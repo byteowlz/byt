@@ -41,6 +41,8 @@ fn try_main() -> Result<()> {
         Command::Sync { command } => handle_sync(&ctx, command),
         Command::Init(cmd) => handle_init(&ctx, cmd),
         Command::Config { command } => handle_config(&ctx, command),
+        Command::Secrets { command } => handle_secrets(&ctx, command),
+        Command::New(cmd) => handle_new(&ctx, cmd),
         Command::Completions { shell } => handle_completions(shell),
     }
 }
@@ -125,6 +127,13 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Manage GitHub repository secrets for releases
+    Secrets {
+        #[command(subcommand)]
+        command: SecretsCommand,
+    },
+    /// Create a new project from template
+    New(NewCommand),
     /// Generate shell completions
     Completions {
         #[arg(value_enum)]
@@ -268,6 +277,57 @@ enum ConfigCommand {
     Show,
     /// Print the resolved config file path
     Path,
+}
+
+#[derive(Debug, Subcommand)]
+enum SecretsCommand {
+    /// Set up all release secrets for a repository
+    Setup {
+        /// Repository name (e.g., mmry) or full path (byteowlz/mmry)
+        repo: String,
+        /// Skip AUR secrets (only set TAP_GITHUB_TOKEN)
+        #[arg(long)]
+        skip_aur: bool,
+    },
+    /// List secrets for a repository
+    List {
+        /// Repository name (e.g., mmry) or full path (byteowlz/mmry)
+        repo: String,
+    },
+    /// Set a specific secret
+    Set {
+        /// Repository name (e.g., mmry) or full path (byteowlz/mmry)
+        repo: String,
+        /// Secret name
+        name: String,
+        /// Secret value (will prompt if not provided)
+        #[arg(long)]
+        value: Option<String>,
+        /// Read value from file
+        #[arg(long, conflicts_with = "value")]
+        from_file: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Clone, Args)]
+struct NewCommand {
+    /// Project name
+    name: String,
+    /// Template to use (rust-cli, rust-workspace, python-cli, go-cli)
+    #[arg(short, long, default_value = "rust-cli")]
+    template: String,
+    /// Create GitHub repository
+    #[arg(long)]
+    github: bool,
+    /// Make GitHub repo private
+    #[arg(long)]
+    private: bool,
+    /// Project description
+    #[arg(short, long)]
+    description: Option<String>,
+    /// Directory to create project in (default: current directory)
+    #[arg(short, long)]
+    output: Option<PathBuf>,
 }
 
 // ============================================================================
@@ -426,6 +486,58 @@ struct AppConfig {
     ignore_dirs: Vec<String>,
     /// Required files for governance compliance
     required_files: Vec<String>,
+    /// Release and distribution settings
+    release: ReleaseConfig,
+    /// Template settings
+    templates: TemplatesConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct TemplatesConfig {
+    /// GitHub repository containing templates (e.g., "byteowlz/templates")
+    repo: String,
+    /// Branch to use (default: main)
+    branch: String,
+}
+
+impl Default for TemplatesConfig {
+    fn default() -> Self {
+        Self {
+            repo: "byteowlz/templates".to_string(),
+            branch: "main".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct ReleaseConfig {
+    /// GitHub organization/user (used as default when repo has no org prefix)
+    github_org: String,
+    /// Homebrew tap repository (e.g., "myorg/homebrew-tap")
+    homebrew_tap: String,
+    /// Scoop bucket repository (e.g., "myorg/scoop-bucket")
+    scoop_bucket: String,
+    /// AUR account email for commits
+    aur_email: Option<String>,
+    /// Path to AUR SSH private key
+    aur_ssh_key_path: Option<String>,
+    /// Name of the GitHub PAT secret for tap/bucket updates (default: TAP_GITHUB_TOKEN)
+    tap_token_name: String,
+}
+
+impl Default for ReleaseConfig {
+    fn default() -> Self {
+        Self {
+            github_org: String::new(), // Must be configured
+            homebrew_tap: String::new(),
+            scoop_bucket: String::new(),
+            aur_email: None,
+            aur_ssh_key_path: None,
+            tap_token_name: "TAP_GITHUB_TOKEN".to_string(),
+        }
+    }
 }
 
 impl Default for AppConfig {
@@ -443,6 +555,8 @@ impl Default for AppConfig {
                 "justfile".to_string(),
                 ".beads".to_string(),
             ],
+            release: ReleaseConfig::default(),
+            templates: TemplatesConfig::default(),
         }
     }
 }
@@ -1766,6 +1880,474 @@ fn handle_config(ctx: &RuntimeContext, command: ConfigCommand) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn handle_secrets(ctx: &RuntimeContext, command: SecretsCommand) -> Result<()> {
+    use std::process::Command;
+    
+    // Check if gh is available
+    let gh_check = Command::new("gh")
+        .arg("--version")
+        .output();
+    
+    if gh_check.is_err() {
+        return Err(anyhow!("GitHub CLI (gh) not found. Install it from https://cli.github.com"));
+    }
+    
+    let release_cfg = &ctx.config.release;
+    
+    // Normalize repo name to full path using configured org
+    let normalize_repo = |repo: &str| -> Result<String> {
+        if repo.contains('/') {
+            Ok(repo.to_string())
+        } else if !release_cfg.github_org.is_empty() {
+            Ok(format!("{}/{}", release_cfg.github_org, repo))
+        } else {
+            Err(anyhow!(
+                "No github_org configured. Either use full repo path (org/repo) or set github_org in ~/.config/byt/config.toml"
+            ))
+        }
+    };
+    
+    match command {
+        SecretsCommand::Setup { repo, skip_aur } => {
+            let repo_full = normalize_repo(&repo)?;
+            
+            println!("Setting up release secrets for {}", repo_full);
+            println!();
+            
+            // 1. TAP_GITHUB_TOKEN
+            let token_name = &release_cfg.tap_token_name;
+            println!("=== {} ===", token_name);
+            
+            // Show which repos need access
+            let mut needs_access = Vec::new();
+            if !release_cfg.homebrew_tap.is_empty() {
+                needs_access.push(release_cfg.homebrew_tap.as_str());
+            }
+            if !release_cfg.scoop_bucket.is_empty() {
+                needs_access.push(release_cfg.scoop_bucket.as_str());
+            }
+            if needs_access.is_empty() {
+                println!("This token needs 'repo' scope for your homebrew-tap and scoop-bucket repos");
+            } else {
+                println!("This token needs 'repo' scope for: {}", needs_access.join(", "));
+            }
+            println!();
+            
+            // Check if already set
+            let check = Command::new("gh")
+                .args(["secret", "list", "--repo", &repo_full])
+                .output()
+                .context("checking existing secrets")?;
+            
+            let existing = String::from_utf8_lossy(&check.stdout);
+            let has_tap_token = existing.lines().any(|l| l.starts_with(token_name));
+            
+            if has_tap_token {
+                println!("{} is already set. Skipping (use 'byt secrets set' to update)", token_name);
+            } else {
+                println!("Enter your GitHub PAT (or press Enter to skip):");
+                print!("> ");
+                io::stdout().flush()?;
+                
+                let mut token = String::new();
+                io::stdin().read_line(&mut token)?;
+                let token = token.trim();
+                
+                if !token.is_empty() {
+                    let mut child = Command::new("gh")
+                        .args(["secret", "set", token_name, "--repo", &repo_full])
+                        .stdin(std::process::Stdio::piped())
+                        .spawn()
+                        .context("setting secret")?;
+                    
+                    if let Some(mut stdin) = child.stdin.take() {
+                        stdin.write_all(token.as_bytes())?;
+                    }
+                    
+                    let status = child.wait()?;
+                    if status.success() {
+                        println!("{} set successfully", token_name);
+                    } else {
+                        eprintln!("Failed to set {}", token_name);
+                    }
+                }
+            }
+            
+            // 2. AUR secrets (if not skipped)
+            if !skip_aur {
+                println!();
+                println!("=== AUR_SSH_PRIVATE_KEY ===");
+                
+                let has_aur_key = existing.lines().any(|l| l.starts_with("AUR_SSH_PRIVATE_KEY"));
+                
+                if has_aur_key {
+                    println!("AUR_SSH_PRIVATE_KEY is already set. Skipping.");
+                } else if let Some(ref key_path) = ctx.config.release.aur_ssh_key_path {
+                    let expanded = shellexpand::tilde(key_path);
+                    let key_file = Path::new(expanded.as_ref());
+                    
+                    if key_file.exists() {
+                        println!("Reading from: {}", key_file.display());
+                        let key_content = fs::read_to_string(key_file)
+                            .context("reading AUR SSH key")?;
+                        
+                        let mut child = Command::new("gh")
+                            .args(["secret", "set", "AUR_SSH_PRIVATE_KEY", "--repo", &repo_full])
+                            .stdin(std::process::Stdio::piped())
+                            .spawn()
+                            .context("setting secret")?;
+                        
+                        if let Some(mut stdin) = child.stdin.take() {
+                            stdin.write_all(key_content.as_bytes())?;
+                        }
+                        
+                        let status = child.wait()?;
+                        if status.success() {
+                            println!("AUR_SSH_PRIVATE_KEY set successfully");
+                        } else {
+                            eprintln!("Failed to set AUR_SSH_PRIVATE_KEY");
+                        }
+                    } else {
+                        eprintln!("AUR SSH key not found at: {}", key_file.display());
+                        eprintln!("Configure aur_ssh_key_path in ~/.config/byt/config.toml");
+                    }
+                } else {
+                    eprintln!("No aur_ssh_key_path configured in ~/.config/byt/config.toml");
+                    eprintln!("Skipping AUR_SSH_PRIVATE_KEY");
+                }
+                
+                println!();
+                println!("=== AUR_EMAIL ===");
+                
+                let has_aur_email = existing.lines().any(|l| l.starts_with("AUR_EMAIL"));
+                
+                if has_aur_email {
+                    println!("AUR_EMAIL is already set. Skipping.");
+                } else if let Some(ref email) = ctx.config.release.aur_email {
+                    let mut child = Command::new("gh")
+                        .args(["secret", "set", "AUR_EMAIL", "--repo", &repo_full])
+                        .stdin(std::process::Stdio::piped())
+                        .spawn()
+                        .context("setting secret")?;
+                    
+                    if let Some(mut stdin) = child.stdin.take() {
+                        stdin.write_all(email.as_bytes())?;
+                    }
+                    
+                    let status = child.wait()?;
+                    if status.success() {
+                        println!("AUR_EMAIL set to: {}", email);
+                    } else {
+                        eprintln!("Failed to set AUR_EMAIL");
+                    }
+                } else {
+                    eprintln!("No aur_email configured in ~/.config/byt/config.toml");
+                    eprintln!("Skipping AUR_EMAIL");
+                }
+            }
+            
+            println!();
+            println!("Done! Run 'byt secrets list {}' to verify.", repo);
+            Ok(())
+        }
+        
+        SecretsCommand::List { repo } => {
+            let repo_full = normalize_repo(&repo)?;
+            
+            let output = Command::new("gh")
+                .args(["secret", "list", "--repo", &repo_full])
+                .output()
+                .context("listing secrets")?;
+            
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(anyhow!("Failed to list secrets: {}", stderr));
+            }
+            
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if stdout.is_empty() {
+                println!("No secrets found for {}", repo_full);
+            } else {
+                println!("Secrets for {}:", repo_full);
+                println!();
+                print!("{}", stdout);
+            }
+            Ok(())
+        }
+        
+        SecretsCommand::Set { repo, name, value, from_file } => {
+            let repo_full = normalize_repo(&repo)?;
+            
+            let secret_value = if let Some(v) = value {
+                v
+            } else if let Some(path) = from_file {
+                fs::read_to_string(&path)
+                    .with_context(|| format!("reading {}", path.display()))?
+            } else {
+                // Prompt for value
+                println!("Enter value for {} (Ctrl+D when done):", name);
+                let mut val = String::new();
+                io::stdin().read_line(&mut val)?;
+                val.trim().to_string()
+            };
+            
+            let mut child = Command::new("gh")
+                .args(["secret", "set", &name, "--repo", &repo_full])
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .context("setting secret")?;
+            
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(secret_value.as_bytes())?;
+            }
+            
+            let status = child.wait()?;
+            if status.success() {
+                println!("Secret {} set for {}", name, repo_full);
+            } else {
+                return Err(anyhow!("Failed to set secret {}", name));
+            }
+            Ok(())
+        }
+    }
+}
+
+fn handle_new(ctx: &RuntimeContext, cmd: NewCommand) -> Result<()> {
+    use std::process::Command;
+    
+    let templates_cfg = &ctx.config.templates;
+    let release_cfg = &ctx.config.release;
+    
+    // Determine output directory
+    let output_dir = cmd.output.unwrap_or_else(|| PathBuf::from("."));
+    let project_dir = output_dir.join(&cmd.name);
+    
+    if project_dir.exists() {
+        return Err(anyhow!("Directory '{}' already exists", project_dir.display()));
+    }
+    
+    println!("Creating new {} project: {}", cmd.template, cmd.name);
+    
+    // Clone template from GitHub
+    let template_url = format!(
+        "https://github.com/{}/archive/refs/heads/{}.zip",
+        templates_cfg.repo, templates_cfg.branch
+    );
+    
+    // Create temp dir for download
+    let temp_dir = std::env::temp_dir().join(format!("byt-template-{}", std::process::id()));
+    fs::create_dir_all(&temp_dir)?;
+    
+    // Download and extract template
+    println!("Fetching template from {}...", templates_cfg.repo);
+    
+    let zip_path = temp_dir.join("template.zip");
+    let output = Command::new("curl")
+        .args(["-sL", "-o", zip_path.to_str().unwrap(), &template_url])
+        .output()
+        .context("downloading template")?;
+    
+    if !output.status.success() {
+        let _ = fs::remove_dir_all(&temp_dir);
+        return Err(anyhow!("Failed to download template"));
+    }
+    
+    // Extract zip
+    let extract_dir = temp_dir.join("extracted");
+    let output = Command::new("unzip")
+        .args(["-q", zip_path.to_str().unwrap(), "-d", extract_dir.to_str().unwrap()])
+        .output()
+        .context("extracting template")?;
+    
+    if !output.status.success() {
+        let _ = fs::remove_dir_all(&temp_dir);
+        return Err(anyhow!("Failed to extract template"));
+    }
+    
+    // Find the template directory (repo-branch/template-name)
+    let repo_name = templates_cfg.repo.split('/').last().unwrap_or("templates");
+    let template_src = extract_dir
+        .join(format!("{}-{}", repo_name, templates_cfg.branch))
+        .join(&cmd.template);
+    
+    if !template_src.exists() {
+        let _ = fs::remove_dir_all(&temp_dir);
+        return Err(anyhow!(
+            "Template '{}' not found. Available: rust-cli, rust-workspace, python-cli, go-cli",
+            cmd.template
+        ));
+    }
+    
+    // Copy template to project directory
+    println!("Creating project structure...");
+    copy_dir_recursive(&template_src, &project_dir)?;
+    
+    // Replace template variables
+    println!("Configuring project...");
+    replace_in_files(&project_dir, "{{project_name}}", &cmd.name)?;
+    replace_in_files(&project_dir, "your-binary-name", &cmd.name)?;
+    
+    // Rename directories/files if needed (e.g., python_cli -> project_name)
+    rename_template_dirs(&project_dir, &cmd.template, &cmd.name)?;
+    
+    // Clean up temp
+    let _ = fs::remove_dir_all(&temp_dir);
+    
+    // Initialize git
+    println!("Initializing git...");
+    let _ = Command::new("git")
+        .args(["init"])
+        .current_dir(&project_dir)
+        .output();
+    
+    // Initialize beads
+    println!("Initializing beads...");
+    let _ = Command::new("bd")
+        .args(["init"])
+        .current_dir(&project_dir)
+        .output();
+    
+    // Create GitHub repo if requested
+    if cmd.github {
+        println!("Creating GitHub repository...");
+        
+        let mut gh_args = vec!["repo", "create"];
+        
+        let repo_name = if !release_cfg.github_org.is_empty() {
+            format!("{}/{}", release_cfg.github_org, cmd.name)
+        } else {
+            cmd.name.clone()
+        };
+        gh_args.push(&repo_name);
+        
+        if cmd.private {
+            gh_args.push("--private");
+        } else {
+            gh_args.push("--public");
+        }
+        
+        gh_args.push("--source");
+        gh_args.push(project_dir.to_str().unwrap());
+        
+        if let Some(ref desc) = cmd.description {
+            gh_args.push("--description");
+            gh_args.push(desc);
+        }
+        
+        gh_args.push("--push");
+        
+        let output = Command::new("gh")
+            .args(&gh_args)
+            .output()
+            .context("creating GitHub repo")?;
+        
+        if output.status.success() {
+            println!("GitHub repository created: {}", repo_name);
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!("Warning: Failed to create GitHub repo: {}", stderr.trim());
+        }
+    }
+    
+    println!();
+    println!("Project created at: {}", project_dir.display());
+    println!();
+    println!("Next steps:");
+    println!("  cd {}", cmd.name);
+    println!("  just");
+    if !cmd.github {
+        println!("  # To create GitHub repo: byt new {} --github", cmd.name);
+    }
+    
+    Ok(())
+}
+
+/// Recursively copy a directory
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+    fs::create_dir_all(dst)?;
+    
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        
+        if src_path.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else {
+            fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    
+    Ok(())
+}
+
+/// Replace a string in all files in a directory recursively
+fn replace_in_files(dir: &Path, from: &str, to: &str) -> Result<()> {
+    for entry in walkdir::WalkDir::new(dir) {
+        let entry = entry?;
+        let path = entry.path();
+        
+        if path.is_file() {
+            // Skip binary files
+            if let Some(ext) = path.extension() {
+                let ext = ext.to_string_lossy();
+                if ["png", "jpg", "jpeg", "gif", "ico", "woff", "woff2", "ttf", "lock"].contains(&ext.as_ref()) {
+                    continue;
+                }
+            }
+            
+            if let Ok(content) = fs::read_to_string(path) {
+                if content.contains(from) {
+                    let new_content = content.replace(from, to);
+                    fs::write(path, new_content)?;
+                }
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+/// Rename template-specific directories
+fn rename_template_dirs(project_dir: &Path, template: &str, project_name: &str) -> Result<()> {
+    // Python: rename python_cli to project_name (with underscores)
+    if template == "python-cli" {
+        let old_dir = project_dir.join("python_cli");
+        if old_dir.exists() {
+            let new_name = project_name.replace('-', "_");
+            let new_dir = project_dir.join(&new_name);
+            fs::rename(&old_dir, &new_dir)?;
+            
+            // Also update imports in files
+            replace_in_files(project_dir, "python_cli", &new_name)?;
+        }
+    }
+    
+    // Rust workspace: rename crate directories
+    if template == "rust-workspace" {
+        let crates_dir = project_dir.join("crates");
+        if crates_dir.exists() {
+            for entry in fs::read_dir(&crates_dir)? {
+                let entry = entry?;
+                let old_name = entry.file_name().to_string_lossy().to_string();
+                if old_name.starts_with("rust-") {
+                    let new_name = old_name.replace("rust-", &format!("{}-", project_name));
+                    let new_path = crates_dir.join(&new_name);
+                    fs::rename(entry.path(), &new_path)?;
+                }
+            }
+            // Update Cargo.toml references
+            replace_in_files(project_dir, "rust-cli", &format!("{}-cli", project_name))?;
+            replace_in_files(project_dir, "rust-core", &format!("{}-core", project_name))?;
+            replace_in_files(project_dir, "rust-api", &format!("{}-api", project_name))?;
+            replace_in_files(project_dir, "rust-mcp", &format!("{}-mcp", project_name))?;
+            replace_in_files(project_dir, "rust-tui", &format!("{}-tui", project_name))?;
+        }
+    }
+    
+    Ok(())
 }
 
 fn handle_completions(shell: Shell) -> Result<()> {
