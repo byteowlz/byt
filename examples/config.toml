@@ -1,0 +1,41 @@
+# byt configuration
+# Place at ~/.config/byt/config.toml
+
+# Directories to ignore when scanning for repositories
+ignore_dirs = [
+    ".git",
+    "node_modules",
+    "target",
+    "dist",
+    ".venv",
+    "__pycache__",
+]
+
+# Files required for governance compliance
+required_files = [
+    "justfile",
+    ".beads",
+]
+
+# Release and distribution settings
+[release]
+# GitHub organization/user (used when repo name has no org prefix)
+# e.g., "byt secrets setup myrepo" becomes "github_org/myrepo"
+github_org = "your-github-org"
+
+# Homebrew tap repository for formula updates
+homebrew_tap = "your-github-org/homebrew-tap"
+
+# Scoop bucket repository for manifest updates  
+scoop_bucket = "your-github-org/scoop-bucket"
+
+# Email for AUR git commits
+aur_email = "your-email@example.com"
+
+# Path to SSH private key registered with AUR
+# Supports ~ expansion and environment variables
+aur_ssh_key_path = "~/.ssh/aur_ed25519"
+
+# Name of the GitHub secret for homebrew-tap/scoop-bucket access
+# This PAT needs 'repo' scope for the repos above
+tap_token_name = "TAP_GITHUB_TOKEN"
