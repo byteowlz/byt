@@ -43,6 +43,7 @@ fn try_main() -> Result<()> {
         Command::Config { command } => handle_config(&ctx, command),
         Command::Secrets { command } => handle_secrets(&ctx, command),
         Command::New(cmd) => handle_new(&ctx, cmd),
+        Command::Schema { command } => handle_schema(&ctx, command),
         Command::Completions { shell } => handle_completions(shell),
     }
 }
@@ -134,6 +135,11 @@ enum Command {
     },
     /// Create a new project from template
     New(NewCommand),
+    /// Manage JSON schemas (sync to central schemas repo)
+    Schema {
+        #[command(subcommand)]
+        command: SchemaCommand,
+    },
     /// Generate shell completions
     Completions {
         #[arg(value_enum)]
@@ -330,6 +336,22 @@ struct NewCommand {
     output: Option<PathBuf>,
 }
 
+#[derive(Debug, Subcommand)]
+enum SchemaCommand {
+    /// Check for updated schemas across all repos
+    Check,
+    /// Sync updated schemas to the central schemas repository
+    Sync {
+        /// Commit and push changes
+        #[arg(long)]
+        push: bool,
+        /// Only sync specific repos
+        repos: Vec<String>,
+    },
+    /// List all schemas in the workspace
+    List,
+}
+
 // ============================================================================
 // Catalog Types
 // ============================================================================
@@ -405,8 +427,18 @@ struct RuntimeContext {
 
 impl RuntimeContext {
     fn new(common: CommonOpts) -> Result<Self> {
-        let paths = AppPaths::discover(common.config.clone(), common.workspace.clone())?;
+        let mut paths = AppPaths::discover(common.config.clone(), common.workspace.clone())?;
         let config = load_config(&paths)?;
+        
+        // Apply workspace override from config if not already set via CLI
+        if common.workspace.is_none() {
+            if let Some(ref ws) = config.workspace {
+                if let Ok(expanded) = expand_path(PathBuf::from(ws)) {
+                    paths.workspace_root = expanded;
+                }
+            }
+        }
+        
         Ok(Self {
             common,
             paths,
@@ -450,7 +482,17 @@ impl RuntimeContext {
     }
 
     fn catalog_path(&self) -> PathBuf {
-        self.paths.workspace_root.join("CATALOG.json")
+        if let Some(ref path) = self.config.catalog_path {
+            let expanded = expand_path(PathBuf::from(path)).unwrap_or_else(|_| PathBuf::from(path));
+            if expanded.is_absolute() {
+                expanded
+            } else {
+                self.paths.workspace_root.join(expanded)
+            }
+        } else {
+            // Default: look in govnr/ subdirectory
+            self.paths.workspace_root.join("govnr").join("CATALOG.json")
+        }
     }
 }
 
@@ -482,6 +524,10 @@ impl AppPaths {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 struct AppConfig {
+    /// Workspace root directory (auto-detected if not set)
+    workspace: Option<String>,
+    /// Path to CATALOG.json (relative to workspace or absolute)
+    catalog_path: Option<String>,
     /// Directories to ignore when scanning for repos
     ignore_dirs: Vec<String>,
     /// Required files for governance compliance
@@ -490,6 +536,8 @@ struct AppConfig {
     release: ReleaseConfig,
     /// Template settings
     templates: TemplatesConfig,
+    /// Schema settings
+    schemas: SchemaConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -506,6 +554,65 @@ impl Default for TemplatesConfig {
         Self {
             repo: "byteowlz/templates".to_string(),
             branch: "main".to_string(),
+        }
+    }
+}
+
+/// Template manifest for composition support
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct TemplateManifest {
+    /// Template metadata
+    #[serde(default)]
+    template: TemplateMetadata,
+    /// Templates to compose into this one
+    #[serde(default)]
+    compose: Vec<TemplateComposition>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct TemplateMetadata {
+    /// Template name
+    #[serde(default)]
+    name: String,
+    /// Template description
+    #[serde(default)]
+    description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TemplateComposition {
+    /// Source template name to pull from
+    source: String,
+    /// Target directory within this template (where to place the composed template)
+    target: String,
+    /// Optional prefix to replace with project name (e.g., "rust-" becomes "myproject-")
+    #[serde(default)]
+    rename_prefix: Option<String>,
+    /// Files/directories to exclude from the composed template
+    #[serde(default)]
+    exclude: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct SchemaConfig {
+    /// Path to schemas repository (relative to workspace or absolute)
+    repo_path: String,
+    /// Schema file pattern to look for in repos (e.g., "examples/*.schema.json")
+    patterns: Vec<String>,
+    /// Base URL for schema references (used in $schema fields)
+    base_url: String,
+}
+
+impl Default for SchemaConfig {
+    fn default() -> Self {
+        Self {
+            repo_path: "schemas".to_string(),
+            patterns: vec![
+                "examples/*.schema.json".to_string(),
+                "schemas/*.schema.json".to_string(),
+            ],
+            base_url: "https://raw.githubusercontent.com/byteowlz/schemas/refs/heads/main".to_string(),
         }
     }
 }
@@ -543,6 +650,8 @@ impl Default for ReleaseConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            workspace: None,
+            catalog_path: None,
             ignore_dirs: vec![
                 ".git".to_string(),
                 "node_modules".to_string(),
@@ -557,6 +666,7 @@ impl Default for AppConfig {
             ],
             release: ReleaseConfig::default(),
             templates: TemplatesConfig::default(),
+            schemas: SchemaConfig::default(),
         }
     }
 }
@@ -2166,11 +2276,10 @@ fn handle_new(ctx: &RuntimeContext, cmd: NewCommand) -> Result<()> {
         return Err(anyhow!("Failed to extract template"));
     }
     
-    // Find the template directory (repo-branch/template-name)
+    // Find the templates root directory (repo-branch/)
     let repo_name = templates_cfg.repo.split('/').last().unwrap_or("templates");
-    let template_src = extract_dir
-        .join(format!("{}-{}", repo_name, templates_cfg.branch))
-        .join(&cmd.template);
+    let templates_root = extract_dir.join(format!("{}-{}", repo_name, templates_cfg.branch));
+    let template_src = templates_root.join(&cmd.template);
     
     if !template_src.exists() {
         let _ = fs::remove_dir_all(&temp_dir);
@@ -2180,9 +2289,53 @@ fn handle_new(ctx: &RuntimeContext, cmd: NewCommand) -> Result<()> {
         ));
     }
     
+    // Check for template manifest (template.toml)
+    let manifest_path = template_src.join("template.toml");
+    let manifest: Option<TemplateManifest> = if manifest_path.exists() {
+        let content = fs::read_to_string(&manifest_path)
+            .context("reading template.toml")?;
+        Some(toml::from_str(&content).context("parsing template.toml")?)
+    } else {
+        None
+    };
+    
     // Copy template to project directory
     println!("Creating project structure...");
     copy_dir_recursive(&template_src, &project_dir)?;
+    
+    // Remove template.toml from the project (it's only for byt)
+    let project_manifest = project_dir.join("template.toml");
+    if project_manifest.exists() {
+        fs::remove_file(&project_manifest)?;
+    }
+    
+    // Apply template composition if defined
+    if let Some(ref manifest) = manifest {
+        for comp in &manifest.compose {
+            let source_template = templates_root.join(&comp.source);
+            if !source_template.exists() {
+                eprintln!("Warning: Composed template '{}' not found, skipping", comp.source);
+                continue;
+            }
+            
+            let target_dir = project_dir.join(&comp.target);
+            println!("  Composing {} -> {}", comp.source, comp.target);
+            
+            // Remove target directory if it exists (will be replaced by composed template)
+            if target_dir.exists() {
+                fs::remove_dir_all(&target_dir)?;
+            }
+            
+            // Copy composed template, excluding specified files
+            copy_dir_filtered(&source_template, &target_dir, &comp.exclude)?;
+            
+            // Remove template.toml from composed template too
+            let composed_manifest = target_dir.join("template.toml");
+            if composed_manifest.exists() {
+                fs::remove_file(&composed_manifest)?;
+            }
+        }
+    }
     
     // Replace template variables
     println!("Configuring project...");
@@ -2283,6 +2436,48 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Recursively copy a directory, excluding specified paths
+fn copy_dir_filtered(src: &Path, dst: &Path, exclude: &[String]) -> Result<()> {
+    fs::create_dir_all(dst)?;
+    
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        
+        // Check if this file/dir should be excluded
+        let should_exclude = exclude.iter().any(|pattern| {
+            // Simple matching: exact name or glob pattern
+            if pattern.contains('*') {
+                // Basic glob: *.ext or prefix*
+                if let Some(suffix) = pattern.strip_prefix('*') {
+                    file_name.ends_with(suffix)
+                } else if let Some(prefix) = pattern.strip_suffix('*') {
+                    file_name.starts_with(prefix)
+                } else {
+                    false
+                }
+            } else {
+                file_name == *pattern
+            }
+        });
+        
+        if should_exclude {
+            continue;
+        }
+        
+        let dst_path = dst.join(entry.file_name());
+        
+        if src_path.is_dir() {
+            copy_dir_filtered(&src_path, &dst_path, exclude)?;
+        } else {
+            fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    
+    Ok(())
+}
+
 /// Replace a string in all files in a directory recursively
 fn replace_in_files(dir: &Path, from: &str, to: &str) -> Result<()> {
     for entry in walkdir::WalkDir::new(dir) {
@@ -2345,6 +2540,264 @@ fn rename_template_dirs(project_dir: &Path, template: &str, project_name: &str) 
             replace_in_files(project_dir, "rust-mcp", &format!("{}-mcp", project_name))?;
             replace_in_files(project_dir, "rust-tui", &format!("{}-tui", project_name))?;
         }
+    }
+    
+    Ok(())
+}
+
+// ============================================================================
+// Schema Management
+// ============================================================================
+
+#[derive(Debug)]
+struct SchemaInfo {
+    repo: String,
+    source_path: PathBuf,
+    dest_path: PathBuf,
+    needs_update: bool,
+}
+
+fn handle_schema(ctx: &RuntimeContext, command: SchemaCommand) -> Result<()> {
+    match command {
+        SchemaCommand::Check => schema_check(ctx),
+        SchemaCommand::Sync { push, repos } => schema_sync(ctx, push, repos),
+        SchemaCommand::List => schema_list(ctx),
+    }
+}
+
+fn find_schemas(ctx: &RuntimeContext) -> Result<Vec<SchemaInfo>> {
+    use glob::glob;
+    
+    let workspace = ctx.workspace_root();
+    let schema_cfg = &ctx.config.schemas;
+    
+    // Get schemas repo path
+    let schemas_repo = if PathBuf::from(&schema_cfg.repo_path).is_absolute() {
+        PathBuf::from(&schema_cfg.repo_path)
+    } else {
+        workspace.join(&schema_cfg.repo_path)
+    };
+    
+    // Load catalog to get repo list
+    let catalog_path = ctx.catalog_path();
+    if !catalog_path.exists() {
+        return Err(anyhow!("Catalog not found at {}. Run 'byt catalog refresh' first.", catalog_path.display()));
+    }
+    
+    let content = fs::read_to_string(&catalog_path)?;
+    let catalog: Catalog = serde_json::from_str(&content)?;
+    
+    let mut schemas = Vec::new();
+    
+    for (repo_name, repo_info) in &catalog.repos {
+        let repo_path = workspace.join(&repo_info.path);
+        
+        // Check each pattern for schema files
+        for pattern in &schema_cfg.patterns {
+            let full_pattern = repo_path.join(pattern);
+            if let Some(pattern_str) = full_pattern.to_str() {
+                for entry in glob(pattern_str).unwrap_or_else(|_| glob("").unwrap()) {
+                    if let Ok(source_path) = entry {
+                        // Determine destination path in schemas repo
+                        let file_name = source_path.file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("schema.json");
+                        
+                        // Use repo name as directory, preserve original filename
+                        // Only rename config.schema.json -> {repo}.config.schema.json for clarity
+                        let dest_name = if file_name == "config.schema.json" {
+                            format!("{}.config.schema.json", repo_name)
+                        } else {
+                            // Keep original filename for all other schemas
+                            file_name.to_string()
+                        };
+                        
+                        let dest_path = schemas_repo.join(repo_name).join(&dest_name);
+                        
+                        // Check if needs update
+                        let needs_update = if dest_path.exists() {
+                            // Compare file contents
+                            let source_content = fs::read_to_string(&source_path).unwrap_or_default();
+                            let dest_content = fs::read_to_string(&dest_path).unwrap_or_default();
+                            source_content != dest_content
+                        } else {
+                            true
+                        };
+                        
+                        schemas.push(SchemaInfo {
+                            repo: repo_name.clone(),
+                            source_path,
+                            dest_path,
+                            needs_update,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    
+    Ok(schemas)
+}
+
+fn schema_check(ctx: &RuntimeContext) -> Result<()> {
+    let schemas = find_schemas(ctx)?;
+    
+    let needs_update: Vec<_> = schemas.iter().filter(|s| s.needs_update).collect();
+    
+    if needs_update.is_empty() {
+        println!("All schemas are up to date.");
+        return Ok(());
+    }
+    
+    println!("Schemas needing update:\n");
+    for schema in &needs_update {
+        let status = if schema.dest_path.exists() { "modified" } else { "new" };
+        println!("  [{}] {} -> {}", 
+            status,
+            schema.source_path.display(),
+            schema.dest_path.display()
+        );
+    }
+    
+    println!("\nRun 'byt schema sync' to update, or 'byt schema sync --push' to update and push.");
+    
+    Ok(())
+}
+
+fn schema_sync(ctx: &RuntimeContext, push: bool, filter_repos: Vec<String>) -> Result<()> {
+    use std::process::Command;
+    
+    let schemas = find_schemas(ctx)?;
+    let schema_cfg = &ctx.config.schemas;
+    
+    // Filter schemas
+    let schemas: Vec<_> = if filter_repos.is_empty() {
+        schemas.into_iter().filter(|s| s.needs_update).collect()
+    } else {
+        schemas.into_iter()
+            .filter(|s| s.needs_update && filter_repos.contains(&s.repo))
+            .collect()
+    };
+    
+    if schemas.is_empty() {
+        println!("No schemas to sync.");
+        return Ok(());
+    }
+    
+    // Get schemas repo path
+    let workspace = ctx.workspace_root();
+    let schemas_repo = if PathBuf::from(&schema_cfg.repo_path).is_absolute() {
+        PathBuf::from(&schema_cfg.repo_path)
+    } else {
+        workspace.join(&schema_cfg.repo_path)
+    };
+    
+    if !schemas_repo.exists() {
+        return Err(anyhow!(
+            "Schemas repo not found at {}. Clone it first or update schemas.repo_path in config.",
+            schemas_repo.display()
+        ));
+    }
+    
+    // Copy each schema
+    for schema in &schemas {
+        // Create destination directory
+        if let Some(parent) = schema.dest_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        
+        // Copy file
+        fs::copy(&schema.source_path, &schema.dest_path)?;
+        
+        let status = if schema.dest_path.exists() { "updated" } else { "added" };
+        println!("[{}] {} -> {}", status, schema.repo, schema.dest_path.display());
+    }
+    
+    if push {
+        println!("\nCommitting and pushing changes...");
+        
+        // Git add
+        let output = Command::new("git")
+            .args(["add", "."])
+            .current_dir(&schemas_repo)
+            .output()
+            .context("running git add")?;
+        
+        if !output.status.success() {
+            return Err(anyhow!("git add failed: {}", String::from_utf8_lossy(&output.stderr)));
+        }
+        
+        // Check if there are changes to commit
+        let output = Command::new("git")
+            .args(["diff", "--cached", "--quiet"])
+            .current_dir(&schemas_repo)
+            .output()?;
+        
+        if output.status.success() {
+            println!("No changes to commit.");
+            return Ok(());
+        }
+        
+        // Generate commit message
+        let repos: std::collections::HashSet<_> = schemas.iter().map(|s| s.repo.as_str()).collect();
+        let commit_msg = if repos.len() == 1 {
+            format!("feat: update {} schema", repos.iter().next().unwrap())
+        } else {
+            let repo_list: Vec<_> = repos.into_iter().collect();
+            format!("feat: update schemas for {}", repo_list.join(", "))
+        };
+        
+        // Git commit
+        let output = Command::new("git")
+            .args(["commit", "-m", &commit_msg])
+            .current_dir(&schemas_repo)
+            .output()
+            .context("running git commit")?;
+        
+        if !output.status.success() {
+            return Err(anyhow!("git commit failed: {}", String::from_utf8_lossy(&output.stderr)));
+        }
+        
+        // Git push
+        let output = Command::new("git")
+            .args(["push"])
+            .current_dir(&schemas_repo)
+            .output()
+            .context("running git push")?;
+        
+        if !output.status.success() {
+            return Err(anyhow!("git push failed: {}", String::from_utf8_lossy(&output.stderr)));
+        }
+        
+        println!("Changes committed and pushed.");
+    } else {
+        println!("\nSchemas copied. Run 'byt schema sync --push' to commit and push.");
+    }
+    
+    Ok(())
+}
+
+fn schema_list(ctx: &RuntimeContext) -> Result<()> {
+    let schemas = find_schemas(ctx)?;
+    
+    if schemas.is_empty() {
+        println!("No schemas found matching configured patterns.");
+        println!("Patterns: {:?}", ctx.config.schemas.patterns);
+        return Ok(());
+    }
+    
+    println!("Schemas in workspace:\n");
+    for schema in &schemas {
+        let status = if schema.needs_update {
+            if schema.dest_path.exists() { "needs update" } else { "new" }
+        } else {
+            "synced"
+        };
+        
+        println!("  {} [{}]", schema.repo, status);
+        println!("    source: {}", schema.source_path.display());
+        println!("    dest:   {}", schema.dest_path.display());
+        println!();
     }
     
     Ok(())

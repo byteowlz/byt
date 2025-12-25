@@ -1,0 +1,112 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/byteowlz/byt/schemas/config.schema.json",
+  "title": "byt configuration",
+  "description": "Configuration schema for byt - Byteowlz meta-tool",
+  "type": "object",
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "JSON Schema reference for editor support"
+    },
+    "workspace": {
+      "type": "string",
+      "description": "Workspace root directory. All repos should be subdirectories of this path. Supports ~ and environment variables. Auto-detected if not set."
+    },
+    "catalog_path": {
+      "type": "string",
+      "description": "Path to CATALOG.json (relative to workspace or absolute). Default: govnr/CATALOG.json"
+    },
+    "ignore_dirs": {
+      "type": "array",
+      "description": "Directories to ignore when scanning for repositories",
+      "items": {
+        "type": "string"
+      },
+      "default": [".git", "node_modules", "target", "dist", ".venv", "__pycache__"]
+    },
+    "required_files": {
+      "type": "array",
+      "description": "Files required for governance compliance",
+      "items": {
+        "type": "string"
+      },
+      "default": ["justfile", ".beads"]
+    },
+    "release": {
+      "type": "object",
+      "description": "Release and distribution settings",
+      "properties": {
+        "github_org": {
+          "type": "string",
+          "description": "GitHub organization/user. Used as default when repo name has no org prefix."
+        },
+        "homebrew_tap": {
+          "type": "string",
+          "description": "Homebrew tap repository (e.g., 'myorg/homebrew-tap')"
+        },
+        "scoop_bucket": {
+          "type": "string",
+          "description": "Scoop bucket repository (e.g., 'myorg/scoop-bucket')"
+        },
+        "aur_email": {
+          "type": "string",
+          "description": "Email for AUR git commits"
+        },
+        "aur_ssh_key_path": {
+          "type": "string",
+          "description": "Path to SSH private key registered with AUR. Supports ~ expansion."
+        },
+        "tap_token_name": {
+          "type": "string",
+          "description": "Name of the GitHub secret for homebrew-tap/scoop-bucket access",
+          "default": "TAP_GITHUB_TOKEN"
+        }
+      },
+      "additionalProperties": false
+    },
+    "templates": {
+      "type": "object",
+      "description": "Template settings for project scaffolding",
+      "properties": {
+        "repo": {
+          "type": "string",
+          "description": "GitHub repository containing templates (e.g., 'byteowlz/templates')",
+          "default": "byteowlz/templates"
+        },
+        "branch": {
+          "type": "string",
+          "description": "Branch to use for templates",
+          "default": "main"
+        }
+      },
+      "additionalProperties": false
+    },
+    "schemas": {
+      "type": "object",
+      "description": "Schema management settings",
+      "properties": {
+        "repo_path": {
+          "type": "string",
+          "description": "Path to schemas repository (relative to workspace or absolute)",
+          "default": "schemas"
+        },
+        "patterns": {
+          "type": "array",
+          "description": "Glob patterns to find schema files in repos",
+          "items": {
+            "type": "string"
+          },
+          "default": ["examples/*.schema.json", "schemas/*.schema.json"]
+        },
+        "base_url": {
+          "type": "string",
+          "description": "Base URL for schema references (used in $schema fields)",
+          "default": "https://raw.githubusercontent.com/byteowlz/schemas/refs/heads/main"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}
