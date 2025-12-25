@@ -1,5 +1,15 @@
+"$schema" = "https://raw.githubusercontent.com/byteowlz/schemas/refs/heads/main/byt/byt.config.schema.json"
+
 # byt configuration
 # Place at ~/.config/byt/config.toml
+
+# Workspace root directory (auto-detected if not set)
+# All repos should be subdirectories of this path
+# workspace = "~/byteowlz"
+
+# Path to CATALOG.json (relative to workspace or absolute)
+# Default: govnr/CATALOG.json
+# catalog_path = "govnr/CATALOG.json"
 
 # Directories to ignore when scanning for repositories
 ignore_dirs = [
@@ -39,3 +49,24 @@ aur_ssh_key_path = "~/.ssh/aur_ed25519"
 # Name of the GitHub secret for homebrew-tap/scoop-bucket access
 # This PAT needs 'repo' scope for the repos above
 tap_token_name = "TAP_GITHUB_TOKEN"
+
+# Template settings for project scaffolding
+[templates]
+# GitHub repository containing templates
+repo = "byteowlz/templates"
+# Branch to use
+branch = "main"
+
+# Schema management settings
+[schemas]
+# Path to schemas repository (relative to workspace or absolute)
+repo_path = "schemas"
+
+# Patterns to find schema files in repos
+patterns = [
+    "examples/*.schema.json",
+    "schemas/*.schema.json",
+]
+
+# Base URL for schema references (used in $schema fields)
+base_url = "https://raw.githubusercontent.com/byteowlz/schemas/refs/heads/main"
