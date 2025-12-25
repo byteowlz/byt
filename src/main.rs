@@ -1806,9 +1806,7 @@ fn sync_pull(ctx: &RuntimeContext, explicit_stores: Vec<String>) -> Result<()> {
         return Ok(());
     }
     
-    let mut imported = 0;
-    let mut total_memories = 0;
-    let mut skipped = 0;
+    let mut imported_count = 0;
     
     for store in &stores {
         let input_file = sync_dir.join(format!("{}.json", store));
@@ -1823,73 +1821,44 @@ fn sync_pull(ctx: &RuntimeContext, explicit_stores: Vec<String>) -> Result<()> {
         // Ensure store exists
         ensure_memory_store(store)?;
         
-        // Read export file
-        let content = fs::read_to_string(&input_file)?;
-        let export: serde_json::Value = serde_json::from_str(&content)?;
-        
-        let memories = export.get("memories").and_then(|v| v.as_array());
-        if memories.is_none() {
-            continue;
-        }
-        
-        let memories = memories.unwrap();
-        let mut store_imported = 0;
-        let mut store_skipped = 0;
-        
-        for memory in memories {
-            // Try to add the memory via stdin (mmry will handle deduplication via content hash)
-            let memory_json = serde_json::to_string(memory)?;
-            
-            let mut child = Command::new("mmry")
-                .args(["add", "-", "--store", store])
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-                .context("spawning mmry add")?;
-            
-            // Write JSON to stdin and close it
-            if let Some(mut stdin) = child.stdin.take() {
-                use std::io::Write;
-                stdin.write_all(memory_json.as_bytes())?;
-                // stdin is dropped here, closing the pipe
-            }
-            
-            // Wait for the command to complete
-            let output = child.wait_with_output()?;
-            
-            if output.status.success() {
-                store_imported += 1;
-            } else {
-                // Likely duplicate, skip silently
-                store_skipped += 1;
-            }
-        }
+        // Use mmry import command (handles HMLR data, deduplication, re-embedding)
+        let output = Command::new("mmry")
+            .args(["import", &input_file.display().to_string(), "--store", store])
+            .output()
+            .context("running mmry import")?;
         
         if !ctx.common.quiet {
-            println!("  {} ({} imported, {} skipped)", store, store_imported, store_skipped);
+            // Parse output for summary
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if output.status.success() {
+                // Extract key info from output
+                let lines: Vec<&str> = stdout.lines().collect();
+                let summary = lines.iter()
+                    .find(|l| l.contains("memories") || l.contains("Import complete"))
+                    .map(|s| s.trim())
+                    .unwrap_or("imported");
+                println!("  {} - {}", store, summary);
+                imported_count += 1;
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                println!("  {} - error: {}", store, stderr.lines().next().unwrap_or("unknown error"));
+            }
+        } else if output.status.success() {
+            imported_count += 1;
         }
-        
-        imported += store_imported;
-        skipped += store_skipped;
-        total_memories += memories.len();
     }
     
     if ctx.common.json {
         #[derive(Serialize)]
         struct PullResult {
-            memories_imported: usize,
-            memories_skipped: usize,
-            total_in_sync: usize,
+            stores_imported: usize,
         }
         println!("{}", serde_json::to_string_pretty(&PullResult {
-            memories_imported: imported,
-            memories_skipped: skipped,
-            total_in_sync: total_memories,
+            stores_imported: imported_count,
         })?);
     } else {
         println!();
-        println!("Imported {} memories ({} skipped as duplicates)", imported, skipped);
+        println!("Imported {} stores (with HMLR data)", imported_count);
     }
     
     Ok(())
