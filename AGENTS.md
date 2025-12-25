@@ -6,28 +6,29 @@
 
 ## Commands
 
-| Command | Description |
-|---------|-------------|
-| `byt catalog refresh` | Scan all repos and generate CATALOG.json |
-| `byt catalog show` | Display the current catalog |
-| `byt catalog list` | List all repository names |
-| `byt lint` | Check governance compliance (justfile, beads, AGENTS.md) |
-| `byt status` | Show repository status and compliance matrix |
-| `byt ready` | Show ready work from govnr-level beads |
-| `byt triage` | Cross-repo triage via bv workspace aggregation |
-| `byt triage --next` | Get single top recommendation |
-| `byt triage --refresh` | Regenerate workspace.yaml before triage |
-| `byt search <query>` | Search agent conversation history (via cass) |
-| `byt memory add` | Add a memory (via mmry) |
-| `byt memory search` | Search memories (via mmry) |
-| `byt memory projects` | List available memory stores |
-| `byt sync status` | Show memory sync state |
-| `byt sync push` | Export memories to .sync/memories/ |
-| `byt sync pull` | Import memories from .sync/memories/ |
+| Command                | Description                                              |
+| ---------------------- | -------------------------------------------------------- |
+| `byt catalog refresh`  | Scan all repos and generate CATALOG.json                 |
+| `byt catalog show`     | Display the current catalog                              |
+| `byt catalog list`     | List all repository names                                |
+| `byt lint`             | Check governance compliance (justfile, beads, AGENTS.md) |
+| `byt status`           | Show repository status and compliance matrix             |
+| `byt ready`            | Show ready work from govnr-level beads                   |
+| `byt triage`           | Cross-repo triage via bv workspace aggregation           |
+| `byt triage --next`    | Get single top recommendation                            |
+| `byt triage --refresh` | Regenerate workspace.yaml before triage                  |
+| `byt search <query>`   | Search agent conversation history (via cass)             |
+| `byt memory add`       | Add a memory (via mmry)                                  |
+| `byt memory search`    | Search memories (via mmry)                               |
+| `byt memory projects`  | List available memory stores                             |
+| `byt sync status`      | Show memory sync state                                   |
+| `byt sync push`        | Export memories to .sync/memories/                       |
+| `byt sync pull`        | Import memories from .sync/memories/                     |
 
 ## Architecture
 
 byt integrates with:
+
 - **bd (beads)** - Issue tracking at govnr and repo levels
 - **bv (beads_viewer)** - Cross-repo issue triage via workspace config
 - **cass** - Agent conversation search across all sessions
@@ -55,3 +56,52 @@ just clippy      # Lint
 - `--workspace <PATH>` - Override workspace root
 - `--dry-run` - Preview changes without writing
 - `-v` / `--verbose` - Increase logging verbosity
+
+## Issue Tracking (bd/beads)
+
+Use `bd` for all issue tracking. Do NOT use markdown TODOs or external trackers.
+
+```bash
+bd ready --json                              # Find unblocked work
+bd create "Title" -t task -p 2 --json        # Create issue (types: bug/feature/task/epic/chore)
+bd update <id> --status in_progress --json   # Claim task
+bd close <id> --reason "Done" --json         # Complete work
+```
+
+Priorities: 0=critical, 1=high, 2=medium (default), 3=low, 4=backlog
+
+Always commit `.beads/issues.jsonl` with code changes.
+
+## Memory System (byt/mmry)
+
+Use `byt memory` to store and retrieve project knowledge. Memories auto-detect the current repo.
+
+**Adding memories:**
+
+```bash
+byt memory add "Important decision or learning"              # Auto-detects current repo
+byt memory add "Cross-repo architecture decision" --govnr    # Force govnr store
+byt memory add "Specific insight" -c "architecture" -i 8     # With category and importance
+```
+
+**Searching memories:**
+
+```bash
+byt memory search "query"           # Search current repo's memories
+byt memory search "query" --govnr   # Search cross-repo memories
+byt memory search "query" --all     # Search ALL projects
+```
+
+**When to add memories:**
+
+- Architecture decisions and their rationale
+- Non-obvious solutions to tricky problems
+- Integration patterns with other byteowlz repos
+- Performance findings or benchmarks
+- API contracts or breaking changes
+
+**When to search memories:**
+
+- Before starting work on a feature (check for prior decisions)
+- When encountering unfamiliar code patterns
+- When integrating with other repos (`byt memory search "query" --all`)

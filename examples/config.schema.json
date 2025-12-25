@@ -106,6 +106,18 @@
         }
       },
       "additionalProperties": false
+    },
+    "sync": {
+      "type": "object",
+      "description": "Memory sync settings",
+      "properties": {
+        "sync_dir": {
+          "type": "string",
+          "description": "Directory for memory sync files (relative to workspace or absolute). Set to 'govnr/.sync/memories' to keep sync files in the govnr repo.",
+          "default": ".sync/memories"
+        }
+      },
+      "additionalProperties": false
     }
   },
   "additionalProperties": false

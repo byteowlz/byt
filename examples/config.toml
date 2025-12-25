@@ -70,3 +70,10 @@ patterns = [
 
 # Base URL for schema references (used in $schema fields)
 base_url = "https://raw.githubusercontent.com/byteowlz/schemas/refs/heads/main"
+
+# Memory sync settings
+[sync]
+# Directory for memory sync files (relative to workspace or absolute)
+# Default: ".sync/memories" in workspace root
+# Set to "govnr/.sync/memories" to keep sync files in the govnr repo (recommended)
+sync_dir = "govnr/.sync/memories"
