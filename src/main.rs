@@ -538,6 +538,8 @@ struct AppConfig {
     templates: TemplatesConfig,
     /// Schema settings
     schemas: SchemaConfig,
+    /// Memory sync settings
+    sync: SyncConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -619,6 +621,23 @@ impl Default for SchemaConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+struct SyncConfig {
+    /// Directory for memory sync files (relative to workspace or absolute)
+    /// Default: ".sync/memories" in workspace root
+    /// Set to "govnr/.sync/memories" to keep sync files in the govnr repo
+    sync_dir: String,
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            sync_dir: ".sync/memories".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 struct ReleaseConfig {
     /// GitHub organization/user (used as default when repo has no org prefix)
     github_org: String,
@@ -667,6 +686,7 @@ impl Default for AppConfig {
             release: ReleaseConfig::default(),
             templates: TemplatesConfig::default(),
             schemas: SchemaConfig::default(),
+            sync: SyncConfig::default(),
         }
     }
 }
@@ -1666,12 +1686,12 @@ fn get_existing_stores() -> Result<Vec<String>> {
     Ok(stores)
 }
 
-/// Export memories to .sync/memories/ for git-based sync
+/// Export memories to sync directory for git-based sync
 fn sync_push(ctx: &RuntimeContext, explicit_stores: Vec<String>) -> Result<()> {
     use std::process::Command;
     
     let stores = get_syncable_stores(ctx, explicit_stores)?;
-    let sync_dir = ctx.workspace_root().join(".sync/memories");
+    let sync_dir = resolve_sync_dir(ctx)?;
     
     fs::create_dir_all(&sync_dir)?;
     
@@ -1733,14 +1753,14 @@ fn sync_push(ctx: &RuntimeContext, explicit_stores: Vec<String>) -> Result<()> {
     Ok(())
 }
 
-/// Import memories from .sync/memories/ after git pull
+/// Import memories from sync directory after git pull
 fn sync_pull(ctx: &RuntimeContext, explicit_stores: Vec<String>) -> Result<()> {
     use std::process::Command;
     
-    let sync_dir = ctx.workspace_root().join(".sync/memories");
+    let sync_dir = resolve_sync_dir(ctx)?;
     
     if !sync_dir.exists() {
-        return Err(anyhow!("No .sync/memories directory found. Run 'byt sync push' first or 'git pull'."));
+        return Err(anyhow!("Sync directory not found: {}. Run 'byt sync push' first or 'git pull'.", sync_dir.display()));
     }
     
     // Get stores to import
@@ -1875,9 +1895,24 @@ fn sync_pull(ctx: &RuntimeContext, explicit_stores: Vec<String>) -> Result<()> {
     Ok(())
 }
 
+/// Resolve the sync directory from config
+fn resolve_sync_dir(ctx: &RuntimeContext) -> Result<PathBuf> {
+    let sync_path = &ctx.config.sync.sync_dir;
+    
+    // If absolute path, use as-is
+    if sync_path.starts_with('/') || sync_path.starts_with('~') {
+        let expanded = shellexpand::full(sync_path)
+            .context("expanding sync_dir path")?;
+        return Ok(PathBuf::from(expanded.to_string()));
+    }
+    
+    // Otherwise, relative to workspace
+    Ok(ctx.workspace_root().join(sync_path))
+}
+
 /// Show sync status
 fn sync_status(ctx: &RuntimeContext) -> Result<()> {
-    let sync_dir = ctx.workspace_root().join(".sync/memories");
+    let sync_dir = resolve_sync_dir(ctx)?;
     let existing_stores = get_existing_stores()?;
     
     // Get catalog repos

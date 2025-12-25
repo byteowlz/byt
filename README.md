@@ -1,6 +1,6 @@
 # byt
 
-Byteowlz meta-tool for cross-repo management and governance.
+byteowlz meta-tool for cross-repo management and governance.
 
 ## Installation
 
@@ -34,8 +34,9 @@ byt memory add "content" # Add memory
 ## Integration
 
 byt integrates with:
+
 - `bd` / `bv` for issue tracking
-- `cass` for agent session search  
+- `cass` for agent session search
 - `mmry` for memory management
 
 ## License
