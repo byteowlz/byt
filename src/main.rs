@@ -2949,6 +2949,23 @@ enum InstallMethod {
 
 const TOOLS: &[ToolInfo] = &[
     ToolInfo {
+        name: "beads",
+        description: "Distributed git-backed graph issue tracker for AI agents (bd command)",
+        binary: "bd",
+        repo: "steveyegge/beads",
+        install_method: InstallMethod::CurlScript(
+            "https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh"
+        ),
+    },
+    ToolInfo {
+        name: "mmry",
+        description: "Local-first memory system for humans and AI agents",
+        binary: "mmry",
+        repo: "byteowlz/mmry",
+        // mmry uses an interactive install script; we use cargo install for automation
+        install_method: InstallMethod::Cargo("--git https://github.com/byteowlz/mmry mmry-cli"),
+    },
+    ToolInfo {
         name: "bv",
         description: "TUI for beads with graph analytics (PageRank, critical path, cycles)",
         binary: "bv",
@@ -3172,10 +3189,15 @@ fn install_single_tool(ctx: &RuntimeContext, tool: &ToolInfo, force: bool) -> Re
                 return Err(anyhow!("Install script failed"));
             }
         }
-        InstallMethod::Cargo(crate_name) => {
+        InstallMethod::Cargo(crate_args) => {
             println!("Installing {} via cargo...", tool.name);
+            // Parse the cargo args - may include --git URL and crate name
+            let args: Vec<&str> = crate_args.split_whitespace().collect();
+            let mut cmd_args = vec!["install"];
+            cmd_args.extend(args);
+            
             let status = Command::new("cargo")
-                .args(["install", crate_name])
+                .args(&cmd_args)
                 .status()
                 .context("running cargo install")?;
             
@@ -3266,6 +3288,20 @@ fn tools_doctor(_ctx: &RuntimeContext) -> Result<()> {
         
         // Tool-specific health checks
         let health_ok = match tool.name {
+            "beads" => {
+                // Check if bd can run help
+                let output = ShellCommand::new("bd")
+                    .arg("help")
+                    .output();
+                output.is_ok() && output.unwrap().status.success()
+            }
+            "mmry" => {
+                // Check if mmry can run help
+                let output = ShellCommand::new("mmry")
+                    .arg("--help")
+                    .output();
+                output.is_ok() && output.unwrap().status.success()
+            }
             "bv" => {
                 // Check if bv can access beads
                 let output = ShellCommand::new("bv")
