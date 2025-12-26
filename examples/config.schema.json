@@ -118,6 +118,65 @@
         }
       },
       "additionalProperties": false
+    },
+    "tools": {
+      "type": "object",
+      "description": "External agent tools settings. These tools enhance agent coordination and history search.",
+      "properties": {
+        "auto_install": {
+          "type": "boolean",
+          "description": "Auto-install missing tools on first use",
+          "default": false
+        },
+        "mcp_agent_mail": {
+          "type": "object",
+          "description": "mcp_agent_mail - Agent-to-agent coordination via MCP server (https://github.com/Dicklesworthstone/mcp_agent_mail)",
+          "properties": {
+            "port": {
+              "type": "integer",
+              "description": "Port for the MCP server",
+              "default": 8765
+            },
+            "auto_start": {
+              "type": "boolean",
+              "description": "Auto-start the server when needed",
+              "default": false
+            },
+            "venv_path": {
+              "type": "string",
+              "description": "Virtual environment path for isolated Python installs"
+            }
+          },
+          "additionalProperties": false
+        },
+        "cass": {
+          "type": "object",
+          "description": "cass - Coding Agent Session Search (https://github.com/Dicklesworthstone/coding_agent_session_search). Accessed via: byt search",
+          "properties": {
+            "data_dir": {
+              "type": "string",
+              "description": "Data directory for cass index"
+            }
+          },
+          "additionalProperties": false
+        },
+        "bv": {
+          "type": "object",
+          "description": "bv - Beads Viewer with graph analytics (https://github.com/Dicklesworthstone/beads_viewer). Accessed via: byt triage",
+          "properties": {
+            "default_flags": {
+              "type": "array",
+              "description": "Default flags to pass to bv",
+              "items": {
+                "type": "string"
+              },
+              "default": []
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
     }
   },
   "additionalProperties": false

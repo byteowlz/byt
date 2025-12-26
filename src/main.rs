@@ -44,6 +44,7 @@ fn try_main() -> Result<()> {
         Command::Secrets { command } => handle_secrets(&ctx, command),
         Command::New(cmd) => handle_new(&ctx, cmd),
         Command::Schema { command } => handle_schema(&ctx, command),
+        Command::Tools { command } => handle_tools(&ctx, command),
         Command::Completions { shell } => handle_completions(shell),
     }
 }
@@ -139,6 +140,11 @@ enum Command {
     Schema {
         #[command(subcommand)]
         command: SchemaCommand,
+    },
+    /// Manage external agent tools (bv, cass, mcp_agent_mail)
+    Tools {
+        #[command(subcommand)]
+        command: ToolsCommand,
     },
     /// Generate shell completions
     Completions {
@@ -352,6 +358,35 @@ enum SchemaCommand {
     List,
 }
 
+#[derive(Debug, Subcommand)]
+enum ToolsCommand {
+    /// List available and installed tools
+    List,
+    /// Install a tool
+    Install {
+        /// Tool name (bv, cass, mcp_agent_mail, or 'all')
+        tool: String,
+        /// Force reinstall even if already installed
+        #[arg(long)]
+        force: bool,
+    },
+    /// Update a tool to the latest version
+    Update {
+        /// Tool name (bv, cass, mcp_agent_mail, or 'all')
+        tool: String,
+    },
+    /// Check tool health and configuration
+    Doctor,
+    /// Configure a tool (e.g., set up MCP server)
+    Config {
+        /// Tool name
+        tool: String,
+        /// Show current configuration
+        #[arg(long)]
+        show: bool,
+    },
+}
+
 // ============================================================================
 // Catalog Types
 // ============================================================================
@@ -540,6 +575,83 @@ struct AppConfig {
     schemas: SchemaConfig,
     /// Memory sync settings
     sync: SyncConfig,
+    /// External tools settings
+    tools: ToolsConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct ToolsConfig {
+    /// Auto-install tools on first use
+    auto_install: bool,
+    /// mcp_agent_mail configuration
+    mcp_agent_mail: McpAgentMailConfig,
+    /// cass (coding agent session search) configuration
+    cass: CassConfig,
+    /// bv (beads viewer) configuration
+    bv: BvConfig,
+}
+
+impl Default for ToolsConfig {
+    fn default() -> Self {
+        Self {
+            auto_install: false,
+            mcp_agent_mail: McpAgentMailConfig::default(),
+            cass: CassConfig::default(),
+            bv: BvConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct McpAgentMailConfig {
+    /// Port for the MCP server
+    port: u16,
+    /// Auto-start the server when needed
+    auto_start: bool,
+    /// Virtual environment path
+    venv_path: Option<String>,
+}
+
+impl Default for McpAgentMailConfig {
+    fn default() -> Self {
+        Self {
+            port: 8765,
+            auto_start: false,
+            venv_path: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct CassConfig {
+    /// Data directory for cass
+    data_dir: Option<String>,
+}
+
+impl Default for CassConfig {
+    fn default() -> Self {
+        Self {
+            data_dir: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct BvConfig {
+    /// Default flags to pass to bv
+    default_flags: Vec<String>,
+}
+
+impl Default for BvConfig {
+    fn default() -> Self {
+        Self {
+            default_flags: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -687,6 +799,7 @@ impl Default for AppConfig {
             templates: TemplatesConfig::default(),
             schemas: SchemaConfig::default(),
             sync: SyncConfig::default(),
+            tools: ToolsConfig::default(),
         }
     }
 }
@@ -2807,6 +2920,512 @@ fn schema_list(ctx: &RuntimeContext) -> Result<()> {
     Ok(())
 }
 
+// ============================================================================
+// Tools Management
+// ============================================================================
+
+/// Tool metadata
+#[derive(Debug)]
+struct ToolInfo {
+    name: &'static str,
+    description: &'static str,
+    binary: &'static str,
+    repo: &'static str,
+    install_method: InstallMethod,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+enum InstallMethod {
+    /// Install via curl script
+    CurlScript(&'static str),
+    /// Install via cargo
+    Cargo(&'static str),
+    /// Install via go install
+    GoInstall(&'static str),
+    /// Install via uv/pip
+    Python(&'static str),
+}
+
+const TOOLS: &[ToolInfo] = &[
+    ToolInfo {
+        name: "bv",
+        description: "TUI for beads with graph analytics (PageRank, critical path, cycles)",
+        binary: "bv",
+        repo: "Dicklesworthstone/beads_viewer",
+        install_method: InstallMethod::CurlScript(
+            "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/main/install.sh"
+        ),
+    },
+    ToolInfo {
+        name: "cass",
+        description: "Unified search across all agent session history",
+        binary: "cass",
+        repo: "Dicklesworthstone/coding_agent_session_search",
+        install_method: InstallMethod::CurlScript(
+            "https://raw.githubusercontent.com/Dicklesworthstone/coding_agent_session_search/main/install.sh"
+        ),
+    },
+    ToolInfo {
+        name: "mcp_agent_mail",
+        description: "Agent-to-agent coordination via MCP server (inbox/outbox, file reservations)",
+        binary: "mcp_agent_mail",  // Not a binary - it's a Python MCP server
+        repo: "Dicklesworthstone/mcp_agent_mail",
+        // Uses their one-liner installer which sets up uv, venv, and configures agents
+        install_method: InstallMethod::CurlScript(
+            "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail/main/scripts/install.sh"
+        ),
+    },
+];
+
+fn handle_tools(ctx: &RuntimeContext, command: ToolsCommand) -> Result<()> {
+    match command {
+        ToolsCommand::List => tools_list(ctx),
+        ToolsCommand::Install { tool, force } => tools_install(ctx, &tool, force),
+        ToolsCommand::Update { tool } => tools_update(ctx, &tool),
+        ToolsCommand::Doctor => tools_doctor(ctx),
+        ToolsCommand::Config { tool, show } => tools_config(ctx, &tool, show),
+    }
+}
+
+fn tools_list(ctx: &RuntimeContext) -> Result<()> {
+    #[derive(Serialize)]
+    struct ToolStatus {
+        name: String,
+        description: String,
+        installed: bool,
+        path: Option<String>,
+        version: Option<String>,
+    }
+    
+    let mut statuses = Vec::new();
+    
+    for tool in TOOLS {
+        let (installed, path, version) = check_tool_installed(tool);
+        
+        statuses.push(ToolStatus {
+            name: tool.name.to_string(),
+            description: tool.description.to_string(),
+            installed,
+            path,
+            version,
+        });
+    }
+    
+    if ctx.common.json {
+        println!("{}", serde_json::to_string_pretty(&statuses)?);
+    } else {
+        println!("External Agent Tools");
+        println!("====================\n");
+        
+        for status in &statuses {
+            let icon = if status.installed { "[+]" } else { "[ ]" };
+            let version_str = status.version.as_deref().unwrap_or("");
+            let path_str = status.path.as_deref().unwrap_or("not found");
+            
+            println!("{} {} - {}", icon, status.name, status.description);
+            if status.installed {
+                println!("    Path: {} {}", path_str, version_str);
+            }
+            println!();
+        }
+        
+        println!("Commands:");
+        println!("  byt tools install <tool>   Install a tool");
+        println!("  byt tools install all      Install all tools");
+        println!("  byt tools update <tool>    Update a tool");
+        println!("  byt tools doctor           Check tool health");
+    }
+    
+    Ok(())
+}
+
+fn check_tool_installed(tool: &ToolInfo) -> (bool, Option<String>, Option<String>) {
+    use std::process::Command;
+    
+    // Special handling for Python packages
+    if matches!(tool.install_method, InstallMethod::Python(_)) {
+        // Check if module is importable
+        let output = Command::new("python3")
+            .args(["-c", &format!("import {}", tool.name)])
+            .output();
+        
+        if let Ok(out) = output {
+            if out.status.success() {
+                // Try to get version
+                let version_output = Command::new("python3")
+                    .args(["-c", &format!("import {}; print(getattr({}, '__version__', 'unknown'))", tool.name, tool.name)])
+                    .output();
+                
+                let version = version_output.ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+                
+                return (true, Some("python module".to_string()), version);
+            }
+        }
+        
+        // Also check if installed via uv tool
+        let output = Command::new("uv")
+            .args(["tool", "list"])
+            .output();
+        
+        if let Ok(out) = output {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            if stdout.contains(tool.name) {
+                return (true, Some("uv tool".to_string()), None);
+            }
+        }
+        
+        return (false, None, None);
+    }
+    
+    // Check for binary
+    let output = Command::new("which")
+        .arg(tool.binary)
+        .output();
+    
+    if let Ok(out) = output {
+        if out.status.success() {
+            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            
+            // Try to get version
+            let version_output = Command::new(tool.binary)
+                .arg("--version")
+                .output();
+            
+            let version = version_output.ok()
+                .filter(|o| o.status.success())
+                .map(|o| {
+                    let stdout = String::from_utf8_lossy(&o.stdout);
+                    stdout.lines().next().unwrap_or("").trim().to_string()
+                });
+            
+            return (true, Some(path), version);
+        }
+    }
+    
+    (false, None, None)
+}
+
+fn tools_install(ctx: &RuntimeContext, tool_name: &str, force: bool) -> Result<()> {
+    if tool_name == "all" {
+        for tool in TOOLS {
+            println!("Installing {}...", tool.name);
+            install_single_tool(ctx, tool, force)?;
+            println!();
+        }
+        return Ok(());
+    }
+    
+    let tool = TOOLS.iter()
+        .find(|t| t.name == tool_name)
+        .ok_or_else(|| anyhow!(
+            "Unknown tool '{}'. Available: {}",
+            tool_name,
+            TOOLS.iter().map(|t| t.name).collect::<Vec<_>>().join(", ")
+        ))?;
+    
+    install_single_tool(ctx, tool, force)
+}
+
+fn install_single_tool(ctx: &RuntimeContext, tool: &ToolInfo, force: bool) -> Result<()> {
+    use std::process::Command;
+    
+    // Check if already installed
+    let (installed, path, _) = check_tool_installed(tool);
+    if installed && !force {
+        println!("{} is already installed at {}", tool.name, path.unwrap_or_default());
+        println!("Use --force to reinstall");
+        return Ok(());
+    }
+    
+    if ctx.common.dry_run {
+        println!("Would install {} from {}", tool.name, tool.repo);
+        return Ok(());
+    }
+    
+    match &tool.install_method {
+        InstallMethod::CurlScript(url) => {
+            println!("Installing {} via install script...", tool.name);
+            
+            // Tool-specific arguments
+            let script_args = match tool.name {
+                "cass" => "--easy-mode",
+                "mcp_agent_mail" => "--yes",
+                _ => "",
+            };
+            
+            let status = if script_args.is_empty() {
+                Command::new("bash")
+                    .args(["-c", &format!("curl -fsSL '{}' | bash", url)])
+                    .status()
+                    .context("running install script")?
+            } else {
+                Command::new("bash")
+                    .args(["-c", &format!("curl -fsSL '{}' | bash -s -- {}", url, script_args)])
+                    .status()
+                    .context("running install script")?
+            };
+            
+            if !status.success() {
+                return Err(anyhow!("Install script failed"));
+            }
+        }
+        InstallMethod::Cargo(crate_name) => {
+            println!("Installing {} via cargo...", tool.name);
+            let status = Command::new("cargo")
+                .args(["install", crate_name])
+                .status()
+                .context("running cargo install")?;
+            
+            if !status.success() {
+                return Err(anyhow!("cargo install failed"));
+            }
+        }
+        InstallMethod::GoInstall(pkg) => {
+            println!("Installing {} via go install...", tool.name);
+            let status = Command::new("go")
+                .args(["install", pkg])
+                .status()
+                .context("running go install")?;
+            
+            if !status.success() {
+                return Err(anyhow!("go install failed"));
+            }
+        }
+        InstallMethod::Python(pkg) => {
+            println!("Installing {} via uv...", tool.name);
+            
+            // First try uv pip install
+            let status = Command::new("uv")
+                .args(["pip", "install", pkg])
+                .status();
+            
+            if status.is_ok() && status.unwrap().success() {
+                println!("{} installed successfully", tool.name);
+            } else {
+                // Fallback to pip
+                println!("Falling back to pip...");
+                let status = Command::new("pip3")
+                    .args(["install", pkg])
+                    .status()
+                    .context("running pip install")?;
+                
+                if !status.success() {
+                    return Err(anyhow!("pip install failed"));
+                }
+            }
+        }
+    }
+    
+    println!("{} installed successfully", tool.name);
+    Ok(())
+}
+
+fn tools_update(ctx: &RuntimeContext, tool_name: &str) -> Result<()> {
+    // For now, update is just a force reinstall
+    if tool_name == "all" {
+        for tool in TOOLS {
+            println!("Updating {}...", tool.name);
+            install_single_tool(ctx, tool, true)?;
+            println!();
+        }
+        return Ok(());
+    }
+    
+    let tool = TOOLS.iter()
+        .find(|t| t.name == tool_name)
+        .ok_or_else(|| anyhow!(
+            "Unknown tool '{}'. Available: {}",
+            tool_name,
+            TOOLS.iter().map(|t| t.name).collect::<Vec<_>>().join(", ")
+        ))?;
+    
+    install_single_tool(ctx, tool, true)
+}
+
+fn tools_doctor(_ctx: &RuntimeContext) -> Result<()> {
+    use std::process::Command as ShellCommand;
+    
+    println!("Tool Health Check");
+    println!("=================\n");
+    
+    let mut all_healthy = true;
+    
+    for tool in TOOLS {
+        let (installed, _path, version) = check_tool_installed(tool);
+        
+        print!("{}: ", tool.name);
+        
+        if !installed {
+            println!("NOT INSTALLED");
+            all_healthy = false;
+            continue;
+        }
+        
+        // Tool-specific health checks
+        let health_ok = match tool.name {
+            "bv" => {
+                // Check if bv can access beads
+                let output = ShellCommand::new("bv")
+                    .arg("-help")
+                    .output();
+                output.is_ok() && output.unwrap().status.success()
+            }
+            "cass" => {
+                // Check if cass db exists
+                let output = ShellCommand::new("cass")
+                    .args(["--help"])
+                    .output();
+                output.is_ok() && output.unwrap().status.success()
+            }
+            "mcp_agent_mail" => {
+                // Check if module loads
+                let output = ShellCommand::new("python3")
+                    .args(["-c", "import mcp_agent_mail; print('ok')"])
+                    .output();
+                output.is_ok() && output.unwrap().status.success()
+            }
+            _ => true,
+        };
+        
+        if health_ok {
+            let ver = version.as_deref().unwrap_or("");
+            println!("OK {}", ver);
+        } else {
+            println!("ERROR (installed but not working)");
+            all_healthy = false;
+        }
+    }
+    
+    println!();
+    
+    // Check for MCP configuration
+    println!("MCP Configuration:");
+    let opencode_config_path = get_opencode_config_path();
+    
+    if opencode_config_path.exists() {
+        if let Ok(content) = fs::read_to_string(&opencode_config_path) {
+            if content.contains("mcp_agent_mail") {
+                println!("  mcp_agent_mail: configured in opencode");
+            } else {
+                println!("  mcp_agent_mail: NOT configured in opencode");
+                println!("  Run 'byt tools config mcp_agent_mail' to set up");
+            }
+        }
+    } else {
+        println!("  opencode config not found at {}", opencode_config_path.display());
+    }
+    
+    println!();
+    
+    if all_healthy {
+        println!("All tools are healthy!");
+    } else {
+        println!("Some tools need attention. Run 'byt tools install <tool>' to fix.");
+    }
+    
+    Ok(())
+}
+
+fn tools_config(ctx: &RuntimeContext, tool_name: &str, show: bool) -> Result<()> {
+    let tool = TOOLS.iter()
+        .find(|t| t.name == tool_name)
+        .ok_or_else(|| anyhow!(
+            "Unknown tool '{}'. Available: {}",
+            tool_name,
+            TOOLS.iter().map(|t| t.name).collect::<Vec<_>>().join(", ")
+        ))?;
+    
+    match tool.name {
+        "mcp_agent_mail" => config_mcp_agent_mail(ctx, show),
+        "cass" => {
+            println!("cass configuration:");
+            println!("  Data dir: {:?}", ctx.config.tools.cass.data_dir);
+            println!();
+            println!("cass uses default paths. Configure in ~/.config/byt/config.toml:");
+            println!("  [tools.cass]");
+            println!("  data_dir = \"~/.local/share/coding-agent-search\"");
+            Ok(())
+        }
+        "bv" => {
+            println!("bv configuration:");
+            println!("  Default flags: {:?}", ctx.config.tools.bv.default_flags);
+            println!();
+            println!("bv uses .beads/ in each repo. No global config needed.");
+            println!("Configure in ~/.config/byt/config.toml:");
+            println!("  [tools.bv]");
+            println!("  default_flags = [\"-robot-triage\"]");
+            Ok(())
+        }
+        _ => {
+            println!("No configuration available for {}", tool_name);
+            Ok(())
+        }
+    }
+}
+
+fn config_mcp_agent_mail(ctx: &RuntimeContext, show: bool) -> Result<()> {
+    let config = &ctx.config.tools.mcp_agent_mail;
+    
+    if show {
+        println!("mcp_agent_mail configuration:");
+        println!("  Port: {}", config.port);
+        println!("  Auto-start: {}", config.auto_start);
+        println!("  Venv path: {:?}", config.venv_path);
+        return Ok(());
+    }
+    
+    // Generate MCP server configuration for opencode
+    println!("Setting up mcp_agent_mail for opencode...\n");
+    
+    let config_path = get_opencode_config_path();
+    let opencode_config_dir = config_path.parent()
+        .ok_or_else(|| anyhow!("Could not determine config directory"))?;
+    
+    // Load existing config or create new
+    let mut config_value: serde_json::Value = if config_path.exists() {
+        let content = fs::read_to_string(&config_path)?;
+        serde_json::from_str(&content).unwrap_or(serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+    
+    // Add mcp_agent_mail server config
+    let mcp_config = serde_json::json!({
+        "command": "python3",
+        "args": ["-m", "mcp_agent_mail.server"],
+        "env": {
+            "MCP_AGENT_MAIL_PORT": config.port.to_string()
+        }
+    });
+    
+    // Ensure mcpServers exists
+    if config_value.get("mcpServers").is_none() {
+        config_value["mcpServers"] = serde_json::json!({});
+    }
+    
+    config_value["mcpServers"]["mcp_agent_mail"] = mcp_config;
+    
+    if ctx.common.dry_run {
+        println!("Would update {}:", config_path.display());
+        println!("{}", serde_json::to_string_pretty(&config_value)?);
+        return Ok(());
+    }
+    
+    // Write config
+    fs::create_dir_all(opencode_config_dir)?;
+    fs::write(&config_path, serde_json::to_string_pretty(&config_value)?)?;
+    
+    println!("Updated {}", config_path.display());
+    println!();
+    println!("mcp_agent_mail is now configured for opencode.");
+    println!("Restart opencode to activate the MCP server.");
+    
+    Ok(())
+}
+
 fn handle_completions(shell: Shell) -> Result<()> {
     let mut cmd = Cli::command();
     clap_complete::generate(shell, &mut cmd, APP_NAME, &mut io::stdout());
@@ -2816,6 +3435,18 @@ fn handle_completions(shell: Shell) -> Result<()> {
 // ============================================================================
 // Utility Functions
 // ============================================================================
+
+/// Get the path to opencode's config file
+/// Uses XDG_CONFIG_HOME if set, otherwise ~/.config/opencode/opencode.json
+fn get_opencode_config_path() -> PathBuf {
+    let config_dir = env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
+        .unwrap_or_else(|| PathBuf::from(".config"));
+    
+    config_dir.join("opencode").join("opencode.json")
+}
 
 fn load_config(paths: &AppPaths) -> Result<AppConfig> {
     if !paths.config_file.exists() {
