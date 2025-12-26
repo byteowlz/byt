@@ -141,7 +141,7 @@ enum Command {
         #[command(subcommand)]
         command: SchemaCommand,
     },
-    /// Manage external agent tools (bv, cass, mcp_agent_mail)
+    /// Manage external agent tools (bv, cass, mailz)
     Tools {
         #[command(subcommand)]
         command: ToolsCommand,
@@ -364,7 +364,7 @@ enum ToolsCommand {
     List,
     /// Install a tool
     Install {
-        /// Tool name (bv, cass, mcp_agent_mail, or 'all')
+        /// Tool name (bv, cass, mailz, or 'all')
         tool: String,
         /// Force reinstall even if already installed
         #[arg(long)]
@@ -372,7 +372,7 @@ enum ToolsCommand {
     },
     /// Update a tool to the latest version
     Update {
-        /// Tool name (bv, cass, mcp_agent_mail, or 'all')
+        /// Tool name (bv, cass, mailz, or 'all')
         tool: String,
     },
     /// Check tool health and configuration
@@ -584,8 +584,8 @@ struct AppConfig {
 struct ToolsConfig {
     /// Auto-install tools on first use
     auto_install: bool,
-    /// mcp_agent_mail configuration
-    mcp_agent_mail: McpAgentMailConfig,
+    /// mailz (agent coordination) configuration
+    mailz: MailzConfig,
     /// cass (coding agent session search) configuration
     cass: CassConfig,
     /// bv (beads viewer) configuration
@@ -596,7 +596,7 @@ impl Default for ToolsConfig {
     fn default() -> Self {
         Self {
             auto_install: false,
-            mcp_agent_mail: McpAgentMailConfig::default(),
+            mailz: MailzConfig::default(),
             cass: CassConfig::default(),
             bv: BvConfig::default(),
         }
@@ -605,22 +605,14 @@ impl Default for ToolsConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
-struct McpAgentMailConfig {
-    /// Port for the MCP server
-    port: u16,
-    /// Auto-start the server when needed
-    auto_start: bool,
-    /// Virtual environment path
-    venv_path: Option<String>,
+struct MailzConfig {
+    /// Database path (defaults to $XDG_DATA_HOME/mailz/mailz.db)
+    db_path: Option<String>,
 }
 
-impl Default for McpAgentMailConfig {
+impl Default for MailzConfig {
     fn default() -> Self {
-        Self {
-            port: 8765,
-            auto_start: false,
-            venv_path: None,
-        }
+        Self { db_path: None }
     }
 }
 
@@ -2984,14 +2976,11 @@ const TOOLS: &[ToolInfo] = &[
         ),
     },
     ToolInfo {
-        name: "mcp_agent_mail",
-        description: "Agent-to-agent coordination via MCP server (inbox/outbox, file reservations)",
-        binary: "mcp_agent_mail",  // Not a binary - it's a Python MCP server
-        repo: "Dicklesworthstone/mcp_agent_mail",
-        // Uses their one-liner installer which sets up uv, venv, and configures agents
-        install_method: InstallMethod::CurlScript(
-            "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail/main/scripts/install.sh"
-        ),
+        name: "mailz",
+        description: "Agent coordination MCP server (messaging, file reservations)",
+        binary: "mailz-mcp",
+        repo: "byteowlz/mailz",
+        install_method: InstallMethod::Cargo("--git https://github.com/byteowlz/mailz mailz-mcp"),
     },
 ];
 
@@ -3169,7 +3158,6 @@ fn install_single_tool(ctx: &RuntimeContext, tool: &ToolInfo, force: bool) -> Re
             // Tool-specific arguments
             let script_args = match tool.name {
                 "cass" => "--easy-mode",
-                "mcp_agent_mail" => "--yes",
                 _ => "",
             };
             
@@ -3316,10 +3304,10 @@ fn tools_doctor(_ctx: &RuntimeContext) -> Result<()> {
                     .output();
                 output.is_ok() && output.unwrap().status.success()
             }
-            "mcp_agent_mail" => {
-                // Check if module loads
-                let output = ShellCommand::new("python3")
-                    .args(["-c", "import mcp_agent_mail; print('ok')"])
+            "mailz" => {
+                // Check if mailz-mcp runs
+                let output = ShellCommand::new("mailz-mcp")
+                    .args(["--help"])
                     .output();
                 output.is_ok() && output.unwrap().status.success()
             }
@@ -3343,11 +3331,11 @@ fn tools_doctor(_ctx: &RuntimeContext) -> Result<()> {
     
     if opencode_config_path.exists() {
         if let Ok(content) = fs::read_to_string(&opencode_config_path) {
-            if content.contains("mcp_agent_mail") {
-                println!("  mcp_agent_mail: configured in opencode");
+            if content.contains("mailz") {
+                println!("  mailz: configured in opencode");
             } else {
-                println!("  mcp_agent_mail: NOT configured in opencode");
-                println!("  Run 'byt tools config mcp_agent_mail' to set up");
+                println!("  mailz: NOT configured in opencode");
+                println!("  Run 'byt tools config mailz' to set up");
             }
         }
     } else {
@@ -3375,7 +3363,7 @@ fn tools_config(ctx: &RuntimeContext, tool_name: &str, show: bool) -> Result<()>
         ))?;
     
     match tool.name {
-        "mcp_agent_mail" => config_mcp_agent_mail(ctx, show),
+        "mailz" => config_mailz(ctx, show),
         "cass" => {
             println!("cass configuration:");
             println!("  Data dir: {:?}", ctx.config.tools.cass.data_dir);
@@ -3402,24 +3390,39 @@ fn tools_config(ctx: &RuntimeContext, tool_name: &str, show: bool) -> Result<()>
     }
 }
 
-fn config_mcp_agent_mail(ctx: &RuntimeContext, show: bool) -> Result<()> {
-    let config = &ctx.config.tools.mcp_agent_mail;
-    
+fn config_mailz(ctx: &RuntimeContext, show: bool) -> Result<()> {
+    let config = &ctx.config.tools.mailz;
+
     if show {
-        println!("mcp_agent_mail configuration:");
-        println!("  Port: {}", config.port);
-        println!("  Auto-start: {}", config.auto_start);
-        println!("  Venv path: {:?}", config.venv_path);
+        println!("mailz configuration:");
+        println!("  Database path: {:?}", config.db_path);
         return Ok(());
     }
-    
+
+    // Check if mailz-mcp is installed
+    let mailz_path = which::which("mailz-mcp");
+    if mailz_path.is_err() {
+        println!("mailz-mcp is not installed.");
+        println!();
+        println!("To install mailz, run:");
+        println!("  byt tools install mailz");
+        println!();
+        println!("After installation, run 'byt tools config mailz' again.");
+        return Ok(());
+    }
+
+    let mailz_bin = mailz_path.unwrap();
+    println!("Found mailz-mcp at: {}", mailz_bin.display());
+    println!();
+
     // Generate MCP server configuration for opencode
-    println!("Setting up mcp_agent_mail for opencode...\n");
-    
+    println!("Setting up mailz for opencode...\n");
+
     let config_path = get_opencode_config_path();
-    let opencode_config_dir = config_path.parent()
+    let opencode_config_dir = config_path
+        .parent()
         .ok_or_else(|| anyhow!("Could not determine config directory"))?;
-    
+
     // Load existing config or create new
     let mut config_value: serde_json::Value = if config_path.exists() {
         let content = fs::read_to_string(&config_path)?;
@@ -3427,38 +3430,42 @@ fn config_mcp_agent_mail(ctx: &RuntimeContext, show: bool) -> Result<()> {
     } else {
         serde_json::json!({})
     };
-    
-    // Add mcp_agent_mail server config (opencode local MCP format)
-    let mcp_config = serde_json::json!({
+
+    // Add mailz MCP server config (opencode local MCP format)
+    // mailz-mcp is a standalone binary, much simpler than Python
+    let mut mcp_config = serde_json::json!({
         "type": "local",
-        "command": ["python3", "-m", "mcp_agent_mail.server"],
-        "environment": {
-            "MCP_AGENT_MAIL_PORT": config.port.to_string()
-        }
+        "command": [mailz_bin.to_string_lossy()],
+        "environment": {}
     });
-    
+
+    // Add custom db_path if configured
+    if let Some(db_path) = &config.db_path {
+        mcp_config["environment"]["MAILZ_DB_PATH"] = serde_json::Value::String(db_path.clone());
+    }
+
     // Ensure mcp exists (opencode uses "mcp" key)
     if config_value.get("mcp").is_none() {
         config_value["mcp"] = serde_json::json!({});
     }
-    
-    config_value["mcp"]["mcp_agent_mail"] = mcp_config;
-    
+
+    config_value["mcp"]["mailz"] = mcp_config;
+
     if ctx.common.dry_run {
         println!("Would update {}:", config_path.display());
         println!("{}", serde_json::to_string_pretty(&config_value)?);
         return Ok(());
     }
-    
+
     // Write config
     fs::create_dir_all(opencode_config_dir)?;
     fs::write(&config_path, serde_json::to_string_pretty(&config_value)?)?;
-    
+
     println!("Updated {}", config_path.display());
     println!();
-    println!("mcp_agent_mail is now configured for opencode.");
+    println!("mailz is now configured for opencode.");
     println!("Restart opencode to activate the MCP server.");
-    
+
     Ok(())
 }
 
