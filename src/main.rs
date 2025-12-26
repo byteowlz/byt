@@ -39,6 +39,7 @@ fn try_main() -> Result<()> {
         Command::Search(cmd) => handle_search(&ctx, cmd),
         Command::Memory { command } => handle_memory(&ctx, command),
         Command::Sync { command } => handle_sync(&ctx, command),
+        Command::Repos { command } => handle_repos(&ctx, command),
         Command::Init(cmd) => handle_init(&ctx, cmd),
         Command::Config { command } => handle_config(&ctx, command),
         Command::Secrets { command } => handle_secrets(&ctx, command),
@@ -121,6 +122,11 @@ enum Command {
     Sync {
         #[command(subcommand)]
         command: SyncCommand,
+    },
+    /// Manage repositories across machines
+    Repos {
+        #[command(subcommand)]
+        command: ReposCommand,
     },
     /// Initialize byt configuration
     Init(InitCommand),
@@ -273,6 +279,27 @@ enum SyncCommand {
         stores: Vec<String>,
     },
     /// Show sync status (what would be synced)
+    Status,
+}
+
+#[derive(Debug, Subcommand)]
+enum ReposCommand {
+    /// Sync all repositories and memories across machines
+    Sync {
+        /// Skip pulling changes from remote
+        #[arg(long)]
+        no_pull: bool,
+        /// Push local commits to remote
+        #[arg(long)]
+        push: bool,
+        /// Skip syncing memories via mmry export/import
+        #[arg(long)]
+        no_memories: bool,
+        /// Only sync specific repos (default: all in catalog)
+        #[arg(long, short = 'r')]
+        repos: Vec<String>,
+    },
+    /// Show status of all repositories (uncommitted changes, ahead/behind)
     Status,
 }
 
@@ -2062,6 +2089,393 @@ fn sync_status(ctx: &RuntimeContext) -> Result<()> {
         println!("  byt sync pull    # Import memories from .sync/");
     }
     
+    Ok(())
+}
+
+// ============================================================================
+// Repos Command Handlers
+// ============================================================================
+
+fn handle_repos(ctx: &RuntimeContext, command: ReposCommand) -> Result<()> {
+    match command {
+        ReposCommand::Sync {
+            no_pull,
+            push,
+            no_memories,
+            repos,
+        } => repos_sync(ctx, !no_pull, push, !no_memories, repos),
+        ReposCommand::Status => repos_status(ctx),
+    }
+}
+
+/// Sync all repositories and memories across machines
+fn repos_sync(
+    ctx: &RuntimeContext,
+    do_pull: bool,
+    do_push: bool,
+    sync_memories: bool,
+    explicit_repos: Vec<String>,
+) -> Result<()> {
+    use std::process::Command as ShellCommand;
+
+    let workspace = ctx.workspace_root();
+
+    // Load catalog to get all repos
+    let catalog_path = ctx.catalog_path();
+    let repos: Vec<String> = if !explicit_repos.is_empty() {
+        explicit_repos
+    } else if catalog_path.exists() {
+        let content = fs::read_to_string(&catalog_path)?;
+        let catalog: Catalog = serde_json::from_str(&content)?;
+        catalog.repos.keys().cloned().collect()
+    } else {
+        // Fallback: scan workspace for git repos
+        let mut found = Vec::new();
+        for entry in fs::read_dir(&workspace)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() && path.join(".git").exists() {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    found.push(name.to_string());
+                }
+            }
+        }
+        found
+    };
+
+    if repos.is_empty() {
+        println!("No repositories found. Run 'byt catalog refresh' first.");
+        return Ok(());
+    }
+
+    println!("Syncing {} repositories...\n", repos.len());
+
+    let mut pull_ok = 0;
+    let mut pull_failed = 0;
+    let mut push_ok = 0;
+    let mut push_failed = 0;
+    let mut has_changes = Vec::new();
+
+    for repo_name in &repos {
+        let repo_path = workspace.join(repo_name);
+        if !repo_path.exists() {
+            if !ctx.common.quiet {
+                println!("  {} - skipped (not found locally)", repo_name);
+            }
+            continue;
+        }
+
+        if !repo_path.join(".git").exists() {
+            if !ctx.common.quiet {
+                println!("  {} - skipped (not a git repo)", repo_name);
+            }
+            continue;
+        }
+
+        // Check for uncommitted changes first
+        let status_output = ShellCommand::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&repo_path)
+            .output()?;
+        let has_uncommitted = !status_output.stdout.is_empty();
+
+        if has_uncommitted {
+            has_changes.push(repo_name.clone());
+        }
+
+        // Pull
+        if do_pull {
+            if ctx.common.dry_run {
+                println!("  {} - would pull", repo_name);
+            } else {
+                let output = ShellCommand::new("git")
+                    .args(["pull", "--rebase", "--autostash"])
+                    .current_dir(&repo_path)
+                    .output()?;
+
+                if output.status.success() {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let summary = if stdout.contains("Already up to date") {
+                        "up to date"
+                    } else if stdout.contains("Fast-forward") {
+                        "fast-forward"
+                    } else {
+                        "pulled"
+                    };
+                    if !ctx.common.quiet {
+                        println!("  {} - {}", repo_name, summary);
+                    }
+                    pull_ok += 1;
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    eprintln!(
+                        "  {} - pull failed: {}",
+                        repo_name,
+                        stderr.lines().next().unwrap_or("unknown error")
+                    );
+                    pull_failed += 1;
+                }
+            }
+        }
+
+        // Push (only if requested and there are commits to push)
+        if do_push && !ctx.common.dry_run {
+            // Check if there are commits to push
+            let ahead_output = ShellCommand::new("git")
+                .args(["rev-list", "--count", "@{upstream}..HEAD"])
+                .current_dir(&repo_path)
+                .output();
+
+            if let Ok(output) = ahead_output {
+                let ahead_count: i32 = String::from_utf8_lossy(&output.stdout)
+                    .trim()
+                    .parse()
+                    .unwrap_or(0);
+
+                if ahead_count > 0 {
+                    let push_output = ShellCommand::new("git")
+                        .args(["push"])
+                        .current_dir(&repo_path)
+                        .output()?;
+
+                    if push_output.status.success() {
+                        if !ctx.common.quiet {
+                            println!("  {} - pushed {} commit(s)", repo_name, ahead_count);
+                        }
+                        push_ok += 1;
+                    } else {
+                        let stderr = String::from_utf8_lossy(&push_output.stderr);
+                        eprintln!(
+                            "  {} - push failed: {}",
+                            repo_name,
+                            stderr.lines().next().unwrap_or("unknown error")
+                        );
+                        push_failed += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // Sync memories if requested
+    if sync_memories && !ctx.common.dry_run {
+        println!();
+        println!("Syncing memories...");
+
+        // Get stores that match repos
+        let memory_stores: Vec<String> = repos
+            .iter()
+            .filter(|r| {
+                // Check if store exists
+                ShellCommand::new("mmry")
+                    .args(["stores", "info", r])
+                    .output()
+                    .map(|o| o.status.success())
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect();
+
+        // Always include govnr
+        let mut stores_to_sync = memory_stores;
+        if !stores_to_sync.contains(&"govnr".to_string()) {
+            stores_to_sync.insert(0, "govnr".to_string());
+        }
+
+        if do_pull {
+            // Import from sync dir (after git pull brought in new files)
+            let sync_dir = resolve_sync_dir(ctx)?;
+            if sync_dir.exists() {
+                for store in &stores_to_sync {
+                    let import_file = sync_dir.join(format!("{}.json", store));
+                    if import_file.exists() {
+                        let output = ShellCommand::new("mmry")
+                            .args([
+                                "import",
+                                &import_file.display().to_string(),
+                                "--store",
+                                store,
+                            ])
+                            .output();
+
+                        match output {
+                            Ok(o) if o.status.success() => {
+                                if !ctx.common.quiet {
+                                    println!("  {} - imported", store);
+                                }
+                            }
+                            Ok(o) => {
+                                let stderr = String::from_utf8_lossy(&o.stderr);
+                                if !ctx.common.quiet {
+                                    println!(
+                                        "  {} - import warning: {}",
+                                        store,
+                                        stderr.lines().next().unwrap_or("")
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("  {} - import error: {}", store, e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if do_push {
+            // Export to sync dir
+            let sync_dir = resolve_sync_dir(ctx)?;
+            fs::create_dir_all(&sync_dir)?;
+
+            for store in &stores_to_sync {
+                let output_file = sync_dir.join(format!("{}.json", store));
+                let output = ShellCommand::new("mmry")
+                    .args([
+                        "export",
+                        "--store",
+                        store,
+                        "-o",
+                        &output_file.display().to_string(),
+                    ])
+                    .output();
+
+                match output {
+                    Ok(o) if o.status.success() => {
+                        if !ctx.common.quiet {
+                            println!("  {} - exported", store);
+                        }
+                    }
+                    Ok(o) => {
+                        let stderr = String::from_utf8_lossy(&o.stderr);
+                        eprintln!(
+                            "  {} - export failed: {}",
+                            store,
+                            stderr.lines().next().unwrap_or("")
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("  {} - export error: {}", store, e);
+                    }
+                }
+            }
+        }
+    }
+
+    // Summary
+    println!();
+    if do_pull {
+        println!(
+            "Pull: {} ok, {} failed",
+            pull_ok,
+            pull_failed
+        );
+    }
+    if do_push {
+        println!(
+            "Push: {} ok, {} failed",
+            push_ok,
+            push_failed
+        );
+    }
+    if !has_changes.is_empty() {
+        println!();
+        println!("Repos with uncommitted changes:");
+        for repo in &has_changes {
+            println!("  - {}", repo);
+        }
+    }
+
+    if do_push && sync_memories {
+        println!();
+        println!("Don't forget to commit and push the .sync/ directory:");
+        println!("  cd ~/byteowlz/govnr && git add .sync && git commit -m 'sync memories' && git push");
+    }
+
+    Ok(())
+}
+
+/// Show status of all repositories
+fn repos_status(ctx: &RuntimeContext) -> Result<()> {
+    use std::process::Command as ShellCommand;
+
+    let workspace = ctx.workspace_root();
+    let catalog_path = ctx.catalog_path();
+
+    let repos: Vec<String> = if catalog_path.exists() {
+        let content = fs::read_to_string(&catalog_path)?;
+        let catalog: Catalog = serde_json::from_str(&content)?;
+        catalog.repos.keys().cloned().collect()
+    } else {
+        Vec::new()
+    };
+
+    if repos.is_empty() {
+        println!("No repositories in catalog. Run 'byt catalog refresh' first.");
+        return Ok(());
+    }
+
+    println!("Repository Status");
+    println!("=================\n");
+
+    for repo_name in &repos {
+        let repo_path = workspace.join(repo_name);
+        if !repo_path.exists() || !repo_path.join(".git").exists() {
+            println!("  {} - not found", repo_name);
+            continue;
+        }
+
+        // Get status info
+        let status_output = ShellCommand::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&repo_path)
+            .output()?;
+        let status_str = String::from_utf8_lossy(&status_output.stdout);
+        let uncommitted = !status_str.is_empty();
+        let uncommitted_count = status_str.lines().count();
+
+        // Get ahead/behind
+        let ahead_output = ShellCommand::new("git")
+            .args(["rev-list", "--count", "@{upstream}..HEAD"])
+            .current_dir(&repo_path)
+            .output();
+        let ahead: i32 = ahead_output
+            .as_ref()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().parse().unwrap_or(0))
+            .unwrap_or(0);
+
+        let behind_output = ShellCommand::new("git")
+            .args(["rev-list", "--count", "HEAD..@{upstream}"])
+            .current_dir(&repo_path)
+            .output();
+        let behind: i32 = behind_output
+            .as_ref()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().parse().unwrap_or(0))
+            .unwrap_or(0);
+
+        // Format status
+        let mut status_parts = Vec::new();
+        if uncommitted {
+            status_parts.push(format!("{} uncommitted", uncommitted_count));
+        }
+        if ahead > 0 {
+            status_parts.push(format!("{} ahead", ahead));
+        }
+        if behind > 0 {
+            status_parts.push(format!("{} behind", behind));
+        }
+
+        if status_parts.is_empty() {
+            println!("  {} - clean", repo_name);
+        } else {
+            println!("  {} - {}", repo_name, status_parts.join(", "));
+        }
+    }
+
     Ok(())
 }
 
