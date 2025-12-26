@@ -128,23 +128,13 @@
           "description": "Auto-install missing tools on first use",
           "default": false
         },
-        "mcp_agent_mail": {
+        "mailz": {
           "type": "object",
-          "description": "mcp_agent_mail - Agent-to-agent coordination via MCP server (https://github.com/Dicklesworthstone/mcp_agent_mail)",
+          "description": "mailz - Agent coordination MCP server for messaging and file reservations (https://github.com/byteowlz/mailz)",
           "properties": {
-            "port": {
-              "type": "integer",
-              "description": "Port for the MCP server",
-              "default": 8765
-            },
-            "auto_start": {
-              "type": "boolean",
-              "description": "Auto-start the server when needed",
-              "default": false
-            },
-            "venv_path": {
+            "db_path": {
               "type": "string",
-              "description": "Virtual environment path for isolated Python installs"
+              "description": "Database path (defaults to $XDG_DATA_HOME/mailz/mailz.db)"
             }
           },
           "additionalProperties": false

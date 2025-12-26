@@ -84,15 +84,11 @@ sync_dir = "govnr/.sync/memories"
 # Auto-install missing tools on first use (e.g., when running byt triage without bv)
 auto_install = false
 
-# mcp_agent_mail - Agent-to-agent coordination via MCP server
-# Source: https://github.com/Dicklesworthstone/mcp_agent_mail
-[tools.mcp_agent_mail]
-# Port for the MCP server
-port = 8765
-# Auto-start the server when needed
-auto_start = false
-# Virtual environment path (optional, for isolated Python installs)
-# venv_path = "~/.local/share/mcp_agent_mail/venv"
+# mailz - Agent coordination MCP server (messaging, file reservations)
+# Source: https://github.com/byteowlz/mailz
+[tools.mailz]
+# Database path (defaults to $XDG_DATA_HOME/mailz/mailz.db)
+# db_path = "~/.local/share/mailz/mailz.db"
 
 # cass - Coding Agent Session Search
 # Source: https://github.com/Dicklesworthstone/coding_agent_session_search
