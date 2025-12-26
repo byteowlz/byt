@@ -3428,11 +3428,11 @@ fn config_mcp_agent_mail(ctx: &RuntimeContext, show: bool) -> Result<()> {
         serde_json::json!({})
     };
     
-    // Add mcp_agent_mail server config
+    // Add mcp_agent_mail server config (opencode local MCP format)
     let mcp_config = serde_json::json!({
-        "command": "python3",
-        "args": ["-m", "mcp_agent_mail.server"],
-        "env": {
+        "type": "local",
+        "command": ["python3", "-m", "mcp_agent_mail.server"],
+        "environment": {
             "MCP_AGENT_MAIL_PORT": config.port.to_string()
         }
     });
