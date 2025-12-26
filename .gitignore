@@ -49,3 +49,6 @@ criterion/
 # IDE/Editor specific (Rust)
 .cargo/
 !.cargo/config.toml
+
+# bv (beads viewer) local config and caches
+.bv/
