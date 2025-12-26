@@ -77,3 +77,33 @@ base_url = "https://raw.githubusercontent.com/byteowlz/schemas/refs/heads/main"
 # Default: ".sync/memories" in workspace root
 # Set to "govnr/.sync/memories" to keep sync files in the govnr repo (recommended)
 sync_dir = "govnr/.sync/memories"
+
+# External agent tools settings
+# These tools enhance agent coordination and history search
+[tools]
+# Auto-install missing tools on first use (e.g., when running byt triage without bv)
+auto_install = false
+
+# mcp_agent_mail - Agent-to-agent coordination via MCP server
+# Source: https://github.com/Dicklesworthstone/mcp_agent_mail
+[tools.mcp_agent_mail]
+# Port for the MCP server
+port = 8765
+# Auto-start the server when needed
+auto_start = false
+# Virtual environment path (optional, for isolated Python installs)
+# venv_path = "~/.local/share/mcp_agent_mail/venv"
+
+# cass - Coding Agent Session Search
+# Source: https://github.com/Dicklesworthstone/coding_agent_session_search
+# Wraps via: byt search "query"
+[tools.cass]
+# Data directory for cass index (uses default if not set)
+# data_dir = "~/.local/share/coding-agent-search"
+
+# bv - Beads Viewer with graph analytics
+# Source: https://github.com/Dicklesworthstone/beads_viewer
+# Wraps via: byt triage
+[tools.bv]
+# Default flags to pass to bv (empty by default)
+# default_flags = ["-robot-triage"]
