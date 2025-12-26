@@ -3437,12 +3437,12 @@ fn config_mcp_agent_mail(ctx: &RuntimeContext, show: bool) -> Result<()> {
         }
     });
     
-    // Ensure mcp_servers exists (opencode uses "mcp_servers" not "mcpServers")
-    if config_value.get("mcp_servers").is_none() {
-        config_value["mcp_servers"] = serde_json::json!({});
+    // Ensure mcp exists (opencode uses "mcp" key)
+    if config_value.get("mcp").is_none() {
+        config_value["mcp"] = serde_json::json!({});
     }
     
-    config_value["mcp_servers"]["mcp_agent_mail"] = mcp_config;
+    config_value["mcp"]["mcp_agent_mail"] = mcp_config;
     
     if ctx.common.dry_run {
         println!("Would update {}:", config_path.display());
