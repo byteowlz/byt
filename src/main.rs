@@ -2688,8 +2688,9 @@ fn repos_compare(ctx: &RuntimeContext, explicit_repos: Vec<String>, explicit_mac
         
         // Build SSH command
         let port_str = remote.port.to_string();
+        // Use login shell to ensure PATH includes ~/.cargo/bin etc.
         let remote_cmd = format!(
-            "cd {} && byt repos status --json 2>/dev/null",
+            "cd {} && $HOME/.cargo/bin/byt repos status --json 2>/dev/null || byt repos status --json",
             workspace_path
         );
         
