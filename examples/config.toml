@@ -103,3 +103,26 @@ auto_install = false
 [tools.bv]
 # Default flags to pass to bv (empty by default)
 # default_flags = ["-robot-triage"]
+
+# Cross-machine sync settings
+# Configure remote machines for repository comparison
+[machines]
+# Local machine name (auto-detected from hostname if not set)
+# local_name = "macbook"
+
+# Remote machines for 'byt repos compare'
+# Each machine should have byt installed and SSH access configured
+
+# Example: Arch VM
+# [[machines.remotes]]
+# name = "archvm"
+# host = "user@archvm.local"
+# port = 22
+# workspace = "~/byteowlz"
+# identity_file = "~/.ssh/id_ed25519"
+
+# Example: Work server
+# [[machines.remotes]]
+# name = "workserver"
+# host = "myuser@work.example.com"
+# workspace = "/home/myuser/byteowlz"

@@ -301,6 +301,15 @@ enum ReposCommand {
     },
     /// Show status of all repositories (uncommitted changes, ahead/behind)
     Status,
+    /// Compare repository versions across configured machines
+    Compare {
+        /// Only compare specific repos
+        #[arg(long, short = 'r')]
+        repos: Vec<String>,
+        /// Only check specific machines (default: all configured)
+        #[arg(long, short = 'm')]
+        machines: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Args)]
@@ -604,6 +613,8 @@ struct AppConfig {
     sync: SyncConfig,
     /// External tools settings
     tools: ToolsConfig,
+    /// Remote machines for cross-machine sync
+    machines: MachinesConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -671,6 +682,47 @@ impl Default for BvConfig {
             default_flags: Vec::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct MachinesConfig {
+    /// Local machine name (for identification in output)
+    local_name: String,
+    /// Remote machines to compare with
+    remotes: Vec<RemoteMachine>,
+}
+
+impl Default for MachinesConfig {
+    fn default() -> Self {
+        Self {
+            local_name: hostname::get()
+                .map(|h| h.to_string_lossy().to_string())
+                .unwrap_or_else(|_| "local".to_string()),
+            remotes: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RemoteMachine {
+    /// Machine name (for display)
+    name: String,
+    /// SSH host (user@host or just host)
+    host: String,
+    /// SSH port (default: 22)
+    #[serde(default = "default_ssh_port")]
+    port: u16,
+    /// Path to workspace on remote machine
+    #[serde(default)]
+    workspace: Option<String>,
+    /// SSH identity file (optional)
+    #[serde(default)]
+    identity_file: Option<String>,
+}
+
+fn default_ssh_port() -> u16 {
+    22
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -819,6 +871,7 @@ impl Default for AppConfig {
             schemas: SchemaConfig::default(),
             sync: SyncConfig::default(),
             tools: ToolsConfig::default(),
+            machines: MachinesConfig::default(),
         }
     }
 }
@@ -2105,6 +2158,7 @@ fn handle_repos(ctx: &RuntimeContext, command: ReposCommand) -> Result<()> {
             repos,
         } => repos_sync(ctx, !no_pull, push, !no_memories, repos),
         ReposCommand::Status => repos_status(ctx),
+        ReposCommand::Compare { repos, machines } => repos_compare(ctx, repos, machines),
     }
 }
 
@@ -2395,10 +2449,114 @@ fn repos_sync(
     Ok(())
 }
 
-/// Show status of all repositories
-fn repos_status(ctx: &RuntimeContext) -> Result<()> {
+/// Repository status info for JSON output
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RepoStatusInfo {
+    name: String,
+    exists: bool,
+    head_commit: Option<String>,
+    head_date: Option<String>,
+    branch: Option<String>,
+    uncommitted: i32,
+    ahead: i32,
+    behind: i32,
+}
+
+/// Machine status response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MachineStatus {
+    machine: String,
+    repos: Vec<RepoStatusInfo>,
+}
+
+/// Get detailed status for a single repo
+fn get_repo_status(repo_path: &Path, repo_name: &str) -> RepoStatusInfo {
     use std::process::Command as ShellCommand;
 
+    if !repo_path.exists() || !repo_path.join(".git").exists() {
+        return RepoStatusInfo {
+            name: repo_name.to_string(),
+            exists: false,
+            head_commit: None,
+            head_date: None,
+            branch: None,
+            uncommitted: 0,
+            ahead: 0,
+            behind: 0,
+        };
+    }
+
+    // Get HEAD commit hash
+    let head_commit = ShellCommand::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .current_dir(repo_path)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+
+    // Get HEAD commit date (ISO format)
+    let head_date = ShellCommand::new("git")
+        .args(["log", "-1", "--format=%cI"])
+        .current_dir(repo_path)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+
+    // Get current branch
+    let branch = ShellCommand::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(repo_path)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+
+    // Get uncommitted count
+    let status_output = ShellCommand::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(repo_path)
+        .output();
+    let uncommitted = status_output
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines().count() as i32)
+        .unwrap_or(0);
+
+    // Get ahead count
+    let ahead = ShellCommand::new("git")
+        .args(["rev-list", "--count", "@{upstream}..HEAD"])
+        .current_dir(repo_path)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().parse().unwrap_or(0))
+        .unwrap_or(0);
+
+    // Get behind count
+    let behind = ShellCommand::new("git")
+        .args(["rev-list", "--count", "HEAD..@{upstream}"])
+        .current_dir(repo_path)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().parse().unwrap_or(0))
+        .unwrap_or(0);
+
+    RepoStatusInfo {
+        name: repo_name.to_string(),
+        exists: true,
+        head_commit,
+        head_date,
+        branch,
+        uncommitted,
+        ahead,
+        behind,
+    }
+}
+
+/// Show status of all repositories
+fn repos_status(ctx: &RuntimeContext) -> Result<()> {
     let workspace = ctx.workspace_root();
     let catalog_path = ctx.catalog_path();
 
@@ -2411,70 +2569,267 @@ fn repos_status(ctx: &RuntimeContext) -> Result<()> {
     };
 
     if repos.is_empty() {
-        println!("No repositories in catalog. Run 'byt catalog refresh' first.");
+        if ctx.common.json {
+            println!("[]");
+        } else {
+            println!("No repositories in catalog. Run 'byt catalog refresh' first.");
+        }
         return Ok(());
     }
 
-    println!("Repository Status");
-    println!("=================\n");
+    let statuses: Vec<RepoStatusInfo> = repos
+        .iter()
+        .map(|name| get_repo_status(&workspace.join(name), name))
+        .collect();
 
-    for repo_name in &repos {
-        let repo_path = workspace.join(repo_name);
-        if !repo_path.exists() || !repo_path.join(".git").exists() {
-            println!("  {} - not found", repo_name);
-            continue;
-        }
+    if ctx.common.json {
+        let machine_status = MachineStatus {
+            machine: ctx.config.machines.local_name.clone(),
+            repos: statuses,
+        };
+        println!("{}", serde_json::to_string_pretty(&machine_status)?);
+    } else {
+        println!("Repository Status");
+        println!("=================\n");
 
-        // Get status info
-        let status_output = ShellCommand::new("git")
-            .args(["status", "--porcelain"])
-            .current_dir(&repo_path)
-            .output()?;
-        let status_str = String::from_utf8_lossy(&status_output.stdout);
-        let uncommitted = !status_str.is_empty();
-        let uncommitted_count = status_str.lines().count();
+        for status in &statuses {
+            if !status.exists {
+                println!("  {} - not found", status.name);
+                continue;
+            }
 
-        // Get ahead/behind
-        let ahead_output = ShellCommand::new("git")
-            .args(["rev-list", "--count", "@{upstream}..HEAD"])
-            .current_dir(&repo_path)
-            .output();
-        let ahead: i32 = ahead_output
-            .as_ref()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().parse().unwrap_or(0))
-            .unwrap_or(0);
+            let mut parts = Vec::new();
+            if status.uncommitted > 0 {
+                parts.push(format!("{} uncommitted", status.uncommitted));
+            }
+            if status.ahead > 0 {
+                parts.push(format!("{} ahead", status.ahead));
+            }
+            if status.behind > 0 {
+                parts.push(format!("{} behind", status.behind));
+            }
 
-        let behind_output = ShellCommand::new("git")
-            .args(["rev-list", "--count", "HEAD..@{upstream}"])
-            .current_dir(&repo_path)
-            .output();
-        let behind: i32 = behind_output
-            .as_ref()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().parse().unwrap_or(0))
-            .unwrap_or(0);
-
-        // Format status
-        let mut status_parts = Vec::new();
-        if uncommitted {
-            status_parts.push(format!("{} uncommitted", uncommitted_count));
-        }
-        if ahead > 0 {
-            status_parts.push(format!("{} ahead", ahead));
-        }
-        if behind > 0 {
-            status_parts.push(format!("{} behind", behind));
-        }
-
-        if status_parts.is_empty() {
-            println!("  {} - clean", repo_name);
-        } else {
-            println!("  {} - {}", repo_name, status_parts.join(", "));
+            if parts.is_empty() {
+                println!("  {} - clean ({})", status.name, status.head_commit.as_deref().unwrap_or("?"));
+            } else {
+                println!("  {} - {} ({})", status.name, parts.join(", "), status.head_commit.as_deref().unwrap_or("?"));
+            }
         }
     }
+
+    Ok(())
+}
+
+/// Compare repositories across configured machines
+fn repos_compare(ctx: &RuntimeContext, explicit_repos: Vec<String>, explicit_machines: Vec<String>) -> Result<()> {
+    use std::process::Command as ShellCommand;
+    use std::collections::HashMap;
+
+    let workspace = ctx.workspace_root();
+    let catalog_path = ctx.catalog_path();
+
+    // Get repos to compare
+    let repos: Vec<String> = if !explicit_repos.is_empty() {
+        explicit_repos
+    } else if catalog_path.exists() {
+        let content = fs::read_to_string(&catalog_path)?;
+        let catalog: Catalog = serde_json::from_str(&content)?;
+        catalog.repos.keys().cloned().collect()
+    } else {
+        Vec::new()
+    };
+
+    if repos.is_empty() {
+        println!("No repositories to compare. Run 'byt catalog refresh' first.");
+        return Ok(());
+    }
+
+    // Get machines to query
+    let remotes: Vec<&RemoteMachine> = if !explicit_machines.is_empty() {
+        ctx.config.machines.remotes.iter()
+            .filter(|m| explicit_machines.contains(&m.name))
+            .collect()
+    } else {
+        ctx.config.machines.remotes.iter().collect()
+    };
+
+    if remotes.is_empty() && ctx.config.machines.remotes.is_empty() {
+        println!("No remote machines configured.");
+        println!();
+        println!("Add machines to ~/.config/byt/config.toml:");
+        println!();
+        println!("  [[machines.remotes]]");
+        println!("  name = \"archvm\"");
+        println!("  host = \"user@archvm\"");
+        println!("  workspace = \"~/byteowlz\"");
+        return Ok(());
+    }
+
+    // Collect status from local machine
+    let local_name = &ctx.config.machines.local_name;
+    let local_statuses: Vec<RepoStatusInfo> = repos
+        .iter()
+        .map(|name| get_repo_status(&workspace.join(name), name))
+        .collect();
+
+    let mut all_statuses: HashMap<String, MachineStatus> = HashMap::new();
+    all_statuses.insert(local_name.clone(), MachineStatus {
+        machine: local_name.clone(),
+        repos: local_statuses,
+    });
+
+    // Query remote machines via SSH
+    for remote in &remotes {
+        if !ctx.common.quiet {
+            eprint!("Querying {}... ", remote.name);
+        }
+
+        let workspace_path = remote.workspace.as_deref().unwrap_or("~/byteowlz");
+        
+        // Build SSH command
+        let port_str = remote.port.to_string();
+        let remote_cmd = format!(
+            "cd {} && byt repos status --json 2>/dev/null",
+            workspace_path
+        );
+        
+        let mut ssh_args: Vec<&str> = vec!["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"];
+        if remote.port != 22 {
+            ssh_args.extend(["-p", &port_str]);
+        }
+        if let Some(ref identity) = remote.identity_file {
+            ssh_args.extend(["-i", identity]);
+        }
+        ssh_args.push(&remote.host);
+        ssh_args.push(&remote_cmd);
+
+        let output = ShellCommand::new("ssh")
+            .args(&ssh_args)
+            .output();
+
+        match output {
+            Ok(o) if o.status.success() => {
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                match serde_json::from_str::<MachineStatus>(&stdout) {
+                    Ok(status) => {
+                        if !ctx.common.quiet {
+                            eprintln!("OK");
+                        }
+                        all_statuses.insert(remote.name.clone(), status);
+                    }
+                    Err(e) => {
+                        if !ctx.common.quiet {
+                            eprintln!("parse error: {}", e);
+                        }
+                    }
+                }
+            }
+            Ok(o) => {
+                if !ctx.common.quiet {
+                    let stderr = String::from_utf8_lossy(&o.stderr);
+                    eprintln!("failed: {}", stderr.lines().next().unwrap_or("unknown error"));
+                }
+            }
+            Err(e) => {
+                if !ctx.common.quiet {
+                    eprintln!("error: {}", e);
+                }
+            }
+        }
+    }
+
+    if ctx.common.json {
+        println!("{}", serde_json::to_string_pretty(&all_statuses)?);
+        return Ok(());
+    }
+
+    // Build comparison table
+    println!();
+    println!("Repository Comparison Across Machines");
+    println!("=====================================");
+    println!();
+
+    // Get all machine names in order (local first)
+    let mut machine_names: Vec<&String> = vec![local_name];
+    for remote in &remotes {
+        if all_statuses.contains_key(&remote.name) {
+            machine_names.push(&remote.name);
+        }
+    }
+
+    // Print header
+    print!("{:<20}", "Repository");
+    for name in &machine_names {
+        print!(" {:>15}", name);
+    }
+    println!();
+    print!("{:<20}", "----------");
+    for _ in &machine_names {
+        print!(" {:>15}", "---------------");
+    }
+    println!();
+
+    // Print each repo
+    for repo_name in &repos {
+        print!("{:<20}", repo_name);
+
+        let mut commits: Vec<Option<&str>> = Vec::new();
+        let mut dates: Vec<Option<&str>> = Vec::new();
+
+        for machine_name in &machine_names {
+            if let Some(status) = all_statuses.get(*machine_name) {
+                if let Some(repo) = status.repos.iter().find(|r| &r.name == repo_name) {
+                    if repo.exists {
+                        let commit = repo.head_commit.as_deref().unwrap_or("?");
+                        let uncommitted = if repo.uncommitted > 0 {
+                            format!("*{}", commit)
+                        } else {
+                            commit.to_string()
+                        };
+                        print!(" {:>15}", uncommitted);
+                        commits.push(repo.head_commit.as_deref());
+                        dates.push(repo.head_date.as_deref());
+                    } else {
+                        print!(" {:>15}", "-");
+                        commits.push(None);
+                        dates.push(None);
+                    }
+                } else {
+                    print!(" {:>15}", "-");
+                    commits.push(None);
+                    dates.push(None);
+                }
+            } else {
+                print!(" {:>15}", "?");
+                commits.push(None);
+                dates.push(None);
+            }
+        }
+
+        // Determine which machine has the newest version
+        let newest_idx = dates.iter().enumerate()
+            .filter_map(|(i, d)| d.map(|date| (i, date)))
+            .max_by_key(|(_, date)| *date)
+            .map(|(i, _)| i);
+
+        // Check if all commits match
+        let all_same = commits.iter()
+            .filter_map(|c| *c)
+            .collect::<Vec<_>>()
+            .windows(2)
+            .all(|w| w[0] == w[1]);
+
+        if !all_same {
+            if let Some(idx) = newest_idx {
+                print!("  <- {}", machine_names[idx]);
+            }
+        }
+
+        println!();
+    }
+
+    println!();
+    println!("Legend: * = has uncommitted changes, <- = newest version");
 
     Ok(())
 }
