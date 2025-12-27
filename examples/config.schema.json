@@ -167,6 +167,49 @@
         }
       },
       "additionalProperties": false
+    },
+    "machines": {
+      "type": "object",
+      "description": "Cross-machine sync settings for repository comparison",
+      "properties": {
+        "local_name": {
+          "type": "string",
+          "description": "Local machine name for identification in output (auto-detected from hostname if not set)"
+        },
+        "remotes": {
+          "type": "array",
+          "description": "Remote machines to compare with",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "Machine name for display"
+              },
+              "host": {
+                "type": "string",
+                "description": "SSH host (user@host or just host)"
+              },
+              "port": {
+                "type": "integer",
+                "description": "SSH port",
+                "default": 22
+              },
+              "workspace": {
+                "type": "string",
+                "description": "Path to workspace on remote machine"
+              },
+              "identity_file": {
+                "type": "string",
+                "description": "SSH identity file path"
+              }
+            },
+            "required": ["name", "host"],
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
     }
   },
   "additionalProperties": false
