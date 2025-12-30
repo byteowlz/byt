@@ -399,6 +399,19 @@ struct NewCommand {
     /// Directory to create project in (default: current directory)
     #[arg(short, long)]
     output: Option<PathBuf>,
+    /// Clone from a git repository URL instead of using a template
+    /// Can be a full URL (https://github.com/user/repo) or shorthand (user/repo for GitHub)
+    #[arg(long, conflicts_with = "template")]
+    from_git: Option<String>,
+    /// When using --from-git, only use files from this subdirectory
+    #[arg(long, requires = "from_git")]
+    subdir: Option<String>,
+    /// Git branch/tag/commit to clone (default: main or master)
+    #[arg(long, requires = "from_git")]
+    git_ref: Option<String>,
+    /// Skip variable replacement in cloned repo files
+    #[arg(long)]
+    no_replace: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -552,13 +565,11 @@ impl RuntimeContext {
         let config = load_config(&paths)?;
         
         // Apply workspace override from config if not already set via CLI
-        if common.workspace.is_none() {
-            if let Some(ref ws) = config.workspace {
-                if let Ok(expanded) = expand_path(PathBuf::from(ws)) {
+        if common.workspace.is_none()
+            && let Some(ref ws) = config.workspace
+                && let Ok(expanded) = expand_path(PathBuf::from(ws)) {
                     paths.workspace_root = expanded;
                 }
-            }
-        }
         
         Ok(Self {
             common,
@@ -670,6 +681,7 @@ struct AppConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 struct ToolsConfig {
     /// Auto-install tools on first use
     auto_install: bool,
@@ -681,59 +693,33 @@ struct ToolsConfig {
     bv: BvConfig,
 }
 
-impl Default for ToolsConfig {
-    fn default() -> Self {
-        Self {
-            auto_install: false,
-            mailz: MailzConfig::default(),
-            cass: CassConfig::default(),
-            bv: BvConfig::default(),
-        }
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 struct MailzConfig {
     /// Database path (defaults to $XDG_DATA_HOME/mailz/mailz.db)
     db_path: Option<String>,
 }
 
-impl Default for MailzConfig {
-    fn default() -> Self {
-        Self { db_path: None }
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 struct CassConfig {
     /// Data directory for cass
     data_dir: Option<String>,
 }
 
-impl Default for CassConfig {
-    fn default() -> Self {
-        Self {
-            data_dir: None,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 struct BvConfig {
     /// Default flags to pass to bv
     default_flags: Vec<String>,
 }
 
-impl Default for BvConfig {
-    fn default() -> Self {
-        Self {
-            default_flags: Vec::new(),
-        }
-    }
-}
 
 /// Machine configuration - a flat list of all machines in the ecosystem.
 /// byt auto-detects which machine is local by matching hostname.
@@ -1551,35 +1537,27 @@ fn analyze_repo(path: &Path, name: &str, full: bool) -> Result<RepoInfo> {
 
 fn get_repo_description(path: &Path) -> Option<String> {
     // Try to get from Cargo.toml
-    if let Ok(content) = fs::read_to_string(path.join("Cargo.toml")) {
-        if let Ok(cargo) = content.parse::<toml::Table>() {
-            if let Some(pkg) = cargo.get("package").and_then(|p| p.as_table()) {
-                if let Some(desc) = pkg.get("description").and_then(|d| d.as_str()) {
+    if let Ok(content) = fs::read_to_string(path.join("Cargo.toml"))
+        && let Ok(cargo) = content.parse::<toml::Table>()
+            && let Some(pkg) = cargo.get("package").and_then(|p| p.as_table())
+                && let Some(desc) = pkg.get("description").and_then(|d| d.as_str()) {
                     return Some(desc.to_string());
                 }
-            }
-        }
-    }
 
     // Try to get from package.json
-    if let Ok(content) = fs::read_to_string(path.join("package.json")) {
-        if let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&content) {
-            if let Some(desc) = pkg.get("description").and_then(|d| d.as_str()) {
+    if let Ok(content) = fs::read_to_string(path.join("package.json"))
+        && let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&content)
+            && let Some(desc) = pkg.get("description").and_then(|d| d.as_str()) {
                 return Some(desc.to_string());
             }
-        }
-    }
 
     // Try to get from pyproject.toml
-    if let Ok(content) = fs::read_to_string(path.join("pyproject.toml")) {
-        if let Ok(pyproject) = content.parse::<toml::Table>() {
-            if let Some(project) = pyproject.get("project").and_then(|p| p.as_table()) {
-                if let Some(desc) = project.get("description").and_then(|d| d.as_str()) {
+    if let Ok(content) = fs::read_to_string(path.join("pyproject.toml"))
+        && let Ok(pyproject) = content.parse::<toml::Table>()
+            && let Some(project) = pyproject.get("project").and_then(|p| p.as_table())
+                && let Some(desc) = project.get("description").and_then(|d| d.as_str()) {
                     return Some(desc.to_string());
                 }
-            }
-        }
-    }
 
     None
 }
@@ -1902,8 +1880,8 @@ fn display_triage(triage: &serde_json::Value, next_only: bool) {
     }
 
     // Full triage display
-    if let Some(triage_data) = triage.get("triage") {
-        if let Some(quick_ref) = triage_data.get("quick_ref") {
+    if let Some(triage_data) = triage.get("triage")
+        && let Some(quick_ref) = triage_data.get("quick_ref") {
             let open = quick_ref.get("open_count").and_then(|v| v.as_i64()).unwrap_or(0);
             let actionable = quick_ref.get("actionable_count").and_then(|v| v.as_i64()).unwrap_or(0);
             let blocked = quick_ref.get("blocked_count").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -1927,7 +1905,6 @@ fn display_triage(triage: &serde_json::Value, next_only: bool) {
                 }
             }
         }
-    }
 }
 
 fn handle_search(ctx: &RuntimeContext, cmd: SearchCommand) -> Result<()> {
@@ -2090,8 +2067,8 @@ fn detect_current_project(ctx: &RuntimeContext) -> Result<String> {
     // Check if cwd is within the workspace
     if let Ok(relative) = cwd.strip_prefix(workspace) {
         // Get the first component (repo name)
-        if let Some(first) = relative.components().next() {
-            if let Some(name) = first.as_os_str().to_str() {
+        if let Some(first) = relative.components().next()
+            && let Some(name) = first.as_os_str().to_str() {
                 // Check if this is a valid repo in the catalog
                 let catalog_path = ctx.catalog_path();
                 if catalog_path.exists() {
@@ -2104,7 +2081,6 @@ fn detect_current_project(ctx: &RuntimeContext) -> Result<String> {
                     }
                 }
             }
-        }
     }
     
     // If at workspace root or outside workspace, use govnr
@@ -2201,7 +2177,7 @@ fn list_memory_projects(ctx: &RuntimeContext) -> Result<()> {
     let existing_stores: Vec<&str> = stores_output
         .lines()
         .filter(|l| l.starts_with("  "))
-        .filter_map(|l| l.trim().split_whitespace().next())
+        .filter_map(|l| l.split_whitespace().next())
         .collect();
     
     // Get catalog repos
@@ -2315,7 +2291,7 @@ fn get_existing_stores() -> Result<Vec<String>> {
     let stores: Vec<String> = stdout
         .lines()
         .filter(|l| l.starts_with("  "))
-        .filter_map(|l| l.trim().split_whitespace().next())
+        .filter_map(|l| l.split_whitespace().next())
         .map(|s| s.to_string())
         .collect();
     
@@ -2352,15 +2328,14 @@ fn sync_push(ctx: &RuntimeContext, explicit_stores: Vec<String>) -> Result<()> {
         
         if output.status.success() {
             // Count memories in export
-            if let Ok(content) = fs::read_to_string(&output_file) {
-                if let Ok(export) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Ok(content) = fs::read_to_string(&output_file)
+                && let Ok(export) = serde_json::from_str::<serde_json::Value>(&content) {
                     let count = export.get("memory_count").and_then(|v| v.as_i64()).unwrap_or(0);
                     total_memories += count;
                     if !ctx.common.quiet {
                         println!("  {} ({} memories)", store, count);
                     }
                 }
-            }
             exported += 1;
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -2415,14 +2390,13 @@ fn sync_pull(ctx: &RuntimeContext, explicit_stores: Vec<String>) -> Result<()> {
         for entry in fs::read_dir(&sync_dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().map(|e| e == "json").unwrap_or(false) {
-                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            if path.extension().map(|e| e == "json").unwrap_or(false)
+                && let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
                     // Always sync govnr, or sync if repo exists locally
                     if stem == "govnr" || local_repos.contains(&stem.to_string()) {
                         stores.push(stem.to_string());
                     }
                 }
-            }
         }
         stores
     } else {
@@ -2636,14 +2610,13 @@ fn repos_sync(
     } else {
         // Fallback: scan workspace for git repos
         let mut found = Vec::new();
-        for entry in fs::read_dir(&workspace)? {
+        for entry in fs::read_dir(workspace)? {
             let entry = entry?;
             let path = entry.path();
-            if path.is_dir() && path.join(".git").exists() {
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if path.is_dir() && path.join(".git").exists()
+                && let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                     found.push(name.to_string());
                 }
-            }
         }
         found
     };
@@ -3273,11 +3246,10 @@ fn repos_compare(ctx: &RuntimeContext, explicit_repos: Vec<String>, explicit_mac
             .windows(2)
             .all(|w| w[0] == w[1]);
 
-        if !all_same {
-            if let Some(idx) = newest_idx {
+        if !all_same
+            && let Some(idx) = newest_idx {
                 print!("  <- {}", machine_names[idx]);
             }
-        }
 
         println!();
     }
@@ -3559,140 +3531,67 @@ fn handle_secrets(ctx: &RuntimeContext, command: SecretsCommand) -> Result<()> {
 fn handle_new(ctx: &RuntimeContext, cmd: NewCommand) -> Result<()> {
     use std::process::Command;
     
-    let templates_cfg = &ctx.config.templates;
     let release_cfg = &ctx.config.release;
     
     // Determine output directory
-    let output_dir = cmd.output.unwrap_or_else(|| PathBuf::from("."));
+    let output_dir = cmd.output.clone().unwrap_or_else(|| PathBuf::from("."));
     let project_dir = output_dir.join(&cmd.name);
     
     if project_dir.exists() {
         return Err(anyhow!("Directory '{}' already exists", project_dir.display()));
     }
     
-    println!("Creating new {} project: {}", cmd.template, cmd.name);
-    
-    // Clone template from GitHub
-    let template_url = format!(
-        "https://github.com/{}/archive/refs/heads/{}.zip",
-        templates_cfg.repo, templates_cfg.branch
-    );
-    
-    // Create temp dir for download
-    let temp_dir = std::env::temp_dir().join(format!("byt-template-{}", std::process::id()));
-    fs::create_dir_all(&temp_dir)?;
-    
-    // Download and extract template
-    println!("Fetching template from {}...", templates_cfg.repo);
-    
-    let zip_path = temp_dir.join("template.zip");
-    let output = Command::new("curl")
-        .args(["-sL", "-o", zip_path.to_str().unwrap(), &template_url])
-        .output()
-        .context("downloading template")?;
-    
-    if !output.status.success() {
-        let _ = fs::remove_dir_all(&temp_dir);
-        return Err(anyhow!("Failed to download template"));
-    }
-    
-    // Extract zip
-    let extract_dir = temp_dir.join("extracted");
-    let output = Command::new("unzip")
-        .args(["-q", zip_path.to_str().unwrap(), "-d", extract_dir.to_str().unwrap()])
-        .output()
-        .context("extracting template")?;
-    
-    if !output.status.success() {
-        let _ = fs::remove_dir_all(&temp_dir);
-        return Err(anyhow!("Failed to extract template"));
-    }
-    
-    // Find the templates root directory (repo-branch/)
-    let repo_name = templates_cfg.repo.split('/').last().unwrap_or("templates");
-    let templates_root = extract_dir.join(format!("{}-{}", repo_name, templates_cfg.branch));
-    let template_src = templates_root.join(&cmd.template);
-    
-    if !template_src.exists() {
-        let _ = fs::remove_dir_all(&temp_dir);
-        return Err(anyhow!(
-            "Template '{}' not found. Available: rust-cli, rust-workspace, python-cli, go-cli",
-            cmd.template
-        ));
-    }
-    
-    // Check for template manifest (template.toml)
-    let manifest_path = template_src.join("template.toml");
-    let manifest: Option<TemplateManifest> = if manifest_path.exists() {
-        let content = fs::read_to_string(&manifest_path)
-            .context("reading template.toml")?;
-        Some(toml::from_str(&content).context("parsing template.toml")?)
+    // Branch based on whether we're using git clone or templates
+    if let Some(ref git_source) = cmd.from_git {
+        // Git-based scaffolding
+        scaffold_from_git(ctx, &cmd, &project_dir, git_source)?;
     } else {
-        None
-    };
-    
-    // Copy template to project directory
-    println!("Creating project structure...");
-    copy_dir_recursive(&template_src, &project_dir)?;
-    
-    // Remove template.toml from the project (it's only for byt)
-    let project_manifest = project_dir.join("template.toml");
-    if project_manifest.exists() {
-        fs::remove_file(&project_manifest)?;
+        // Template-based scaffolding (original behavior)
+        scaffold_from_template(ctx, &cmd, &project_dir)?;
     }
     
-    // Apply template composition if defined
-    if let Some(ref manifest) = manifest {
-        for comp in &manifest.compose {
-            let source_template = templates_root.join(&comp.source);
-            if !source_template.exists() {
-                eprintln!("Warning: Composed template '{}' not found, skipping", comp.source);
-                continue;
+    // Apply variable replacements unless skipped
+    if !cmd.no_replace {
+        println!("Configuring project...");
+        replace_in_files(&project_dir, "{{project_name}}", &cmd.name)?;
+        replace_in_files(&project_dir, "your-binary-name", &cmd.name)?;
+        
+        // For git-cloned repos, also replace common template patterns
+        if cmd.from_git.is_some() {
+            // Extract the repo name from the git URL for replacements
+            if let Some(ref source) = cmd.from_git
+                && let Some(source_name) = extract_repo_name(source) {
+                    replace_in_files(&project_dir, &source_name, &cmd.name)?;
+                    // Also try with underscores (for Python modules)
+                    let source_underscore = source_name.replace('-', "_");
+                    let name_underscore = cmd.name.replace('-', "_");
+                    if source_underscore != source_name {
+                        replace_in_files(&project_dir, &source_underscore, &name_underscore)?;
+                    }
             }
-            
-            let target_dir = project_dir.join(&comp.target);
-            println!("  Composing {} -> {}", comp.source, comp.target);
-            
-            // Remove target directory if it exists (will be replaced by composed template)
-            if target_dir.exists() {
-                fs::remove_dir_all(&target_dir)?;
-            }
-            
-            // Copy composed template, excluding specified files
-            copy_dir_filtered(&source_template, &target_dir, &comp.exclude)?;
-            
-            // Remove template.toml from composed template too
-            let composed_manifest = target_dir.join("template.toml");
-            if composed_manifest.exists() {
-                fs::remove_file(&composed_manifest)?;
-            }
+        } else {
+            // Rename directories/files if needed (e.g., python_cli -> project_name)
+            rename_template_dirs(&project_dir, &cmd.template, &cmd.name)?;
         }
     }
     
-    // Replace template variables
-    println!("Configuring project...");
-    replace_in_files(&project_dir, "{{project_name}}", &cmd.name)?;
-    replace_in_files(&project_dir, "your-binary-name", &cmd.name)?;
+    // Initialize git (only if not already a git repo from clone)
+    if !project_dir.join(".git").exists() {
+        println!("Initializing git...");
+        let _ = Command::new("git")
+            .args(["init"])
+            .current_dir(&project_dir)
+            .output();
+    }
     
-    // Rename directories/files if needed (e.g., python_cli -> project_name)
-    rename_template_dirs(&project_dir, &cmd.template, &cmd.name)?;
-    
-    // Clean up temp
-    let _ = fs::remove_dir_all(&temp_dir);
-    
-    // Initialize git
-    println!("Initializing git...");
-    let _ = Command::new("git")
-        .args(["init"])
-        .current_dir(&project_dir)
-        .output();
-    
-    // Initialize beads
-    println!("Initializing beads...");
-    let _ = Command::new("bd")
-        .args(["init"])
-        .current_dir(&project_dir)
-        .output();
+    // Initialize beads if not already present
+    if !project_dir.join(".beads").exists() {
+        println!("Initializing beads...");
+        let _ = Command::new("bd")
+            .args(["init"])
+            .current_dir(&project_dir)
+            .output();
+    }
     
     // Create GitHub repo if requested
     if cmd.github {
@@ -3747,6 +3646,281 @@ fn handle_new(ctx: &RuntimeContext, cmd: NewCommand) -> Result<()> {
     }
     
     Ok(())
+}
+
+/// Scaffold a project from a git repository
+fn scaffold_from_git(
+    ctx: &RuntimeContext,
+    cmd: &NewCommand,
+    project_dir: &Path,
+    git_source: &str,
+) -> Result<()> {
+    use std::process::Command;
+    
+    // Normalize the git URL
+    let git_url = normalize_git_url(git_source);
+    
+    println!("Creating new project from git: {}", cmd.name);
+    println!("Source: {}", git_url);
+    
+    // Create temp dir for clone
+    let temp_dir = std::env::temp_dir().join(format!("byt-git-{}", std::process::id()));
+    fs::create_dir_all(&temp_dir)?;
+    
+    let clone_dir = temp_dir.join("repo");
+    
+    // Build git clone command
+    let mut clone_args = vec!["clone", "--depth", "1"];
+    
+    // Add branch/tag/ref if specified
+    if let Some(ref git_ref) = cmd.git_ref {
+        clone_args.push("--branch");
+        clone_args.push(git_ref);
+    }
+    
+    clone_args.push(&git_url);
+    clone_args.push(clone_dir.to_str().unwrap());
+    
+    println!("Cloning repository...");
+    
+    let output = Command::new("git")
+        .args(&clone_args)
+        .output()
+        .context("cloning git repository")?;
+    
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let _ = fs::remove_dir_all(&temp_dir);
+        return Err(anyhow!("Failed to clone repository: {}", stderr.trim()));
+    }
+    
+    // Determine source directory (either clone root or subdir)
+    let source_dir = if let Some(ref subdir) = cmd.subdir {
+        let subdir_path = clone_dir.join(subdir);
+        if !subdir_path.exists() {
+            let _ = fs::remove_dir_all(&temp_dir);
+            return Err(anyhow!(
+                "Subdirectory '{}' not found in repository",
+                subdir
+            ));
+        }
+        if !subdir_path.is_dir() {
+            let _ = fs::remove_dir_all(&temp_dir);
+            return Err(anyhow!(
+                "'{}' is not a directory",
+                subdir
+            ));
+        }
+        subdir_path
+    } else {
+        clone_dir.clone()
+    };
+    
+    println!("Creating project structure...");
+    
+    // Copy files to project directory, excluding .git if we're using a subdir
+    // or if we want a fresh git history
+    if cmd.subdir.is_some() {
+        // When using subdir, always exclude .git (it's in the parent)
+        copy_dir_filtered(&source_dir, project_dir, &[".git".to_string()])?;
+    } else {
+        // When cloning whole repo, remove .git to start fresh
+        copy_dir_recursive(&source_dir, project_dir)?;
+        let git_dir = project_dir.join(".git");
+        if git_dir.exists() {
+            fs::remove_dir_all(&git_dir)?;
+        }
+    }
+    
+    // Remove template.toml if present (byt-specific file)
+    let template_toml = project_dir.join("template.toml");
+    if template_toml.exists() {
+        fs::remove_file(&template_toml)?;
+    }
+    
+    // Clean up temp
+    let _ = fs::remove_dir_all(&temp_dir);
+    
+    // If --dry-run, just show what would happen
+    if ctx.common.dry_run {
+        println!("dry-run: would create project at {}", project_dir.display());
+    }
+    
+    Ok(())
+}
+
+/// Scaffold a project from the templates repository
+fn scaffold_from_template(
+    _ctx: &RuntimeContext,
+    cmd: &NewCommand,
+    project_dir: &Path,
+) -> Result<()> {
+    use std::process::Command;
+    
+    let templates_cfg = &_ctx.config.templates;
+    
+    println!("Creating new {} project: {}", cmd.template, cmd.name);
+    
+    // Clone template from GitHub
+    let template_url = format!(
+        "https://github.com/{}/archive/refs/heads/{}.zip",
+        templates_cfg.repo, templates_cfg.branch
+    );
+    
+    // Create temp dir for download
+    let temp_dir = std::env::temp_dir().join(format!("byt-template-{}", std::process::id()));
+    fs::create_dir_all(&temp_dir)?;
+    
+    // Download and extract template
+    println!("Fetching template from {}...", templates_cfg.repo);
+    
+    let zip_path = temp_dir.join("template.zip");
+    let output = Command::new("curl")
+        .args(["-sL", "-o", zip_path.to_str().unwrap(), &template_url])
+        .output()
+        .context("downloading template")?;
+    
+    if !output.status.success() {
+        let _ = fs::remove_dir_all(&temp_dir);
+        return Err(anyhow!("Failed to download template"));
+    }
+    
+    // Extract zip
+    let extract_dir = temp_dir.join("extracted");
+    let output = Command::new("unzip")
+        .args(["-q", zip_path.to_str().unwrap(), "-d", extract_dir.to_str().unwrap()])
+        .output()
+        .context("extracting template")?;
+    
+    if !output.status.success() {
+        let _ = fs::remove_dir_all(&temp_dir);
+        return Err(anyhow!("Failed to extract template"));
+    }
+    
+    // Find the templates root directory (repo-branch/)
+    let repo_name = templates_cfg.repo.split('/').next_back().unwrap_or("templates");
+    let templates_root = extract_dir.join(format!("{}-{}", repo_name, templates_cfg.branch));
+    let template_src = templates_root.join(&cmd.template);
+    
+    if !template_src.exists() {
+        let _ = fs::remove_dir_all(&temp_dir);
+        return Err(anyhow!(
+            "Template '{}' not found. Available: rust-cli, rust-workspace, python-cli, go-cli",
+            cmd.template
+        ));
+    }
+    
+    // Check for template manifest (template.toml)
+    let manifest_path = template_src.join("template.toml");
+    let manifest: Option<TemplateManifest> = if manifest_path.exists() {
+        let content = fs::read_to_string(&manifest_path)
+            .context("reading template.toml")?;
+        Some(toml::from_str(&content).context("parsing template.toml")?)
+    } else {
+        None
+    };
+    
+    // Copy template to project directory
+    println!("Creating project structure...");
+    copy_dir_recursive(&template_src, project_dir)?;
+    
+    // Remove template.toml from the project (it's only for byt)
+    let project_manifest = project_dir.join("template.toml");
+    if project_manifest.exists() {
+        fs::remove_file(&project_manifest)?;
+    }
+    
+    // Apply template composition if defined
+    if let Some(ref manifest) = manifest {
+        for comp in &manifest.compose {
+            let source_template = templates_root.join(&comp.source);
+            if !source_template.exists() {
+                eprintln!("Warning: Composed template '{}' not found, skipping", comp.source);
+                continue;
+            }
+            
+            let target_dir = project_dir.join(&comp.target);
+            println!("  Composing {} -> {}", comp.source, comp.target);
+            
+            // Remove target directory if it exists (will be replaced by composed template)
+            if target_dir.exists() {
+                fs::remove_dir_all(&target_dir)?;
+            }
+            
+            // Copy composed template, excluding specified files
+            copy_dir_filtered(&source_template, &target_dir, &comp.exclude)?;
+            
+            // Remove template.toml from composed template too
+            let composed_manifest = target_dir.join("template.toml");
+            if composed_manifest.exists() {
+                fs::remove_file(&composed_manifest)?;
+            }
+        }
+    }
+    
+    // Clean up temp
+    let _ = fs::remove_dir_all(&temp_dir);
+    
+    Ok(())
+}
+
+/// Normalize a git source string to a full URL
+/// Supports:
+/// - Full URLs: https://github.com/user/repo, git@github.com:user/repo.git
+/// - GitHub shorthand: user/repo
+/// - GitLab shorthand: gitlab:user/repo
+/// - Bitbucket shorthand: bitbucket:user/repo
+fn normalize_git_url(source: &str) -> String {
+    // Already a full URL
+    if source.starts_with("https://") || source.starts_with("http://") 
+       || source.starts_with("git@") || source.starts_with("ssh://") {
+        return source.to_string();
+    }
+    
+    // Platform-specific shorthand
+    if let Some(path) = source.strip_prefix("gitlab:") {
+        return format!("https://gitlab.com/{}", path);
+    }
+    if let Some(path) = source.strip_prefix("bitbucket:") {
+        return format!("https://bitbucket.org/{}", path);
+    }
+    if let Some(path) = source.strip_prefix("github:") {
+        return format!("https://github.com/{}", path);
+    }
+    
+    // Default: assume GitHub shorthand (user/repo)
+    if source.contains('/') && !source.contains(':') {
+        return format!("https://github.com/{}", source);
+    }
+    
+    // Return as-is if we can't parse it
+    source.to_string()
+}
+
+/// Extract repository name from a git URL or shorthand
+fn extract_repo_name(source: &str) -> Option<String> {
+    // Handle full URLs
+    let path = if source.starts_with("https://") || source.starts_with("http://") {
+        source.split('/').next_back()?
+    } else if source.starts_with("git@") {
+        // git@github.com:user/repo.git
+        let parts: Vec<&str> = source.split(':').collect();
+        if parts.len() >= 2 {
+            parts[1].split('/').next_back()?
+        } else {
+            return None;
+        }
+    } else if source.contains('/') {
+        // Shorthand like user/repo or github:user/repo
+        let clean = source.split(':').next_back().unwrap_or(source);
+        clean.split('/').next_back()?
+    } else {
+        return None;
+    };
+    
+    // Remove .git suffix if present
+    let name = path.strip_suffix(".git").unwrap_or(path);
+    Some(name.to_string())
 }
 
 /// Recursively copy a directory
@@ -3825,12 +3999,11 @@ fn replace_in_files(dir: &Path, from: &str, to: &str) -> Result<()> {
                 }
             }
             
-            if let Ok(content) = fs::read_to_string(path) {
-                if content.contains(from) {
+            if let Ok(content) = fs::read_to_string(path)
+                && content.contains(from) {
                     let new_content = content.replace(from, to);
                     fs::write(path, new_content)?;
                 }
-            }
         }
     }
     
@@ -3928,41 +4101,39 @@ fn find_schemas(ctx: &RuntimeContext) -> Result<Vec<SchemaInfo>> {
         for pattern in &schema_cfg.patterns {
             let full_pattern = repo_path.join(pattern);
             if let Some(pattern_str) = full_pattern.to_str() {
-                for entry in glob(pattern_str).unwrap_or_else(|_| glob("").unwrap()) {
-                    if let Ok(source_path) = entry {
-                        // Determine destination path in schemas repo
-                        let file_name = source_path.file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("schema.json");
-                        
-                        // Use repo name as directory, preserve original filename
-                        // Only rename config.schema.json -> {repo}.config.schema.json for clarity
-                        let dest_name = if file_name == "config.schema.json" {
-                            format!("{}.config.schema.json", repo_name)
-                        } else {
-                            // Keep original filename for all other schemas
-                            file_name.to_string()
-                        };
-                        
-                        let dest_path = schemas_repo.join(repo_name).join(&dest_name);
-                        
-                        // Check if needs update
-                        let needs_update = if dest_path.exists() {
-                            // Compare file contents
-                            let source_content = fs::read_to_string(&source_path).unwrap_or_default();
-                            let dest_content = fs::read_to_string(&dest_path).unwrap_or_default();
-                            source_content != dest_content
-                        } else {
-                            true
-                        };
-                        
-                        schemas.push(SchemaInfo {
-                            repo: repo_name.clone(),
-                            source_path,
-                            dest_path,
-                            needs_update,
-                        });
-                    }
+                for source_path in glob(pattern_str).unwrap_or_else(|_| glob("").unwrap()).flatten() {
+                    // Determine destination path in schemas repo
+                    let file_name = source_path.file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("schema.json");
+                    
+                    // Use repo name as directory, preserve original filename
+                    // Only rename config.schema.json -> {repo}.config.schema.json for clarity
+                    let dest_name = if file_name == "config.schema.json" {
+                        format!("{}.config.schema.json", repo_name)
+                    } else {
+                        // Keep original filename for all other schemas
+                        file_name.to_string()
+                    };
+                    
+                    let dest_path = schemas_repo.join(repo_name).join(&dest_name);
+                    
+                    // Check if needs update
+                    let needs_update = if dest_path.exists() {
+                        // Compare file contents
+                        let source_content = fs::read_to_string(&source_path).unwrap_or_default();
+                        let dest_content = fs::read_to_string(&dest_path).unwrap_or_default();
+                        source_content != dest_content
+                    } else {
+                        true
+                    };
+                    
+                    schemas.push(SchemaInfo {
+                        repo: repo_name.clone(),
+                        source_path,
+                        dest_path,
+                        needs_update,
+                    });
                 }
             }
         }
@@ -4279,8 +4450,8 @@ fn check_tool_installed(tool: &ToolInfo) -> (bool, Option<String>, Option<String
             .args(["-c", &format!("import {}", tool.name)])
             .output();
         
-        if let Ok(out) = output {
-            if out.status.success() {
+        if let Ok(out) = output
+            && out.status.success() {
                 // Try to get version
                 let version_output = Command::new("python3")
                     .args(["-c", &format!("import {}; print(getattr({}, '__version__', 'unknown'))", tool.name, tool.name)])
@@ -4292,7 +4463,6 @@ fn check_tool_installed(tool: &ToolInfo) -> (bool, Option<String>, Option<String
                 
                 return (true, Some("python module".to_string()), version);
             }
-        }
         
         // Also check if installed via uv tool
         let output = Command::new("uv")
@@ -4314,8 +4484,8 @@ fn check_tool_installed(tool: &ToolInfo) -> (bool, Option<String>, Option<String
         .arg(tool.binary)
         .output();
     
-    if let Ok(out) = output {
-        if out.status.success() {
+    if let Ok(out) = output
+        && out.status.success() {
             let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
             
             // Try to get version
@@ -4332,7 +4502,6 @@ fn check_tool_installed(tool: &ToolInfo) -> (bool, Option<String>, Option<String
             
             return (true, Some(path), version);
         }
-    }
     
     (false, None, None)
 }
@@ -4789,11 +4958,10 @@ fn discover_workspace_root() -> Result<PathBuf> {
 
         if agents_md.exists() && beads.exists() {
             // Check if AGENTS.md mentions Govnr
-            if let Ok(content) = fs::read_to_string(&agents_md) {
-                if content.contains("Govnr") || content.contains("govnr") {
+            if let Ok(content) = fs::read_to_string(&agents_md)
+                && (content.contains("Govnr") || content.contains("govnr")) {
                     return Ok(dir.to_path_buf());
                 }
-            }
         }
 
         if catalog.exists() {
@@ -4818,5 +4986,354 @@ impl fmt::Display for AppPaths {
             self.config_file.display(),
             self.workspace_root.display()
         )
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -------------------------------------------------------------------------
+    // Git URL normalization tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_normalize_git_url_full_https() {
+        let url = "https://github.com/user/repo";
+        assert_eq!(normalize_git_url(url), url);
+    }
+
+    #[test]
+    fn test_normalize_git_url_full_http() {
+        let url = "http://github.com/user/repo";
+        assert_eq!(normalize_git_url(url), url);
+    }
+
+    #[test]
+    fn test_normalize_git_url_git_ssh() {
+        let url = "git@github.com:user/repo.git";
+        assert_eq!(normalize_git_url(url), url);
+    }
+
+    #[test]
+    fn test_normalize_git_url_ssh_protocol() {
+        let url = "ssh://git@github.com/user/repo";
+        assert_eq!(normalize_git_url(url), url);
+    }
+
+    #[test]
+    fn test_normalize_git_url_github_shorthand() {
+        assert_eq!(
+            normalize_git_url("user/repo"),
+            "https://github.com/user/repo"
+        );
+    }
+
+    #[test]
+    fn test_normalize_git_url_github_prefix() {
+        assert_eq!(
+            normalize_git_url("github:user/repo"),
+            "https://github.com/user/repo"
+        );
+    }
+
+    #[test]
+    fn test_normalize_git_url_gitlab_prefix() {
+        assert_eq!(
+            normalize_git_url("gitlab:user/repo"),
+            "https://gitlab.com/user/repo"
+        );
+    }
+
+    #[test]
+    fn test_normalize_git_url_bitbucket_prefix() {
+        assert_eq!(
+            normalize_git_url("bitbucket:user/repo"),
+            "https://bitbucket.org/user/repo"
+        );
+    }
+
+    #[test]
+    fn test_normalize_git_url_unknown_format() {
+        let url = "some-random-string";
+        assert_eq!(normalize_git_url(url), url);
+    }
+
+    // -------------------------------------------------------------------------
+    // Repository name extraction tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_repo_name_https_url() {
+        assert_eq!(
+            extract_repo_name("https://github.com/user/myrepo"),
+            Some("myrepo".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_repo_name_https_with_git_suffix() {
+        assert_eq!(
+            extract_repo_name("https://github.com/user/myrepo.git"),
+            Some("myrepo".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_repo_name_ssh_url() {
+        assert_eq!(
+            extract_repo_name("git@github.com:user/myrepo.git"),
+            Some("myrepo".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_repo_name_shorthand() {
+        assert_eq!(
+            extract_repo_name("user/myrepo"),
+            Some("myrepo".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_repo_name_github_prefix() {
+        assert_eq!(
+            extract_repo_name("github:user/myrepo"),
+            Some("myrepo".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_repo_name_nested_path() {
+        assert_eq!(
+            extract_repo_name("https://github.com/org/group/myrepo"),
+            Some("myrepo".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_repo_name_invalid() {
+        assert_eq!(extract_repo_name("single-word"), None);
+    }
+
+    // -------------------------------------------------------------------------
+    // Copy directory tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_copy_dir_recursive() {
+        let temp = std::env::temp_dir().join("byt-test-copy");
+        let src = temp.join("src");
+        let dst = temp.join("dst");
+        
+        // Clean up from previous runs
+        let _ = fs::remove_dir_all(&temp);
+        
+        // Create source structure
+        fs::create_dir_all(src.join("subdir")).unwrap();
+        fs::write(src.join("file1.txt"), "content1").unwrap();
+        fs::write(src.join("subdir/file2.txt"), "content2").unwrap();
+        
+        // Copy
+        copy_dir_recursive(&src, &dst).unwrap();
+        
+        // Verify
+        assert!(dst.join("file1.txt").exists());
+        assert!(dst.join("subdir/file2.txt").exists());
+        assert_eq!(fs::read_to_string(dst.join("file1.txt")).unwrap(), "content1");
+        assert_eq!(fs::read_to_string(dst.join("subdir/file2.txt")).unwrap(), "content2");
+        
+        // Cleanup
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_copy_dir_filtered() {
+        let temp = std::env::temp_dir().join("byt-test-filter");
+        let src = temp.join("src");
+        let dst = temp.join("dst");
+        
+        // Clean up from previous runs
+        let _ = fs::remove_dir_all(&temp);
+        
+        // Create source structure
+        fs::create_dir_all(src.join(".git")).unwrap();
+        fs::write(src.join("keep.txt"), "keep").unwrap();
+        fs::write(src.join(".git/config"), "git config").unwrap();
+        fs::write(src.join("skip.lock"), "lock file").unwrap();
+        
+        // Copy with exclusions
+        copy_dir_filtered(&src, &dst, &[".git".to_string(), "*.lock".to_string()]).unwrap();
+        
+        // Verify
+        assert!(dst.join("keep.txt").exists());
+        assert!(!dst.join(".git").exists());
+        assert!(!dst.join("skip.lock").exists());
+        
+        // Cleanup
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    // -------------------------------------------------------------------------
+    // Replace in files tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_replace_in_files() {
+        let temp = std::env::temp_dir().join("byt-test-replace");
+        
+        // Clean up from previous runs
+        let _ = fs::remove_dir_all(&temp);
+        fs::create_dir_all(&temp).unwrap();
+        
+        // Create test file
+        fs::write(temp.join("test.txt"), "Hello {{project_name}}!").unwrap();
+        
+        // Replace
+        replace_in_files(&temp, "{{project_name}}", "myproject").unwrap();
+        
+        // Verify
+        assert_eq!(fs::read_to_string(temp.join("test.txt")).unwrap(), "Hello myproject!");
+        
+        // Cleanup
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_replace_in_files_skips_binary() {
+        let temp = std::env::temp_dir().join("byt-test-binary");
+        
+        // Clean up from previous runs
+        let _ = fs::remove_dir_all(&temp);
+        fs::create_dir_all(&temp).unwrap();
+        
+        // Create a "binary" file (by extension)
+        fs::write(temp.join("image.png"), "fake png {{project_name}}").unwrap();
+        fs::write(temp.join("Cargo.lock"), "lock {{project_name}}").unwrap();
+        
+        // Replace should skip these files
+        replace_in_files(&temp, "{{project_name}}", "myproject").unwrap();
+        
+        // Verify they are unchanged
+        assert!(fs::read_to_string(temp.join("image.png")).unwrap().contains("{{project_name}}"));
+        assert!(fs::read_to_string(temp.join("Cargo.lock")).unwrap().contains("{{project_name}}"));
+        
+        // Cleanup
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    // -------------------------------------------------------------------------
+    // NewCommand argument tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_new_command_default_template() {
+        use clap::Parser;
+        
+        let args = vec!["byt", "new", "myproject"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        
+        if let Command::New(cmd) = cli.command {
+            assert_eq!(cmd.name, "myproject");
+            assert_eq!(cmd.template, "rust-cli");
+            assert!(cmd.from_git.is_none());
+            assert!(cmd.subdir.is_none());
+            assert!(!cmd.no_replace);
+        } else {
+            panic!("Expected New command");
+        }
+    }
+
+    #[test]
+    fn test_new_command_from_git() {
+        use clap::Parser;
+        
+        let args = vec!["byt", "new", "myproject", "--from-git", "user/repo"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        
+        if let Command::New(cmd) = cli.command {
+            assert_eq!(cmd.name, "myproject");
+            assert_eq!(cmd.from_git, Some("user/repo".to_string()));
+        } else {
+            panic!("Expected New command");
+        }
+    }
+
+    #[test]
+    fn test_new_command_from_git_with_subdir() {
+        use clap::Parser;
+        
+        let args = vec!["byt", "new", "myproject", "--from-git", "user/repo", "--subdir", "templates/rust"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        
+        if let Command::New(cmd) = cli.command {
+            assert_eq!(cmd.from_git, Some("user/repo".to_string()));
+            assert_eq!(cmd.subdir, Some("templates/rust".to_string()));
+        } else {
+            panic!("Expected New command");
+        }
+    }
+
+    #[test]
+    fn test_new_command_from_git_with_ref() {
+        use clap::Parser;
+        
+        let args = vec!["byt", "new", "myproject", "--from-git", "user/repo", "--git-ref", "v1.0.0"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        
+        if let Command::New(cmd) = cli.command {
+            assert_eq!(cmd.from_git, Some("user/repo".to_string()));
+            assert_eq!(cmd.git_ref, Some("v1.0.0".to_string()));
+        } else {
+            panic!("Expected New command");
+        }
+    }
+
+    #[test]
+    fn test_new_command_no_replace() {
+        use clap::Parser;
+        
+        let args = vec!["byt", "new", "myproject", "--from-git", "user/repo", "--no-replace"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        
+        if let Command::New(cmd) = cli.command {
+            assert!(cmd.no_replace);
+        } else {
+            panic!("Expected New command");
+        }
+    }
+
+    #[test]
+    fn test_new_command_subdir_requires_from_git() {
+        use clap::Parser;
+        
+        // --subdir without --from-git should fail
+        let args = vec!["byt", "new", "myproject", "--subdir", "templates/rust"];
+        let result = Cli::try_parse_from(args);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_new_command_git_ref_requires_from_git() {
+        use clap::Parser;
+        
+        // --git-ref without --from-git should fail
+        let args = vec!["byt", "new", "myproject", "--git-ref", "v1.0.0"];
+        let result = Cli::try_parse_from(args);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_new_command_from_git_conflicts_with_template() {
+        use clap::Parser;
+        
+        // --from-git with -t should fail (they conflict)
+        let args = vec!["byt", "new", "myproject", "--from-git", "user/repo", "-t", "python-cli"];
+        let result = Cli::try_parse_from(args);
+        assert!(result.is_err());
     }
 }
