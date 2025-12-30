@@ -169,47 +169,40 @@
       "additionalProperties": false
     },
     "machines": {
-      "type": "object",
-      "description": "Cross-machine sync settings for repository comparison",
-      "properties": {
-        "local_name": {
-          "type": "string",
-          "description": "Local machine name for identification in output (auto-detected from hostname if not set)"
-        },
-        "remotes": {
-          "type": "array",
-          "description": "Remote machines to compare with",
-          "items": {
-            "type": "object",
-            "properties": {
-              "name": {
-                "type": "string",
-                "description": "Machine name for display"
-              },
-              "host": {
-                "type": "string",
-                "description": "SSH host (user@host or just host)"
-              },
-              "port": {
-                "type": "integer",
-                "description": "SSH port",
-                "default": 22
-              },
-              "workspace": {
-                "type": "string",
-                "description": "Path to workspace on remote machine"
-              },
-              "identity_file": {
-                "type": "string",
-                "description": "SSH identity file path"
-              }
-            },
-            "required": ["name", "host"],
-            "additionalProperties": false
+      "type": "array",
+      "description": "All machines in the ecosystem. byt auto-detects which is local by matching hostname.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Machine name for display"
+          },
+          "hostname": {
+            "type": "string",
+            "description": "Hostname to match against (compared with `hostname` command output). If not set, uses 'name' as the hostname."
+          },
+          "host": {
+            "type": "string",
+            "description": "SSH host (user@host or just host) - used when connecting remotely. If not set, uses hostname (or name if hostname not set)."
+          },
+          "port": {
+            "type": "integer",
+            "description": "SSH port",
+            "default": 22
+          },
+          "workspace": {
+            "type": "string",
+            "description": "Path to workspace on this machine"
+          },
+          "identity_file": {
+            "type": "string",
+            "description": "SSH identity file path"
           }
-        }
-      },
-      "additionalProperties": false
+        },
+        "required": ["name"],
+        "additionalProperties": false
+      }
     }
   },
   "additionalProperties": false

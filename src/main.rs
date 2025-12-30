@@ -171,6 +171,29 @@ enum CatalogCommand {
     Show,
     /// List all repositories
     List,
+    /// Show which repos exist on which machines
+    Machines {
+        #[command(subcommand)]
+        command: MachinesSubcommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum MachinesSubcommand {
+    /// Show repos available on each machine
+    Show {
+        /// Only check specific machines (default: local + all configured remotes)
+        #[arg(long, short = 'm')]
+        machines: Vec<String>,
+    },
+    /// Compare repo availability across machines
+    Compare {
+        /// Only check specific machines (default: local + all configured remotes)
+        #[arg(long, short = 'm')]
+        machines: Vec<String>,
+    },
+    /// Show repos missing from local machine that exist on remotes
+    Missing,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -458,6 +481,33 @@ enum RepoStatus {
     Unknown,
 }
 
+/// Machine-specific catalog showing which repos exist on a machine
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MachineCatalog {
+    machine: String,
+    generated: DateTime<Utc>,
+    repos: Vec<String>,
+}
+
+/// Comparison of catalogs across multiple machines
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MachineCatalogComparison {
+    generated: DateTime<Utc>,
+    machines: Vec<String>,
+    /// All repos across all machines with availability per machine
+    repos: Vec<RepoAvailability>,
+}
+
+/// Availability of a single repo across machines
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RepoAvailability {
+    name: String,
+    /// Which machines have this repo (by machine name)
+    present_on: Vec<String>,
+    /// Which machines are missing this repo
+    missing_on: Vec<String>,
+}
+
 // ============================================================================
 // Lint Types
 // ============================================================================
@@ -613,7 +663,8 @@ struct AppConfig {
     sync: SyncConfig,
     /// External tools settings
     tools: ToolsConfig,
-    /// Remote machines for cross-machine sync
+    /// All machines in the ecosystem (byt auto-detects which is local via hostname)
+    #[serde(default)]
     machines: MachinesConfig,
 }
 
@@ -684,36 +735,26 @@ impl Default for BvConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-struct MachinesConfig {
-    /// Local machine name (for identification in output)
-    local_name: String,
-    /// Remote machines to compare with
-    remotes: Vec<RemoteMachine>,
-}
-
-impl Default for MachinesConfig {
-    fn default() -> Self {
-        Self {
-            local_name: hostname::get()
-                .map(|h| h.to_string_lossy().to_string())
-                .unwrap_or_else(|_| "local".to_string()),
-            remotes: Vec::new(),
-        }
-    }
-}
+/// Machine configuration - a flat list of all machines in the ecosystem.
+/// byt auto-detects which machine is local by matching hostname.
+type MachinesConfig = Vec<Machine>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct RemoteMachine {
+struct Machine {
     /// Machine name (for display)
     name: String,
-    /// SSH host (user@host or just host)
-    host: String,
+    /// Hostname to match against (compared with `hostname` command output)
+    /// If not set, uses `name` as the hostname
+    #[serde(default)]
+    hostname: Option<String>,
+    /// SSH host (user@host or just host) - used when connecting remotely
+    /// If not set, uses `hostname` (or `name` if hostname not set)
+    #[serde(default)]
+    host: Option<String>,
     /// SSH port (default: 22)
     #[serde(default = "default_ssh_port")]
     port: u16,
-    /// Path to workspace on remote machine
+    /// Path to workspace on this machine
     #[serde(default)]
     workspace: Option<String>,
     /// SSH identity file (optional)
@@ -721,8 +762,41 @@ struct RemoteMachine {
     identity_file: Option<String>,
 }
 
+impl Machine {
+    /// Get the hostname to match against (falls back to name if not set)
+    fn match_hostname(&self) -> &str {
+        self.hostname.as_deref().unwrap_or(&self.name)
+    }
+    
+    /// Get the SSH host to connect to (falls back to hostname, then name)
+    fn ssh_host(&self) -> &str {
+        self.host.as_deref()
+            .unwrap_or_else(|| self.hostname.as_deref().unwrap_or(&self.name))
+    }
+}
+
 fn default_ssh_port() -> u16 {
     22
+}
+
+/// Get the current machine's hostname
+fn get_current_hostname() -> String {
+    hostname::get()
+        .map(|h| h.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
+/// Find the local machine from the config (matches by hostname)
+fn find_local_machine(machines: &[Machine]) -> Option<&Machine> {
+    let current = get_current_hostname();
+    machines.iter().find(|m| m.match_hostname() == current)
+}
+
+/// Get the local machine name (from config or hostname)
+fn get_local_machine_name(machines: &[Machine]) -> String {
+    find_local_machine(machines)
+        .map(|m| m.name.clone())
+        .unwrap_or_else(get_current_hostname)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -871,7 +945,7 @@ impl Default for AppConfig {
             schemas: SchemaConfig::default(),
             sync: SyncConfig::default(),
             tools: ToolsConfig::default(),
-            machines: MachinesConfig::default(),
+            machines: Vec::new(),
         }
     }
 }
@@ -885,6 +959,7 @@ fn handle_catalog(ctx: &RuntimeContext, command: CatalogCommand) -> Result<()> {
         CatalogCommand::Refresh { full } => refresh_catalog(ctx, full),
         CatalogCommand::Show => show_catalog(ctx),
         CatalogCommand::List => list_repos(ctx),
+        CatalogCommand::Machines { command } => handle_catalog_machines(ctx, command),
     }
 }
 
@@ -971,6 +1046,382 @@ fn list_repos(ctx: &RuntimeContext) -> Result<()> {
         for name in repos.keys() {
             println!("{}", name);
         }
+    }
+
+    Ok(())
+}
+
+fn handle_catalog_machines(ctx: &RuntimeContext, command: MachinesSubcommand) -> Result<()> {
+    match command {
+        MachinesSubcommand::Show { machines } => catalog_machines_show(ctx, machines),
+        MachinesSubcommand::Compare { machines } => catalog_machines_compare(ctx, machines),
+        MachinesSubcommand::Missing => catalog_machines_missing(ctx),
+    }
+}
+
+/// Get list of repos available on local machine (lightweight - just names)
+fn get_local_repo_list(ctx: &RuntimeContext) -> Result<Vec<String>> {
+    let repos = scan_repositories(ctx, false)?;
+    let mut names: Vec<String> = repos.keys().cloned().collect();
+    names.sort();
+    Ok(names)
+}
+
+/// Get machine catalog for local machine
+fn get_local_machine_catalog(ctx: &RuntimeContext) -> Result<MachineCatalog> {
+    let repos = get_local_repo_list(ctx)?;
+    Ok(MachineCatalog {
+        machine: get_local_machine_name(&ctx.config.machines),
+        generated: Utc::now(),
+        repos,
+    })
+}
+
+/// Check if a machine is the local machine (by hostname match)
+fn is_local_machine(machine: &Machine) -> bool {
+    let current = get_current_hostname();
+    machine.match_hostname() == current
+}
+
+/// Fetch machine catalog from remote via SSH
+fn fetch_remote_machine_catalog(machine: &Machine) -> Result<MachineCatalog> {
+    use std::process::Command as ShellCommand;
+
+    let workspace_path = machine.workspace.as_deref().unwrap_or("~/byteowlz");
+    
+    // Build SSH command - use byt catalog list --json for lightweight output
+    let port_str = machine.port.to_string();
+    let ssh_host = machine.ssh_host();
+    let remote_cmd = format!(
+        "cd {} && $HOME/.cargo/bin/byt catalog list --json 2>/dev/null || byt catalog list --json",
+        workspace_path
+    );
+    
+    let mut ssh_args: Vec<&str> = vec!["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"];
+    if machine.port != 22 {
+        ssh_args.extend(["-p", &port_str]);
+    }
+    if let Some(ref identity) = machine.identity_file {
+        ssh_args.extend(["-i", identity]);
+    }
+    ssh_args.push(ssh_host);
+    ssh_args.push(&remote_cmd);
+
+    let output = ShellCommand::new("ssh")
+        .args(&ssh_args)
+        .output()
+        .with_context(|| format!("Failed to connect to {}", machine.name))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("SSH to {} failed: {}", machine.name, stderr.lines().next().unwrap_or("unknown error")));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let repos: Vec<String> = serde_json::from_str(&stdout)
+        .with_context(|| format!("Failed to parse response from {}", machine.name))?;
+
+    Ok(MachineCatalog {
+        machine: machine.name.clone(),
+        generated: Utc::now(),
+        repos,
+    })
+}
+
+/// Show repos available on each machine
+fn catalog_machines_show(ctx: &RuntimeContext, explicit_machines: Vec<String>) -> Result<()> {
+    let local_name = get_local_machine_name(&ctx.config.machines);
+    
+    // Get local catalog
+    let local_catalog = get_local_machine_catalog(ctx)?;
+    
+    // Determine which machines to query
+    let machines: Vec<&Machine> = if !explicit_machines.is_empty() {
+        ctx.config.machines.iter()
+            .filter(|m| explicit_machines.contains(&m.name))
+            .collect()
+    } else {
+        ctx.config.machines.iter().collect()
+    };
+
+    // Collect all catalogs
+    let mut catalogs: Vec<MachineCatalog> = Vec::new();
+    
+    // Add local catalog first if not in explicit list or if it's included
+    if explicit_machines.is_empty() || explicit_machines.contains(&local_name) {
+        catalogs.push(local_catalog);
+    }
+
+    for machine in &machines {
+        if is_local_machine(machine) {
+            // Skip - already added local catalog above (or will add if in explicit list)
+            if !catalogs.iter().any(|c| c.machine == machine.name) {
+                catalogs.push(MachineCatalog {
+                    machine: machine.name.clone(),
+                    generated: Utc::now(),
+                    repos: get_local_repo_list(ctx)?,
+                });
+            }
+            continue;
+        }
+        
+        if !ctx.common.quiet {
+            eprint!("Querying {}... ", machine.name);
+        }
+        match fetch_remote_machine_catalog(machine) {
+            Ok(catalog) => {
+                if !ctx.common.quiet {
+                    eprintln!("OK ({} repos)", catalog.repos.len());
+                }
+                catalogs.push(catalog);
+            }
+            Err(e) => {
+                if !ctx.common.quiet {
+                    eprintln!("failed: {}", e);
+                }
+            }
+        }
+    }
+
+    if ctx.common.json {
+        println!("{}", serde_json::to_string_pretty(&catalogs)?);
+    } else {
+        println!("Machine Catalogs");
+        println!("================\n");
+        
+        for catalog in &catalogs {
+            println!("{} ({} repos):", catalog.machine, catalog.repos.len());
+            for repo in &catalog.repos {
+                println!("  {}", repo);
+            }
+            println!();
+        }
+    }
+
+    Ok(())
+}
+
+/// Compare repo availability across machines
+fn catalog_machines_compare(ctx: &RuntimeContext, explicit_machines: Vec<String>) -> Result<()> {
+    use std::collections::{HashSet, HashMap as StdHashMap};
+
+    let local_name = get_local_machine_name(&ctx.config.machines);
+    
+    // Get local catalog
+    let local_catalog = get_local_machine_catalog(ctx)?;
+    
+    // Determine which machines to query
+    let machines: Vec<&Machine> = if !explicit_machines.is_empty() {
+        ctx.config.machines.iter()
+            .filter(|m| explicit_machines.contains(&m.name))
+            .collect()
+    } else {
+        ctx.config.machines.iter().collect()
+    };
+
+    // Collect all catalogs
+    let mut catalogs: StdHashMap<String, MachineCatalog> = StdHashMap::new();
+    catalogs.insert(local_name.clone(), local_catalog);
+
+    for machine in &machines {
+        if is_local_machine(machine) {
+            // Already have local catalog
+            continue;
+        }
+        
+        if !ctx.common.quiet {
+            eprint!("Querying {}... ", machine.name);
+        }
+        match fetch_remote_machine_catalog(machine) {
+            Ok(catalog) => {
+                if !ctx.common.quiet {
+                    eprintln!("OK");
+                }
+                catalogs.insert(machine.name.clone(), catalog);
+            }
+            Err(e) => {
+                if !ctx.common.quiet {
+                    eprintln!("failed: {}", e);
+                }
+            }
+        }
+    }
+
+    // Build ordered machine list (local first)
+    let mut machine_names: Vec<String> = vec![local_name.clone()];
+    for machine in &machines {
+        if !is_local_machine(machine) && catalogs.contains_key(&machine.name) {
+            machine_names.push(machine.name.clone());
+        }
+    }
+
+    // Collect all unique repos
+    let mut all_repos: HashSet<String> = HashSet::new();
+    for catalog in catalogs.values() {
+        for repo in &catalog.repos {
+            all_repos.insert(repo.clone());
+        }
+    }
+    let mut all_repos: Vec<String> = all_repos.into_iter().collect();
+    all_repos.sort();
+
+    // Build availability data
+    let mut repo_availability: Vec<RepoAvailability> = Vec::new();
+    for repo in &all_repos {
+        let mut present_on = Vec::new();
+        let mut missing_on = Vec::new();
+        
+        for machine in &machine_names {
+            if let Some(catalog) = catalogs.get(machine) {
+                if catalog.repos.contains(repo) {
+                    present_on.push(machine.clone());
+                } else {
+                    missing_on.push(machine.clone());
+                }
+            }
+        }
+        
+        repo_availability.push(RepoAvailability {
+            name: repo.clone(),
+            present_on,
+            missing_on,
+        });
+    }
+
+    let comparison = MachineCatalogComparison {
+        generated: Utc::now(),
+        machines: machine_names.clone(),
+        repos: repo_availability,
+    };
+
+    if ctx.common.json {
+        println!("{}", serde_json::to_string_pretty(&comparison)?);
+    } else {
+        println!();
+        println!("Repository Availability Across Machines");
+        println!("========================================");
+        println!();
+
+        // Print header
+        print!("{:<25}", "Repository");
+        for name in &machine_names {
+            print!(" {:>12}", name);
+        }
+        println!();
+        print!("{:<25}", "-------------------------");
+        for _ in &machine_names {
+            print!(" {:>12}", "------------");
+        }
+        println!();
+
+        // Print each repo
+        for repo in &comparison.repos {
+            print!("{:<25}", repo.name);
+            for machine in &machine_names {
+                if repo.present_on.contains(machine) {
+                    print!(" {:>12}", "Y");
+                } else {
+                    print!(" {:>12}", "-");
+                }
+            }
+            println!();
+        }
+
+        // Print summary
+        println!();
+        println!("Summary:");
+        for machine in &machine_names {
+            let count = comparison.repos.iter()
+                .filter(|r| r.present_on.contains(machine))
+                .count();
+            println!("  {}: {} repos", machine, count);
+        }
+    }
+
+    Ok(())
+}
+
+/// Show repos missing from local machine that exist on other machines
+fn catalog_machines_missing(ctx: &RuntimeContext) -> Result<()> {
+    use std::collections::HashSet;
+
+    let local_name = get_local_machine_name(&ctx.config.machines);
+    
+    // Get local repos
+    let local_repos: HashSet<String> = get_local_repo_list(ctx)?.into_iter().collect();
+    
+    // Get remote machines (all machines except local)
+    let remote_machines: Vec<&Machine> = ctx.config.machines.iter()
+        .filter(|m| !is_local_machine(m))
+        .collect();
+    
+    if remote_machines.is_empty() {
+        println!("No other machines configured.");
+        println!();
+        println!("Add machines to ~/.config/byt/config.toml:");
+        println!();
+        println!("  [[machines]]");
+        println!("  name = \"archvm\"");
+        println!("  workspace = \"~/byteowlz\"");
+        return Ok(());
+    }
+
+    // Collect repos from all remote machines
+    let mut missing: Vec<(String, Vec<String>)> = Vec::new(); // (repo, machines_that_have_it)
+
+    for machine in &remote_machines {
+        if !ctx.common.quiet {
+            eprint!("Querying {}... ", machine.name);
+        }
+        match fetch_remote_machine_catalog(machine) {
+            Ok(catalog) => {
+                if !ctx.common.quiet {
+                    eprintln!("OK");
+                }
+                for repo in catalog.repos {
+                    if !local_repos.contains(&repo) {
+                        // Check if we already have this repo in missing list
+                        if let Some(entry) = missing.iter_mut().find(|(r, _)| r == &repo) {
+                            entry.1.push(machine.name.clone());
+                        } else {
+                            missing.push((repo, vec![machine.name.clone()]));
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                if !ctx.common.quiet {
+                    eprintln!("failed: {}", e);
+                }
+            }
+        }
+    }
+
+    missing.sort_by(|a, b| a.0.cmp(&b.0));
+
+    if ctx.common.json {
+        #[derive(Serialize)]
+        struct MissingRepo {
+            name: String,
+            available_on: Vec<String>,
+        }
+        let output: Vec<MissingRepo> = missing.iter()
+            .map(|(name, machines)| MissingRepo {
+                name: name.clone(),
+                available_on: machines.clone(),
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else if missing.is_empty() {
+        println!("No repos missing from {} that exist on other machines.", local_name);
+    } else {
+        println!("Repos missing from {} (available on other machines):", local_name);
+        println!();
+        for (repo, machines) in &missing {
+            println!("  {} (on: {})", repo, machines.join(", "));
+        }
+        println!();
+        println!("{} repo(s) missing locally.", missing.len());
     }
 
     Ok(())
@@ -2584,7 +3035,7 @@ fn repos_status(ctx: &RuntimeContext) -> Result<()> {
 
     if ctx.common.json {
         let machine_status = MachineStatus {
-            machine: ctx.config.machines.local_name.clone(),
+            machine: get_local_machine_name(&ctx.config.machines),
             repos: statuses,
         };
         println!("{}", serde_json::to_string_pretty(&machine_status)?);
@@ -2644,29 +3095,30 @@ fn repos_compare(ctx: &RuntimeContext, explicit_repos: Vec<String>, explicit_mac
         return Ok(());
     }
 
-    // Get machines to query
-    let remotes: Vec<&RemoteMachine> = if !explicit_machines.is_empty() {
-        ctx.config.machines.remotes.iter()
-            .filter(|m| explicit_machines.contains(&m.name))
+    // Get machines to query (all except local)
+    let remote_machines: Vec<&Machine> = if !explicit_machines.is_empty() {
+        ctx.config.machines.iter()
+            .filter(|m| explicit_machines.contains(&m.name) && !is_local_machine(m))
             .collect()
     } else {
-        ctx.config.machines.remotes.iter().collect()
+        ctx.config.machines.iter()
+            .filter(|m| !is_local_machine(m))
+            .collect()
     };
 
-    if remotes.is_empty() && ctx.config.machines.remotes.is_empty() {
-        println!("No remote machines configured.");
+    if remote_machines.is_empty() && ctx.config.machines.iter().filter(|m| !is_local_machine(m)).count() == 0 {
+        println!("No other machines configured.");
         println!();
         println!("Add machines to ~/.config/byt/config.toml:");
         println!();
-        println!("  [[machines.remotes]]");
+        println!("  [[machines]]");
         println!("  name = \"archvm\"");
-        println!("  host = \"user@archvm\"");
         println!("  workspace = \"~/byteowlz\"");
         return Ok(());
     }
 
     // Collect status from local machine
-    let local_name = &ctx.config.machines.local_name;
+    let local_name = get_local_machine_name(&ctx.config.machines);
     let local_statuses: Vec<RepoStatusInfo> = repos
         .iter()
         .map(|name| get_repo_status(&workspace.join(name), name))
@@ -2679,15 +3131,16 @@ fn repos_compare(ctx: &RuntimeContext, explicit_repos: Vec<String>, explicit_mac
     });
 
     // Query remote machines via SSH
-    for remote in &remotes {
+    for machine in &remote_machines {
         if !ctx.common.quiet {
-            eprint!("Querying {}... ", remote.name);
+            eprint!("Querying {}... ", machine.name);
         }
 
-        let workspace_path = remote.workspace.as_deref().unwrap_or("~/byteowlz");
+        let workspace_path = machine.workspace.as_deref().unwrap_or("~/byteowlz");
         
         // Build SSH command
-        let port_str = remote.port.to_string();
+        let port_str = machine.port.to_string();
+        let ssh_host = machine.ssh_host();
         // Use login shell to ensure PATH includes ~/.cargo/bin etc.
         let remote_cmd = format!(
             "cd {} && $HOME/.cargo/bin/byt repos status --json 2>/dev/null || byt repos status --json",
@@ -2695,13 +3148,13 @@ fn repos_compare(ctx: &RuntimeContext, explicit_repos: Vec<String>, explicit_mac
         );
         
         let mut ssh_args: Vec<&str> = vec!["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"];
-        if remote.port != 22 {
+        if machine.port != 22 {
             ssh_args.extend(["-p", &port_str]);
         }
-        if let Some(ref identity) = remote.identity_file {
+        if let Some(ref identity) = machine.identity_file {
             ssh_args.extend(["-i", identity]);
         }
-        ssh_args.push(&remote.host);
+        ssh_args.push(ssh_host);
         ssh_args.push(&remote_cmd);
 
         let output = ShellCommand::new("ssh")
@@ -2716,7 +3169,7 @@ fn repos_compare(ctx: &RuntimeContext, explicit_repos: Vec<String>, explicit_mac
                         if !ctx.common.quiet {
                             eprintln!("OK");
                         }
-                        all_statuses.insert(remote.name.clone(), status);
+                        all_statuses.insert(machine.name.clone(), status);
                     }
                     Err(e) => {
                         if !ctx.common.quiet {
@@ -2751,10 +3204,10 @@ fn repos_compare(ctx: &RuntimeContext, explicit_repos: Vec<String>, explicit_mac
     println!();
 
     // Get all machine names in order (local first)
-    let mut machine_names: Vec<&String> = vec![local_name];
-    for remote in &remotes {
-        if all_statuses.contains_key(&remote.name) {
-            machine_names.push(&remote.name);
+    let mut machine_names: Vec<String> = vec![local_name.clone()];
+    for machine in &remote_machines {
+        if all_statuses.contains_key(&machine.name) {
+            machine_names.push(machine.name.clone());
         }
     }
 
@@ -2778,7 +3231,7 @@ fn repos_compare(ctx: &RuntimeContext, explicit_repos: Vec<String>, explicit_mac
         let mut dates: Vec<Option<&str>> = Vec::new();
 
         for machine_name in &machine_names {
-            if let Some(status) = all_statuses.get(*machine_name) {
+            if let Some(status) = all_statuses.get(machine_name) {
                 if let Some(repo) = status.repos.iter().find(|r| &r.name == repo_name) {
                     if repo.exists {
                         let commit = repo.head_commit.as_deref().unwrap_or("?");
