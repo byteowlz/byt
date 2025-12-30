@@ -6,12 +6,15 @@
 
 ## Commands
 
-| Command                | Description                                              |
-| ---------------------- | -------------------------------------------------------- |
-| `byt catalog refresh`  | Scan all repos and generate CATALOG.json                 |
-| `byt catalog show`     | Display the current catalog                              |
-| `byt catalog list`     | List all repository names                                |
-| `byt lint`             | Check governance compliance (justfile, beads, AGENTS.md) |
+| Command                         | Description                                              |
+| ------------------------------- | -------------------------------------------------------- |
+| `byt catalog refresh`           | Scan all repos and generate CATALOG.json                 |
+| `byt catalog show`              | Display the current catalog                              |
+| `byt catalog list`              | List all repository names                                |
+| `byt catalog machines show`     | Show repos available on each machine                     |
+| `byt catalog machines compare`  | Compare repo availability across machines                |
+| `byt catalog machines missing`  | Show repos missing locally that exist on remotes         |
+| `byt lint`                      | Check governance compliance (justfile, beads, AGENTS.md) |
 | `byt status`           | Show repository status and compliance matrix             |
 | `byt ready`            | Show ready work from govnr-level beads                   |
 | `byt triage`           | Cross-repo triage via bv workspace aggregation           |
