@@ -57,6 +57,17 @@ repo = "byteowlz/templates"
 # Branch to use
 branch = "main"
 
+# Website settings for `byt website sync`
+[website]
+# Path to website repository (relative to workspace or absolute)
+repo_path = "byteowlz.com"
+
+# Directory for tool pages within the website repo
+toolz_dir = "pages/toolz"
+
+# Directory for tool assets (icons, screenshots)
+public_dir = "public/toolz"
+
 # Schema management settings
 [schemas]
 # Path to schemas repository (relative to workspace or absolute)
