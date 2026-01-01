@@ -37,6 +37,7 @@ fn try_main() -> Result<()> {
         Command::Ready => handle_ready(&ctx),
         Command::Triage(cmd) => handle_triage(&ctx, cmd),
         Command::Search(cmd) => handle_search(&ctx, cmd),
+        Command::Mail { command } => handle_mail(&ctx, command),
         Command::Memory { command } => handle_memory(&ctx, command),
         Command::Sync { command } => handle_sync(&ctx, command),
         Command::Repos { command } => handle_repos(&ctx, command),
@@ -45,7 +46,11 @@ fn try_main() -> Result<()> {
         Command::Secrets { command } => handle_secrets(&ctx, command),
         Command::New(cmd) => handle_new(&ctx, cmd),
         Command::Schema { command } => handle_schema(&ctx, command),
+        Command::Website { command } => handle_website(&ctx, command),
         Command::Tools { command } => handle_tools(&ctx, command),
+        Command::Reserve(cmd) => handle_reserve(&ctx, cmd),
+        Command::Reservations => handle_reservations(&ctx),
+        Command::Release(cmd) => handle_release(&ctx, cmd),
         Command::Completions { shell } => handle_completions(shell),
     }
 }
@@ -113,6 +118,11 @@ enum Command {
     Triage(TriageCommand),
     /// Search agent conversation history (via cass)
     Search(SearchCommand),
+    /// Agent-to-agent messaging (via mailz)
+    Mail {
+        #[command(subcommand)]
+        command: MailCommand,
+    },
     /// Manage memories (via mmry)
     Memory {
         #[command(subcommand)]
@@ -147,11 +157,22 @@ enum Command {
         #[command(subcommand)]
         command: SchemaCommand,
     },
+    /// Manage byteowlz.com website (sync tool pages from repos)
+    Website {
+        #[command(subcommand)]
+        command: WebsiteCommand,
+    },
     /// Manage external agent tools (bv, cass, mailz)
     Tools {
         #[command(subcommand)]
         command: ToolsCommand,
     },
+    /// Reserve a file for exclusive work (via mailz)
+    Reserve(ReserveCommand),
+    /// List active file reservations (via mailz)
+    Reservations,
+    /// Release a file reservation (via mailz)
+    Release(ReleaseCommand),
     /// Generate shell completions
     Completions {
         #[arg(value_enum)]
@@ -245,6 +266,32 @@ struct SearchCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum MailCommand {
+    /// List inbox messages
+    Inbox,
+    /// Send a message
+    Send {
+        /// Recipient
+        to: String,
+        /// Subject
+        subject: String,
+        /// Message body
+        #[arg(long)]
+        body: String,
+    },
+    /// Read a message
+    Read {
+        /// Message ID
+        id: String,
+    },
+    /// Acknowledge a message
+    Ack {
+        /// Message ID
+        id: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum MemoryCommand {
     /// Add a memory
     Add {
@@ -303,6 +350,24 @@ enum SyncCommand {
     },
     /// Show sync status (what would be synced)
     Status,
+}
+
+#[derive(Debug, Clone, Args)]
+struct ReserveCommand {
+    /// File path to reserve
+    file: String,
+    /// Reservation TTL (e.g. 1h, 30m)
+    #[arg(long, value_name = "DURATION")]
+    ttl: String,
+    /// Reservation reason
+    #[arg(long)]
+    reason: String,
+}
+
+#[derive(Debug, Clone, Args)]
+struct ReleaseCommand {
+    /// File path to release
+    file: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -428,6 +493,22 @@ enum SchemaCommand {
     },
     /// List all schemas in the workspace
     List,
+}
+
+#[derive(Debug, Subcommand)]
+enum WebsiteCommand {
+    /// Sync tool.toml files to website repository
+    Sync {
+        /// Commit changes after sync
+        #[arg(long)]
+        commit: bool,
+        /// Only sync specific repos
+        repos: Vec<String>,
+    },
+    /// List tools that have tool.toml files
+    List,
+    /// Check for tools that need website updates
+    Check,
 }
 
 #[derive(Debug, Subcommand)]
@@ -563,14 +644,15 @@ impl RuntimeContext {
     fn new(common: CommonOpts) -> Result<Self> {
         let mut paths = AppPaths::discover(common.config.clone(), common.workspace.clone())?;
         let config = load_config(&paths)?;
-        
+
         // Apply workspace override from config if not already set via CLI
         if common.workspace.is_none()
             && let Some(ref ws) = config.workspace
-                && let Ok(expanded) = expand_path(PathBuf::from(ws)) {
-                    paths.workspace_root = expanded;
-                }
-        
+            && let Ok(expanded) = expand_path(PathBuf::from(ws))
+        {
+            paths.workspace_root = expanded;
+        }
+
         Ok(Self {
             common,
             paths,
@@ -635,7 +717,10 @@ struct AppPaths {
 }
 
 impl AppPaths {
-    fn discover(config_override: Option<PathBuf>, workspace_override: Option<PathBuf>) -> Result<Self> {
+    fn discover(
+        config_override: Option<PathBuf>,
+        workspace_override: Option<PathBuf>,
+    ) -> Result<Self> {
         let config_file = match config_override {
             Some(path) => expand_path(path)?,
             None => default_config_dir()?.join("config.toml"),
@@ -670,6 +755,8 @@ struct AppConfig {
     templates: TemplatesConfig,
     /// Schema settings
     schemas: SchemaConfig,
+    /// Website settings
+    website: WebsiteConfig,
     /// Memory sync settings
     sync: SyncConfig,
     /// External tools settings
@@ -693,7 +780,6 @@ struct ToolsConfig {
     bv: BvConfig,
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 #[derive(Default)]
@@ -701,7 +787,6 @@ struct MailzConfig {
     /// Database path (defaults to $XDG_DATA_HOME/mailz/mailz.db)
     db_path: Option<String>,
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -711,7 +796,6 @@ struct CassConfig {
     data_dir: Option<String>,
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 #[derive(Default)]
@@ -719,7 +803,6 @@ struct BvConfig {
     /// Default flags to pass to bv
     default_flags: Vec<String>,
 }
-
 
 /// Machine configuration - a flat list of all machines in the ecosystem.
 /// byt auto-detects which machine is local by matching hostname.
@@ -753,10 +836,11 @@ impl Machine {
     fn match_hostname(&self) -> &str {
         self.hostname.as_deref().unwrap_or(&self.name)
     }
-    
+
     /// Get the SSH host to connect to (falls back to hostname, then name)
     fn ssh_host(&self) -> &str {
-        self.host.as_deref()
+        self.host
+            .as_deref()
             .unwrap_or_else(|| self.hostname.as_deref().unwrap_or(&self.name))
     }
 }
@@ -857,7 +941,29 @@ impl Default for SchemaConfig {
                 "examples/*.schema.json".to_string(),
                 "schemas/*.schema.json".to_string(),
             ],
-            base_url: "https://raw.githubusercontent.com/byteowlz/schemas/refs/heads/main".to_string(),
+            base_url: "https://raw.githubusercontent.com/byteowlz/schemas/refs/heads/main"
+                .to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct WebsiteConfig {
+    /// Path to website repository (relative to workspace or absolute)
+    repo_path: String,
+    /// Directory for tool pages within the website repo
+    toolz_dir: String,
+    /// Directory for tool assets (icons, screenshots)
+    public_dir: String,
+}
+
+impl Default for WebsiteConfig {
+    fn default() -> Self {
+        Self {
+            repo_path: "byteowlz.com".to_string(),
+            toolz_dir: "pages/toolz".to_string(),
+            public_dir: "public/toolz".to_string(),
         }
     }
 }
@@ -922,13 +1028,11 @@ impl Default for AppConfig {
                 ".venv".to_string(),
                 "__pycache__".to_string(),
             ],
-            required_files: vec![
-                "justfile".to_string(),
-                ".beads".to_string(),
-            ],
+            required_files: vec!["justfile".to_string(), ".beads".to_string()],
             release: ReleaseConfig::default(),
             templates: TemplatesConfig::default(),
             schemas: SchemaConfig::default(),
+            website: WebsiteConfig::default(),
             sync: SyncConfig::default(),
             tools: ToolsConfig::default(),
             machines: Vec::new(),
@@ -961,7 +1065,10 @@ fn refresh_catalog(ctx: &RuntimeContext, full: bool) -> Result<()> {
     };
 
     if ctx.common.dry_run {
-        info!("dry-run: would write catalog to {}", ctx.catalog_path().display());
+        info!(
+            "dry-run: would write catalog to {}",
+            ctx.catalog_path().display()
+        );
         if ctx.common.json {
             println!("{}", serde_json::to_string_pretty(&catalog)?);
         }
@@ -975,7 +1082,10 @@ fn refresh_catalog(ctx: &RuntimeContext, full: bool) -> Result<()> {
     if ctx.common.json {
         println!("{}", json);
     } else {
-        println!("Catalog refreshed: {} repositories found", catalog.repos.len());
+        println!(
+            "Catalog refreshed: {} repositories found",
+            catalog.repos.len()
+        );
         println!("Written to: {}", ctx.catalog_path().display());
     }
 
@@ -985,7 +1095,9 @@ fn refresh_catalog(ctx: &RuntimeContext, full: bool) -> Result<()> {
 fn show_catalog(ctx: &RuntimeContext) -> Result<()> {
     let catalog_path = ctx.catalog_path();
     if !catalog_path.exists() {
-        return Err(anyhow!("Catalog not found. Run 'byt catalog refresh' first."));
+        return Err(anyhow!(
+            "Catalog not found. Run 'byt catalog refresh' first."
+        ));
     }
 
     let content = fs::read_to_string(&catalog_path)?;
@@ -1074,7 +1186,7 @@ fn fetch_remote_machine_catalog(machine: &Machine) -> Result<MachineCatalog> {
     use std::process::Command as ShellCommand;
 
     let workspace_path = machine.workspace.as_deref().unwrap_or("~/byteowlz");
-    
+
     // Build SSH command - use byt catalog list --json for lightweight output
     let port_str = machine.port.to_string();
     let ssh_host = machine.ssh_host();
@@ -1082,7 +1194,7 @@ fn fetch_remote_machine_catalog(machine: &Machine) -> Result<MachineCatalog> {
         "cd {} && $HOME/.cargo/bin/byt catalog list --json 2>/dev/null || byt catalog list --json",
         workspace_path
     );
-    
+
     let mut ssh_args: Vec<&str> = vec!["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"];
     if machine.port != 22 {
         ssh_args.extend(["-p", &port_str]);
@@ -1100,7 +1212,11 @@ fn fetch_remote_machine_catalog(machine: &Machine) -> Result<MachineCatalog> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("SSH to {} failed: {}", machine.name, stderr.lines().next().unwrap_or("unknown error")));
+        return Err(anyhow!(
+            "SSH to {} failed: {}",
+            machine.name,
+            stderr.lines().next().unwrap_or("unknown error")
+        ));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1117,13 +1233,15 @@ fn fetch_remote_machine_catalog(machine: &Machine) -> Result<MachineCatalog> {
 /// Show repos available on each machine
 fn catalog_machines_show(ctx: &RuntimeContext, explicit_machines: Vec<String>) -> Result<()> {
     let local_name = get_local_machine_name(&ctx.config.machines);
-    
+
     // Get local catalog
     let local_catalog = get_local_machine_catalog(ctx)?;
-    
+
     // Determine which machines to query
     let machines: Vec<&Machine> = if !explicit_machines.is_empty() {
-        ctx.config.machines.iter()
+        ctx.config
+            .machines
+            .iter()
             .filter(|m| explicit_machines.contains(&m.name))
             .collect()
     } else {
@@ -1132,7 +1250,7 @@ fn catalog_machines_show(ctx: &RuntimeContext, explicit_machines: Vec<String>) -
 
     // Collect all catalogs
     let mut catalogs: Vec<MachineCatalog> = Vec::new();
-    
+
     // Add local catalog first if not in explicit list or if it's included
     if explicit_machines.is_empty() || explicit_machines.contains(&local_name) {
         catalogs.push(local_catalog);
@@ -1150,7 +1268,7 @@ fn catalog_machines_show(ctx: &RuntimeContext, explicit_machines: Vec<String>) -
             }
             continue;
         }
-        
+
         if !ctx.common.quiet {
             eprint!("Querying {}... ", machine.name);
         }
@@ -1174,7 +1292,7 @@ fn catalog_machines_show(ctx: &RuntimeContext, explicit_machines: Vec<String>) -
     } else {
         println!("Machine Catalogs");
         println!("================\n");
-        
+
         for catalog in &catalogs {
             println!("{} ({} repos):", catalog.machine, catalog.repos.len());
             for repo in &catalog.repos {
@@ -1189,16 +1307,18 @@ fn catalog_machines_show(ctx: &RuntimeContext, explicit_machines: Vec<String>) -
 
 /// Compare repo availability across machines
 fn catalog_machines_compare(ctx: &RuntimeContext, explicit_machines: Vec<String>) -> Result<()> {
-    use std::collections::{HashSet, HashMap as StdHashMap};
+    use std::collections::{HashMap as StdHashMap, HashSet};
 
     let local_name = get_local_machine_name(&ctx.config.machines);
-    
+
     // Get local catalog
     let local_catalog = get_local_machine_catalog(ctx)?;
-    
+
     // Determine which machines to query
     let machines: Vec<&Machine> = if !explicit_machines.is_empty() {
-        ctx.config.machines.iter()
+        ctx.config
+            .machines
+            .iter()
             .filter(|m| explicit_machines.contains(&m.name))
             .collect()
     } else {
@@ -1214,7 +1334,7 @@ fn catalog_machines_compare(ctx: &RuntimeContext, explicit_machines: Vec<String>
             // Already have local catalog
             continue;
         }
-        
+
         if !ctx.common.quiet {
             eprint!("Querying {}... ", machine.name);
         }
@@ -1256,7 +1376,7 @@ fn catalog_machines_compare(ctx: &RuntimeContext, explicit_machines: Vec<String>
     for repo in &all_repos {
         let mut present_on = Vec::new();
         let mut missing_on = Vec::new();
-        
+
         for machine in &machine_names {
             if let Some(catalog) = catalogs.get(machine) {
                 if catalog.repos.contains(repo) {
@@ -1266,7 +1386,7 @@ fn catalog_machines_compare(ctx: &RuntimeContext, explicit_machines: Vec<String>
                 }
             }
         }
-        
+
         repo_availability.push(RepoAvailability {
             name: repo.clone(),
             present_on,
@@ -1317,7 +1437,9 @@ fn catalog_machines_compare(ctx: &RuntimeContext, explicit_machines: Vec<String>
         println!();
         println!("Summary:");
         for machine in &machine_names {
-            let count = comparison.repos.iter()
+            let count = comparison
+                .repos
+                .iter()
                 .filter(|r| r.present_on.contains(machine))
                 .count();
             println!("  {}: {} repos", machine, count);
@@ -1332,15 +1454,18 @@ fn catalog_machines_missing(ctx: &RuntimeContext) -> Result<()> {
     use std::collections::HashSet;
 
     let local_name = get_local_machine_name(&ctx.config.machines);
-    
+
     // Get local repos
     let local_repos: HashSet<String> = get_local_repo_list(ctx)?.into_iter().collect();
-    
+
     // Get remote machines (all machines except local)
-    let remote_machines: Vec<&Machine> = ctx.config.machines.iter()
+    let remote_machines: Vec<&Machine> = ctx
+        .config
+        .machines
+        .iter()
         .filter(|m| !is_local_machine(m))
         .collect();
-    
+
     if remote_machines.is_empty() {
         println!("No other machines configured.");
         println!();
@@ -1391,7 +1516,8 @@ fn catalog_machines_missing(ctx: &RuntimeContext) -> Result<()> {
             name: String,
             available_on: Vec<String>,
         }
-        let output: Vec<MissingRepo> = missing.iter()
+        let output: Vec<MissingRepo> = missing
+            .iter()
             .map(|(name, machines)| MissingRepo {
                 name: name.clone(),
                 available_on: machines.clone(),
@@ -1399,9 +1525,15 @@ fn catalog_machines_missing(ctx: &RuntimeContext) -> Result<()> {
             .collect();
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else if missing.is_empty() {
-        println!("No repos missing from {} that exist on other machines.", local_name);
+        println!(
+            "No repos missing from {} that exist on other machines.",
+            local_name
+        );
     } else {
-        println!("Repos missing from {} (available on other machines):", local_name);
+        println!(
+            "Repos missing from {} (available on other machines):",
+            local_name
+        );
         println!();
         for (repo, machines) in &missing {
             println!("  {} (on: {})", repo, machines.join(", "));
@@ -1494,7 +1626,7 @@ fn analyze_repo(path: &Path, name: &str, full: bool) -> Result<RepoInfo> {
     // Only fetch slow data (git, beads) if --full is specified
     let (last_commit, status, open_issues) = if full {
         let last_commit = get_last_commit_date(path);
-        
+
         let status = match &last_commit {
             Some(date) => {
                 if let Ok(commit_date) = DateTime::parse_from_rfc3339(date) {
@@ -1539,25 +1671,28 @@ fn get_repo_description(path: &Path) -> Option<String> {
     // Try to get from Cargo.toml
     if let Ok(content) = fs::read_to_string(path.join("Cargo.toml"))
         && let Ok(cargo) = content.parse::<toml::Table>()
-            && let Some(pkg) = cargo.get("package").and_then(|p| p.as_table())
-                && let Some(desc) = pkg.get("description").and_then(|d| d.as_str()) {
-                    return Some(desc.to_string());
-                }
+        && let Some(pkg) = cargo.get("package").and_then(|p| p.as_table())
+        && let Some(desc) = pkg.get("description").and_then(|d| d.as_str())
+    {
+        return Some(desc.to_string());
+    }
 
     // Try to get from package.json
     if let Ok(content) = fs::read_to_string(path.join("package.json"))
         && let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&content)
-            && let Some(desc) = pkg.get("description").and_then(|d| d.as_str()) {
-                return Some(desc.to_string());
-            }
+        && let Some(desc) = pkg.get("description").and_then(|d| d.as_str())
+    {
+        return Some(desc.to_string());
+    }
 
     // Try to get from pyproject.toml
     if let Ok(content) = fs::read_to_string(path.join("pyproject.toml"))
         && let Ok(pyproject) = content.parse::<toml::Table>()
-            && let Some(project) = pyproject.get("project").and_then(|p| p.as_table())
-                && let Some(desc) = project.get("description").and_then(|d| d.as_str()) {
-                    return Some(desc.to_string());
-                }
+        && let Some(project) = pyproject.get("project").and_then(|p| p.as_table())
+        && let Some(desc) = project.get("description").and_then(|d| d.as_str())
+    {
+        return Some(desc.to_string());
+    }
 
     None
 }
@@ -1658,7 +1793,9 @@ fn handle_lint(ctx: &RuntimeContext, cmd: LintCommand) -> Result<()> {
     }
 
     let report = LintReport {
-        passed: issues.iter().all(|i| !matches!(i.severity, Severity::Error)),
+        passed: issues
+            .iter()
+            .all(|i| !matches!(i.severity, Severity::Error)),
         repos_checked: repos.len(),
         issues,
     };
@@ -1681,7 +1818,10 @@ fn handle_lint(ctx: &RuntimeContext, cmd: LintCommand) -> Result<()> {
                     Severity::Warning => "WARN",
                     Severity::Info => "INFO",
                 };
-                println!("[{}] {} - {}: {}", severity_icon, issue.repo, issue.rule, issue.message);
+                println!(
+                    "[{}] {} - {}: {}",
+                    severity_icon, issue.repo, issue.rule, issue.message
+                );
             }
         }
     }
@@ -1729,7 +1869,8 @@ fn handle_status(ctx: &RuntimeContext, cmd: StatusCommand) -> Result<()> {
             if info.has_agents_md { "A" } else { "-" }
         );
 
-        let issues = info.open_issues
+        let issues = info
+            .open_issues
             .map(|n| format!(" ({} issues)", n))
             .unwrap_or_default();
 
@@ -1738,7 +1879,12 @@ fn handle_status(ctx: &RuntimeContext, cmd: StatusCommand) -> Result<()> {
 
     println!();
     println!("Legend: J=justfile, B=beads, A=AGENTS.md");
-    println!("Active: {}, Stale: {}, Total: {}", active, stale, repos.len());
+    println!(
+        "Active: {}, Stale: {}, Total: {}",
+        active,
+        stale,
+        repos.len()
+    );
 
     Ok(())
 }
@@ -1759,14 +1905,13 @@ fn handle_ready(ctx: &RuntimeContext) -> Result<()> {
     }
 
     let content = String::from_utf8_lossy(&output.stdout);
-    
+
     if ctx.common.json {
         // Pass through JSON directly
         println!("{}", content);
     } else {
-        let issues: Vec<serde_json::Value> = serde_json::from_str(&content)
-            .unwrap_or_default();
-        
+        let issues: Vec<serde_json::Value> = serde_json::from_str(&content).unwrap_or_default();
+
         if issues.is_empty() {
             println!("No ready work found at govnr level.");
             println!("Tip: Use 'bd ready' in individual repos for repo-specific work.");
@@ -1777,7 +1922,10 @@ fn handle_ready(ctx: &RuntimeContext) -> Result<()> {
                 let id = issue.get("id").and_then(|i| i.as_str()).unwrap_or("?");
                 let title = issue.get("title").and_then(|t| t.as_str()).unwrap_or("?");
                 let priority = issue.get("priority").and_then(|p| p.as_i64()).unwrap_or(0);
-                let issue_type = issue.get("issue_type").and_then(|t| t.as_str()).unwrap_or("task");
+                let issue_type = issue
+                    .get("issue_type")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("task");
                 println!("[P{}] {} ({}): {}", priority, id, issue_type, title);
             }
         }
@@ -1790,7 +1938,7 @@ fn handle_triage(ctx: &RuntimeContext, cmd: TriageCommand) -> Result<()> {
     use std::process::Command;
 
     let workspace_config = ctx.workspace_root().join(".bv/workspace.yaml");
-    
+
     // Regenerate workspace.yaml if requested or if it doesn't exist
     if cmd.refresh || !workspace_config.exists() {
         generate_workspace_config(ctx)?;
@@ -1808,7 +1956,11 @@ fn handle_triage(ctx: &RuntimeContext, cmd: TriageCommand) -> Result<()> {
     };
 
     let output = Command::new("bv")
-        .args(["-workspace", &workspace_config.display().to_string(), bv_flag])
+        .args([
+            "-workspace",
+            &workspace_config.display().to_string(),
+            bv_flag,
+        ])
         .current_dir(ctx.workspace_root())
         .output()
         .context("running bv - is bv installed?")?;
@@ -1819,7 +1971,7 @@ fn handle_triage(ctx: &RuntimeContext, cmd: TriageCommand) -> Result<()> {
     }
 
     let content = String::from_utf8_lossy(&output.stdout);
-    
+
     if ctx.common.json {
         println!("{}", content);
     } else {
@@ -1837,26 +1989,26 @@ fn handle_triage(ctx: &RuntimeContext, cmd: TriageCommand) -> Result<()> {
 fn generate_workspace_config(ctx: &RuntimeContext) -> Result<()> {
     let repos = scan_repositories(ctx, false)?;
     let bv_dir = ctx.workspace_root().join(".bv");
-    
+
     fs::create_dir_all(&bv_dir)?;
-    
+
     let mut yaml = String::new();
     yaml.push_str("# Byteowlz workspace configuration for bv\n");
     yaml.push_str("# Auto-generated by byt - do not edit manually\n");
     yaml.push_str("# Regenerate with: byt triage --refresh\n\n");
     yaml.push_str("repos:\n");
-    
+
     for (name, info) in &repos {
         if info.has_beads {
             yaml.push_str(&format!("  - path: ./{}\n", name));
             yaml.push_str(&format!("    name: {}\n", name));
         }
     }
-    
+
     let config_path = bv_dir.join("workspace.yaml");
     fs::write(&config_path, yaml)?;
     info!("Generated workspace config: {}", config_path.display());
-    
+
     Ok(())
 }
 
@@ -1881,37 +2033,52 @@ fn display_triage(triage: &serde_json::Value, next_only: bool) {
 
     // Full triage display
     if let Some(triage_data) = triage.get("triage")
-        && let Some(quick_ref) = triage_data.get("quick_ref") {
-            let open = quick_ref.get("open_count").and_then(|v| v.as_i64()).unwrap_or(0);
-            let actionable = quick_ref.get("actionable_count").and_then(|v| v.as_i64()).unwrap_or(0);
-            let blocked = quick_ref.get("blocked_count").and_then(|v| v.as_i64()).unwrap_or(0);
-            let in_progress = quick_ref.get("in_progress_count").and_then(|v| v.as_i64()).unwrap_or(0);
-            
-            println!("Cross-Repo Triage");
-            println!("=================");
-            println!("Open: {}  Actionable: {}  Blocked: {}  In Progress: {}", 
-                     open, actionable, blocked, in_progress);
-            println!();
-            
-            if let Some(top_picks) = quick_ref.get("top_picks").and_then(|v| v.as_array()) {
-                println!("Top Picks:");
-                for pick in top_picks.iter().take(5) {
-                    let id = pick.get("id").and_then(|v| v.as_str()).unwrap_or("?");
-                    let title = pick.get("title").and_then(|v| v.as_str()).unwrap_or("?");
-                    let score = pick.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    let unblocks = pick.get("unblocks").and_then(|v| v.as_i64()).unwrap_or(0);
-                    println!("  [{:.2}] {} (unblocks {})", score, id, unblocks);
-                    println!("        {}", title);
-                }
+        && let Some(quick_ref) = triage_data.get("quick_ref")
+    {
+        let open = quick_ref
+            .get("open_count")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let actionable = quick_ref
+            .get("actionable_count")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let blocked = quick_ref
+            .get("blocked_count")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let in_progress = quick_ref
+            .get("in_progress_count")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+
+        println!("Cross-Repo Triage");
+        println!("=================");
+        println!(
+            "Open: {}  Actionable: {}  Blocked: {}  In Progress: {}",
+            open, actionable, blocked, in_progress
+        );
+        println!();
+
+        if let Some(top_picks) = quick_ref.get("top_picks").and_then(|v| v.as_array()) {
+            println!("Top Picks:");
+            for pick in top_picks.iter().take(5) {
+                let id = pick.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                let title = pick.get("title").and_then(|v| v.as_str()).unwrap_or("?");
+                let score = pick.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let unblocks = pick.get("unblocks").and_then(|v| v.as_i64()).unwrap_or(0);
+                println!("  [{:.2}] {} (unblocks {})", score, id, unblocks);
+                println!("        {}", title);
             }
         }
+    }
 }
 
 fn handle_search(ctx: &RuntimeContext, cmd: SearchCommand) -> Result<()> {
     use std::process::Command;
 
     let mut args = vec!["search".to_string(), cmd.query.clone()];
-    
+
     // Add workspace filter if repo specified
     if let Some(ref repo) = cmd.repo {
         // Try to find the workspace path for this repo
@@ -1921,15 +2088,15 @@ fn handle_search(ctx: &RuntimeContext, cmd: SearchCommand) -> Result<()> {
             args.push(workspace_path.display().to_string());
         }
     }
-    
+
     args.push("--limit".to_string());
     args.push(cmd.limit.to_string());
-    
+
     if let Some(days) = cmd.days {
         args.push("--days".to_string());
         args.push(days.to_string());
     }
-    
+
     if ctx.common.json {
         args.push("--json".to_string());
     }
@@ -1950,11 +2117,33 @@ fn handle_search(ctx: &RuntimeContext, cmd: SearchCommand) -> Result<()> {
     Ok(())
 }
 
+fn handle_mail(_ctx: &RuntimeContext, command: MailCommand) -> Result<()> {
+    match command {
+        MailCommand::Inbox => run_mailz_command(vec!["inbox".to_string()]),
+        MailCommand::Send { to, subject, body } => run_mailz_command(vec![
+            "send".to_string(),
+            to,
+            subject,
+            "--body".to_string(),
+            body,
+        ]),
+        MailCommand::Read { id } => run_mailz_command(vec!["read".to_string(), id]),
+        MailCommand::Ack { id } => run_mailz_command(vec!["ack".to_string(), id]),
+    }
+}
+
 fn handle_memory(ctx: &RuntimeContext, command: MemoryCommand) -> Result<()> {
     use std::process::Command;
 
     match command {
-        MemoryCommand::Add { content, project, govnr, category, tags, importance } => {
+        MemoryCommand::Add {
+            content,
+            project,
+            govnr,
+            category,
+            tags,
+            importance,
+        } => {
             // Determine store: explicit --govnr, explicit --project, or auto-detect from cwd
             let store_name = if govnr {
                 "govnr".to_string()
@@ -1964,31 +2153,31 @@ fn handle_memory(ctx: &RuntimeContext, command: MemoryCommand) -> Result<()> {
                 // Auto-detect from current directory
                 detect_current_project(ctx)?
             };
-            
+
             // Ensure store exists (create if needed)
             ensure_memory_store(&store_name)?;
-            
+
             let mut args = vec!["add".to_string(), content];
-            
+
             args.push("--store".to_string());
             args.push(store_name.clone());
-            
+
             args.push("--memory-type".to_string());
             args.push("semantic".to_string());
-            
+
             if let Some(cat) = category {
                 args.push("--category".to_string());
                 args.push(cat);
             }
-            
+
             if let Some(t) = tags {
                 args.push("--tags".to_string());
                 args.push(t);
             }
-            
+
             args.push("--importance".to_string());
             args.push(importance.to_string());
-            
+
             if ctx.common.json {
                 args.push("--json".to_string());
             }
@@ -2002,7 +2191,7 @@ fn handle_memory(ctx: &RuntimeContext, command: MemoryCommand) -> Result<()> {
             if !stdout.is_empty() {
                 println!("{}", stdout);
             }
-            
+
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 eprintln!("{}", stderr);
@@ -2010,14 +2199,20 @@ fn handle_memory(ctx: &RuntimeContext, command: MemoryCommand) -> Result<()> {
                 println!("Memory added to project: {}", store_name);
             }
         }
-        MemoryCommand::Search { query, project, govnr, all, limit } => {
+        MemoryCommand::Search {
+            query,
+            project,
+            govnr,
+            all,
+            limit,
+        } => {
             let mut args = vec![
                 "search".to_string(),
                 query,
                 "--limit".to_string(),
                 limit.to_string(),
             ];
-            
+
             if all {
                 args.push("--all-stores".to_string());
             } else if govnr {
@@ -2033,7 +2228,7 @@ fn handle_memory(ctx: &RuntimeContext, command: MemoryCommand) -> Result<()> {
                 args.push("--store".to_string());
                 args.push(store_name);
             }
-            
+
             if ctx.common.json {
                 args.push("--json".to_string());
             }
@@ -2045,7 +2240,7 @@ fn handle_memory(ctx: &RuntimeContext, command: MemoryCommand) -> Result<()> {
 
             let stdout = String::from_utf8_lossy(&output.stdout);
             println!("{}", stdout);
-            
+
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 eprintln!("{}", stderr);
@@ -2059,30 +2254,118 @@ fn handle_memory(ctx: &RuntimeContext, command: MemoryCommand) -> Result<()> {
     Ok(())
 }
 
+fn handle_reserve(_ctx: &RuntimeContext, cmd: ReserveCommand) -> Result<()> {
+    let ttl_seconds = parse_duration_to_seconds(&cmd.ttl)?;
+    run_mailz_command(vec![
+        "reserve".to_string(),
+        cmd.file,
+        "--ttl".to_string(),
+        ttl_seconds.to_string(),
+        "--reason".to_string(),
+        cmd.reason,
+    ])
+}
+
+fn handle_reservations(_ctx: &RuntimeContext) -> Result<()> {
+    run_mailz_command(vec!["reservations".to_string()])
+}
+
+fn handle_release(_ctx: &RuntimeContext, cmd: ReleaseCommand) -> Result<()> {
+    run_mailz_command(vec!["release".to_string(), cmd.file])
+}
+
+fn run_mailz_command(args: Vec<String>) -> Result<()> {
+    use std::process::Command;
+
+    let output = Command::new("mailz-cli")
+        .args(&args)
+        .output()
+        .context("running mailz-cli - is mailz-cli installed?")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("mailz-cli failed: {}", stderr.trim()));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !stdout.is_empty() {
+        println!("{}", stdout);
+    }
+
+    Ok(())
+}
+
+fn parse_duration_to_seconds(raw: &str) -> Result<u64> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("ttl duration is empty"));
+    }
+
+    let last = trimmed
+        .chars()
+        .last()
+        .ok_or_else(|| anyhow!("ttl duration is empty"))?;
+
+    if last.is_ascii_digit() {
+        return Err(anyhow!(
+            "ttl duration must include a unit suffix (s/m/h/d), got '{}'",
+            trimmed
+        ));
+    }
+
+    let (value_str, unit) = trimmed.split_at(trimmed.len() - 1);
+    if value_str.is_empty() {
+        return Err(anyhow!(
+            "ttl duration must include a numeric value before the unit"
+        ));
+    }
+
+    let value: u64 = value_str.parse().context("parsing ttl duration value")?;
+    let unit = unit.to_ascii_lowercase();
+
+    let multiplier = match unit.as_str() {
+        "s" => 1u64,
+        "m" => 60u64,
+        "h" => 60u64 * 60u64,
+        "d" => 60u64 * 60u64 * 24u64,
+        _ => {
+            return Err(anyhow!(
+                "unsupported ttl unit '{}'; use s, m, h, or d",
+                unit
+            ));
+        }
+    };
+
+    value
+        .checked_mul(multiplier)
+        .ok_or_else(|| anyhow!("ttl duration is too large"))
+}
+
 /// Detect the current project based on working directory
 fn detect_current_project(ctx: &RuntimeContext) -> Result<String> {
     let cwd = env::current_dir()?;
     let workspace = ctx.workspace_root();
-    
+
     // Check if cwd is within the workspace
     if let Ok(relative) = cwd.strip_prefix(workspace) {
         // Get the first component (repo name)
         if let Some(first) = relative.components().next()
-            && let Some(name) = first.as_os_str().to_str() {
-                // Check if this is a valid repo in the catalog
-                let catalog_path = ctx.catalog_path();
-                if catalog_path.exists() {
-                    let content = fs::read_to_string(&catalog_path)?;
-                    let catalog: Catalog = serde_json::from_str(&content)?;
-                    
-                    if catalog.repos.contains_key(name) {
-                        info!("Auto-detected project: {}", name);
-                        return Ok(name.to_string());
-                    }
+            && let Some(name) = first.as_os_str().to_str()
+        {
+            // Check if this is a valid repo in the catalog
+            let catalog_path = ctx.catalog_path();
+            if catalog_path.exists() {
+                let content = fs::read_to_string(&catalog_path)?;
+                let catalog: Catalog = serde_json::from_str(&content)?;
+
+                if catalog.repos.contains_key(name) {
+                    info!("Auto-detected project: {}", name);
+                    return Ok(name.to_string());
                 }
             }
+        }
     }
-    
+
     // If at workspace root or outside workspace, use govnr
     info!("At workspace root or outside workspace, using govnr store");
     Ok("govnr".to_string())
@@ -2094,32 +2377,38 @@ fn validate_project_name(ctx: &RuntimeContext, project: &str) -> Result<String> 
     if project == "govnr" || project == "default" {
         return Ok(project.to_string());
     }
-    
+
     // Check if project exists in catalog
     let catalog_path = ctx.catalog_path();
     if catalog_path.exists() {
         let content = fs::read_to_string(&catalog_path)?;
         let catalog: Catalog = serde_json::from_str(&content)?;
-        
+
         if catalog.repos.contains_key(project) {
             return Ok(project.to_string());
         }
-        
+
         // Suggest similar names if not found
-        let similar: Vec<&String> = catalog.repos.keys()
+        let similar: Vec<&String> = catalog
+            .repos
+            .keys()
             .filter(|k| k.contains(project) || project.contains(k.as_str()))
             .take(3)
             .collect();
-        
+
         if !similar.is_empty() {
             return Err(anyhow!(
                 "Unknown project '{}'. Did you mean: {}?\nRun 'byt memory projects' to list available projects.",
                 project,
-                similar.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                similar
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
         }
     }
-    
+
     Err(anyhow!(
         "Unknown project '{}'. Run 'byt memory projects' to list available projects, or use 'govnr' for cross-repo memories.",
         project
@@ -2129,57 +2418,63 @@ fn validate_project_name(ctx: &RuntimeContext, project: &str) -> Result<String> 
 /// Ensure a memory store exists, creating it if needed
 fn ensure_memory_store(store_name: &str) -> Result<()> {
     use std::process::Command;
-    
+
     // Check if store exists
     let output = Command::new("mmry")
         .args(["stores", "list"])
         .output()
         .context("checking mmry stores")?;
-    
+
     let stdout = String::from_utf8_lossy(&output.stdout);
-    
+
     // If store already exists, we're done
-    if stdout.contains(&format!("{} ", store_name)) || stdout.contains(&format!("{} (default)", store_name)) {
+    if stdout.contains(&format!("{} ", store_name))
+        || stdout.contains(&format!("{} (default)", store_name))
+    {
         return Ok(());
     }
-    
+
     // Create the store
     info!("Creating memory store: {}", store_name);
     let output = Command::new("mmry")
         .args(["stores", "create", store_name])
         .output()
         .context("creating mmry store")?;
-    
+
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         // Ignore "already exists" errors
         if !stderr.contains("already exists") {
-            return Err(anyhow!("Failed to create store '{}': {}", store_name, stderr));
+            return Err(anyhow!(
+                "Failed to create store '{}': {}",
+                store_name,
+                stderr
+            ));
         }
     }
-    
+
     Ok(())
 }
 
 /// List available projects for memory storage
 fn list_memory_projects(ctx: &RuntimeContext) -> Result<()> {
     use std::process::Command;
-    
+
     // Get existing stores
     let output = Command::new("mmry")
         .args(["stores", "list"])
         .output()
         .context("listing mmry stores")?;
-    
+
     let stores_output = String::from_utf8_lossy(&output.stdout);
-    
+
     // Parse existing stores
     let existing_stores: Vec<&str> = stores_output
         .lines()
         .filter(|l| l.starts_with("  "))
         .filter_map(|l| l.split_whitespace().next())
         .collect();
-    
+
     // Get catalog repos
     let catalog_path = ctx.catalog_path();
     let catalog_repos: Vec<String> = if catalog_path.exists() {
@@ -2189,7 +2484,7 @@ fn list_memory_projects(ctx: &RuntimeContext) -> Result<()> {
     } else {
         Vec::new()
     };
-    
+
     if ctx.common.json {
         #[derive(Serialize)]
         struct ProjectsOutput {
@@ -2197,7 +2492,7 @@ fn list_memory_projects(ctx: &RuntimeContext) -> Result<()> {
             repos: Vec<String>,
             existing_stores: Vec<String>,
         }
-        
+
         let output = ProjectsOutput {
             special: vec!["govnr".to_string()],
             repos: catalog_repos,
@@ -2224,7 +2519,10 @@ fn list_memory_projects(ctx: &RuntimeContext) -> Result<()> {
             println!("  {}{}", repo, marker);
         }
         if catalog_repos.len() > 20 {
-            println!("  ... and {} more (run 'byt catalog list' for full list)", catalog_repos.len() - 20);
+            println!(
+                "  ... and {} more (run 'byt catalog list' for full list)",
+                catalog_repos.len() - 20
+            );
         }
         println!();
         println!("Usage:");
@@ -2233,7 +2531,7 @@ fn list_memory_projects(ctx: &RuntimeContext) -> Result<()> {
         println!("  byt memory search \"query\" --project omni     # Search repo memories");
         println!("  byt memory search \"query\" --all              # Search all projects");
     }
-    
+
     Ok(())
 }
 
@@ -2254,18 +2552,18 @@ fn get_syncable_stores(ctx: &RuntimeContext, explicit_stores: Vec<String>) -> Re
     if !explicit_stores.is_empty() {
         return Ok(explicit_stores);
     }
-    
+
     let mut stores = vec!["govnr".to_string()];
-    
+
     // Get repos from catalog that exist locally
     let catalog_path = ctx.catalog_path();
     if catalog_path.exists() {
         let content = fs::read_to_string(&catalog_path)?;
         let catalog: Catalog = serde_json::from_str(&content)?;
-        
+
         // Get existing mmry stores
         let existing = get_existing_stores()?;
-        
+
         // Add repos that have stores (skip govnr since it's already added)
         for repo_name in catalog.repos.keys() {
             if repo_name != "govnr" && existing.contains(repo_name) {
@@ -2273,76 +2571,90 @@ fn get_syncable_stores(ctx: &RuntimeContext, explicit_stores: Vec<String>) -> Re
             }
         }
     }
-    
+
     Ok(stores)
 }
 
 /// Get list of existing mmry stores
 fn get_existing_stores() -> Result<Vec<String>> {
     use std::process::Command;
-    
+
     let output = Command::new("mmry")
         .args(["stores", "list"])
         .output()
         .context("listing mmry stores")?;
-    
+
     let stdout = String::from_utf8_lossy(&output.stdout);
-    
+
     let stores: Vec<String> = stdout
         .lines()
         .filter(|l| l.starts_with("  "))
         .filter_map(|l| l.split_whitespace().next())
         .map(|s| s.to_string())
         .collect();
-    
+
     Ok(stores)
 }
 
 /// Export memories to sync directory for git-based sync
 fn sync_push(ctx: &RuntimeContext, explicit_stores: Vec<String>) -> Result<()> {
     use std::process::Command;
-    
+
     let stores = get_syncable_stores(ctx, explicit_stores)?;
     let sync_dir = resolve_sync_dir(ctx)?;
-    
+
     fs::create_dir_all(&sync_dir)?;
-    
+
     if ctx.common.dry_run {
-        println!("Would export {} stores to {}", stores.len(), sync_dir.display());
+        println!(
+            "Would export {} stores to {}",
+            stores.len(),
+            sync_dir.display()
+        );
         for store in &stores {
             println!("  - {}", store);
         }
         return Ok(());
     }
-    
+
     let mut exported = 0;
     let mut total_memories = 0;
-    
+
     for store in &stores {
         let output_file = sync_dir.join(format!("{}.json", store));
-        
+
         let output = Command::new("mmry")
-            .args(["export", "--store", store, "-o", &output_file.display().to_string()])
+            .args([
+                "export",
+                "--store",
+                store,
+                "-o",
+                &output_file.display().to_string(),
+            ])
             .output()
             .with_context(|| format!("exporting store '{}'", store))?;
-        
+
         if output.status.success() {
             // Count memories in export
             if let Ok(content) = fs::read_to_string(&output_file)
-                && let Ok(export) = serde_json::from_str::<serde_json::Value>(&content) {
-                    let count = export.get("memory_count").and_then(|v| v.as_i64()).unwrap_or(0);
-                    total_memories += count;
-                    if !ctx.common.quiet {
-                        println!("  {} ({} memories)", store, count);
-                    }
+                && let Ok(export) = serde_json::from_str::<serde_json::Value>(&content)
+            {
+                let count = export
+                    .get("memory_count")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                total_memories += count;
+                if !ctx.common.quiet {
+                    println!("  {} ({} memories)", store, count);
                 }
+            }
             exported += 1;
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
             eprintln!("  {} - FAILED: {}", store, stderr.trim());
         }
     }
-    
+
     if ctx.common.json {
         #[derive(Serialize)]
         struct PushResult {
@@ -2350,30 +2662,41 @@ fn sync_push(ctx: &RuntimeContext, explicit_stores: Vec<String>) -> Result<()> {
             total_memories: i64,
             sync_dir: String,
         }
-        println!("{}", serde_json::to_string_pretty(&PushResult {
-            stores_exported: exported,
-            total_memories,
-            sync_dir: sync_dir.display().to_string(),
-        })?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&PushResult {
+                stores_exported: exported,
+                total_memories,
+                sync_dir: sync_dir.display().to_string(),
+            })?
+        );
     } else {
         println!();
-        println!("Exported {} stores ({} memories) to {}", exported, total_memories, sync_dir.display());
+        println!(
+            "Exported {} stores ({} memories) to {}",
+            exported,
+            total_memories,
+            sync_dir.display()
+        );
         println!("Run 'git add .sync && git commit' to sync");
     }
-    
+
     Ok(())
 }
 
 /// Import memories from sync directory after git pull
 fn sync_pull(ctx: &RuntimeContext, explicit_stores: Vec<String>) -> Result<()> {
     use std::process::Command;
-    
+
     let sync_dir = resolve_sync_dir(ctx)?;
-    
+
     if !sync_dir.exists() {
-        return Err(anyhow!("Sync directory not found: {}. Run 'byt sync push' first or 'git pull'.", sync_dir.display()));
+        return Err(anyhow!(
+            "Sync directory not found: {}. Run 'byt sync push' first or 'git pull'.",
+            sync_dir.display()
+        ));
     }
-    
+
     // Get stores to import
     let stores = if explicit_stores.is_empty() {
         // Auto-detect from files in sync dir that match local repos
@@ -2385,65 +2708,76 @@ fn sync_pull(ctx: &RuntimeContext, explicit_stores: Vec<String>) -> Result<()> {
         } else {
             Vec::new()
         };
-        
+
         let mut stores = Vec::new();
         for entry in fs::read_dir(&sync_dir)? {
             let entry = entry?;
             let path = entry.path();
             if path.extension().map(|e| e == "json").unwrap_or(false)
-                && let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    // Always sync govnr, or sync if repo exists locally
-                    if stem == "govnr" || local_repos.contains(&stem.to_string()) {
-                        stores.push(stem.to_string());
-                    }
+                && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+            {
+                // Always sync govnr, or sync if repo exists locally
+                if stem == "govnr" || local_repos.contains(&stem.to_string()) {
+                    stores.push(stem.to_string());
                 }
+            }
         }
         stores
     } else {
         explicit_stores
     };
-    
+
     if stores.is_empty() {
         println!("No stores to import (no matching repos found locally)");
         return Ok(());
     }
-    
+
     if ctx.common.dry_run {
-        println!("Would import {} stores from {}", stores.len(), sync_dir.display());
+        println!(
+            "Would import {} stores from {}",
+            stores.len(),
+            sync_dir.display()
+        );
         for store in &stores {
             println!("  - {}", store);
         }
         return Ok(());
     }
-    
+
     let mut imported_count = 0;
-    
+
     for store in &stores {
         let input_file = sync_dir.join(format!("{}.json", store));
-        
+
         if !input_file.exists() {
             if !ctx.common.quiet {
                 println!("  {} - skipped (no export file)", store);
             }
             continue;
         }
-        
+
         // Ensure store exists
         ensure_memory_store(store)?;
-        
+
         // Use mmry import command (handles HMLR data, deduplication, re-embedding)
         let output = Command::new("mmry")
-            .args(["import", &input_file.display().to_string(), "--store", store])
+            .args([
+                "import",
+                &input_file.display().to_string(),
+                "--store",
+                store,
+            ])
             .output()
             .context("running mmry import")?;
-        
+
         if !ctx.common.quiet {
             // Parse output for summary
             let stdout = String::from_utf8_lossy(&output.stdout);
             if output.status.success() {
                 // Extract key info from output
                 let lines: Vec<&str> = stdout.lines().collect();
-                let summary = lines.iter()
+                let summary = lines
+                    .iter()
                     .find(|l| l.contains("memories") || l.contains("Import complete"))
                     .map(|s| s.trim())
                     .unwrap_or("imported");
@@ -2451,40 +2785,46 @@ fn sync_pull(ctx: &RuntimeContext, explicit_stores: Vec<String>) -> Result<()> {
                 imported_count += 1;
             } else {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                println!("  {} - error: {}", store, stderr.lines().next().unwrap_or("unknown error"));
+                println!(
+                    "  {} - error: {}",
+                    store,
+                    stderr.lines().next().unwrap_or("unknown error")
+                );
             }
         } else if output.status.success() {
             imported_count += 1;
         }
     }
-    
+
     if ctx.common.json {
         #[derive(Serialize)]
         struct PullResult {
             stores_imported: usize,
         }
-        println!("{}", serde_json::to_string_pretty(&PullResult {
-            stores_imported: imported_count,
-        })?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&PullResult {
+                stores_imported: imported_count,
+            })?
+        );
     } else {
         println!();
         println!("Imported {} stores (with HMLR data)", imported_count);
     }
-    
+
     Ok(())
 }
 
 /// Resolve the sync directory from config
 fn resolve_sync_dir(ctx: &RuntimeContext) -> Result<PathBuf> {
     let sync_path = &ctx.config.sync.sync_dir;
-    
+
     // If absolute path, use as-is
     if sync_path.starts_with('/') || sync_path.starts_with('~') {
-        let expanded = shellexpand::full(sync_path)
-            .context("expanding sync_dir path")?;
+        let expanded = shellexpand::full(sync_path).context("expanding sync_dir path")?;
         return Ok(PathBuf::from(expanded.to_string()));
     }
-    
+
     // Otherwise, relative to workspace
     Ok(ctx.workspace_root().join(sync_path))
 }
@@ -2493,7 +2833,7 @@ fn resolve_sync_dir(ctx: &RuntimeContext) -> Result<PathBuf> {
 fn sync_status(ctx: &RuntimeContext) -> Result<()> {
     let sync_dir = resolve_sync_dir(ctx)?;
     let existing_stores = get_existing_stores()?;
-    
+
     // Get catalog repos
     let catalog_path = ctx.catalog_path();
     let catalog_repos: Vec<String> = if catalog_path.exists() {
@@ -2503,7 +2843,7 @@ fn sync_status(ctx: &RuntimeContext) -> Result<()> {
     } else {
         Vec::new()
     };
-    
+
     if ctx.common.json {
         #[derive(Serialize)]
         struct SyncStatus {
@@ -2512,35 +2852,44 @@ fn sync_status(ctx: &RuntimeContext) -> Result<()> {
             local_stores: Vec<String>,
             syncable_stores: Vec<String>,
         }
-        
+
         let sync_files: Vec<String> = if sync_dir.exists() {
             fs::read_dir(&sync_dir)?
                 .filter_map(|e| e.ok())
-                .filter_map(|e| e.path().file_stem().and_then(|s| s.to_str()).map(|s| s.to_string()))
+                .filter_map(|e| {
+                    e.path()
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.to_string())
+                })
                 .collect()
         } else {
             Vec::new()
         };
-        
-        let syncable: Vec<String> = existing_stores.iter()
+
+        let syncable: Vec<String> = existing_stores
+            .iter()
             .filter(|s| *s == "govnr" || catalog_repos.contains(s))
             .cloned()
             .collect();
-        
-        println!("{}", serde_json::to_string_pretty(&SyncStatus {
-            sync_dir_exists: sync_dir.exists(),
-            sync_files,
-            local_stores: existing_stores,
-            syncable_stores: syncable,
-        })?);
+
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&SyncStatus {
+                sync_dir_exists: sync_dir.exists(),
+                sync_files,
+                local_stores: existing_stores,
+                syncable_stores: syncable,
+            })?
+        );
     } else {
         println!("Memory Sync Status");
         println!("==================");
         println!();
-        
+
         println!("Sync directory: {}", sync_dir.display());
         println!("  Exists: {}", if sync_dir.exists() { "yes" } else { "no" });
-        
+
         if sync_dir.exists() {
             println!("  Files:");
             for entry in fs::read_dir(&sync_dir)? {
@@ -2552,21 +2901,25 @@ fn sync_status(ctx: &RuntimeContext) -> Result<()> {
                 }
             }
         }
-        
+
         println!();
         println!("Local stores:");
         for store in &existing_stores {
             let syncable = *store == "govnr" || catalog_repos.contains(store);
-            let marker = if syncable { "[syncable]" } else { "[local-only]" };
+            let marker = if syncable {
+                "[syncable]"
+            } else {
+                "[local-only]"
+            };
             println!("  {} {}", store, marker);
         }
-        
+
         println!();
         println!("Commands:");
         println!("  byt sync push    # Export memories to .sync/");
         println!("  byt sync pull    # Import memories from .sync/");
     }
-    
+
     Ok(())
 }
 
@@ -2613,10 +2966,12 @@ fn repos_sync(
         for entry in fs::read_dir(workspace)? {
             let entry = entry?;
             let path = entry.path();
-            if path.is_dir() && path.join(".git").exists()
-                && let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    found.push(name.to_string());
-                }
+            if path.is_dir()
+                && path.join(".git").exists()
+                && let Some(name) = path.file_name().and_then(|n| n.to_str())
+            {
+                found.push(name.to_string());
+            }
         }
         found
     };
@@ -2843,18 +3198,10 @@ fn repos_sync(
     // Summary
     println!();
     if do_pull {
-        println!(
-            "Pull: {} ok, {} failed",
-            pull_ok,
-            pull_failed
-        );
+        println!("Pull: {} ok, {} failed", pull_ok, pull_failed);
     }
     if do_push {
-        println!(
-            "Push: {} ok, {} failed",
-            push_ok,
-            push_failed
-        );
+        println!("Push: {} ok, {} failed", push_ok, push_failed);
     }
     if !has_changes.is_empty() {
         println!();
@@ -2867,7 +3214,9 @@ fn repos_sync(
     if do_push && sync_memories {
         println!();
         println!("Don't forget to commit and push the .sync/ directory:");
-        println!("  cd ~/byteowlz/govnr && git add .sync && git commit -m 'sync memories' && git push");
+        println!(
+            "  cd ~/byteowlz/govnr && git add .sync && git commit -m 'sync memories' && git push"
+        );
     }
 
     Ok(())
@@ -2954,7 +3303,12 @@ fn get_repo_status(repo_path: &Path, repo_name: &str) -> RepoStatusInfo {
         .output()
         .ok()
         .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().parse().unwrap_or(0))
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse()
+                .unwrap_or(0)
+        })
         .unwrap_or(0);
 
     // Get behind count
@@ -2964,7 +3318,12 @@ fn get_repo_status(repo_path: &Path, repo_name: &str) -> RepoStatusInfo {
         .output()
         .ok()
         .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().parse().unwrap_or(0))
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse()
+                .unwrap_or(0)
+        })
         .unwrap_or(0);
 
     RepoStatusInfo {
@@ -3034,9 +3393,18 @@ fn repos_status(ctx: &RuntimeContext) -> Result<()> {
             }
 
             if parts.is_empty() {
-                println!("  {} - clean ({})", status.name, status.head_commit.as_deref().unwrap_or("?"));
+                println!(
+                    "  {} - clean ({})",
+                    status.name,
+                    status.head_commit.as_deref().unwrap_or("?")
+                );
             } else {
-                println!("  {} - {} ({})", status.name, parts.join(", "), status.head_commit.as_deref().unwrap_or("?"));
+                println!(
+                    "  {} - {} ({})",
+                    status.name,
+                    parts.join(", "),
+                    status.head_commit.as_deref().unwrap_or("?")
+                );
             }
         }
     }
@@ -3045,9 +3413,13 @@ fn repos_status(ctx: &RuntimeContext) -> Result<()> {
 }
 
 /// Compare repositories across configured machines
-fn repos_compare(ctx: &RuntimeContext, explicit_repos: Vec<String>, explicit_machines: Vec<String>) -> Result<()> {
-    use std::process::Command as ShellCommand;
+fn repos_compare(
+    ctx: &RuntimeContext,
+    explicit_repos: Vec<String>,
+    explicit_machines: Vec<String>,
+) -> Result<()> {
     use std::collections::HashMap;
+    use std::process::Command as ShellCommand;
 
     let workspace = ctx.workspace_root();
     let catalog_path = ctx.catalog_path();
@@ -3070,16 +3442,28 @@ fn repos_compare(ctx: &RuntimeContext, explicit_repos: Vec<String>, explicit_mac
 
     // Get machines to query (all except local)
     let remote_machines: Vec<&Machine> = if !explicit_machines.is_empty() {
-        ctx.config.machines.iter()
+        ctx.config
+            .machines
+            .iter()
             .filter(|m| explicit_machines.contains(&m.name) && !is_local_machine(m))
             .collect()
     } else {
-        ctx.config.machines.iter()
+        ctx.config
+            .machines
+            .iter()
             .filter(|m| !is_local_machine(m))
             .collect()
     };
 
-    if remote_machines.is_empty() && ctx.config.machines.iter().filter(|m| !is_local_machine(m)).count() == 0 {
+    if remote_machines.is_empty()
+        && ctx
+            .config
+            .machines
+            .iter()
+            .filter(|m| !is_local_machine(m))
+            .count()
+            == 0
+    {
         println!("No other machines configured.");
         println!();
         println!("Add machines to ~/.config/byt/config.toml:");
@@ -3098,10 +3482,13 @@ fn repos_compare(ctx: &RuntimeContext, explicit_repos: Vec<String>, explicit_mac
         .collect();
 
     let mut all_statuses: HashMap<String, MachineStatus> = HashMap::new();
-    all_statuses.insert(local_name.clone(), MachineStatus {
-        machine: local_name.clone(),
-        repos: local_statuses,
-    });
+    all_statuses.insert(
+        local_name.clone(),
+        MachineStatus {
+            machine: local_name.clone(),
+            repos: local_statuses,
+        },
+    );
 
     // Query remote machines via SSH
     for machine in &remote_machines {
@@ -3110,7 +3497,7 @@ fn repos_compare(ctx: &RuntimeContext, explicit_repos: Vec<String>, explicit_mac
         }
 
         let workspace_path = machine.workspace.as_deref().unwrap_or("~/byteowlz");
-        
+
         // Build SSH command
         let port_str = machine.port.to_string();
         let ssh_host = machine.ssh_host();
@@ -3119,7 +3506,7 @@ fn repos_compare(ctx: &RuntimeContext, explicit_repos: Vec<String>, explicit_mac
             "cd {} && $HOME/.cargo/bin/byt repos status --json 2>/dev/null || byt repos status --json",
             workspace_path
         );
-        
+
         let mut ssh_args: Vec<&str> = vec!["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"];
         if machine.port != 22 {
             ssh_args.extend(["-p", &port_str]);
@@ -3130,9 +3517,7 @@ fn repos_compare(ctx: &RuntimeContext, explicit_repos: Vec<String>, explicit_mac
         ssh_args.push(ssh_host);
         ssh_args.push(&remote_cmd);
 
-        let output = ShellCommand::new("ssh")
-            .args(&ssh_args)
-            .output();
+        let output = ShellCommand::new("ssh").args(&ssh_args).output();
 
         match output {
             Ok(o) if o.status.success() => {
@@ -3154,7 +3539,10 @@ fn repos_compare(ctx: &RuntimeContext, explicit_repos: Vec<String>, explicit_mac
             Ok(o) => {
                 if !ctx.common.quiet {
                     let stderr = String::from_utf8_lossy(&o.stderr);
-                    eprintln!("failed: {}", stderr.lines().next().unwrap_or("unknown error"));
+                    eprintln!(
+                        "failed: {}",
+                        stderr.lines().next().unwrap_or("unknown error")
+                    );
                 }
             }
             Err(e) => {
@@ -3234,22 +3622,24 @@ fn repos_compare(ctx: &RuntimeContext, explicit_repos: Vec<String>, explicit_mac
         }
 
         // Determine which machine has the newest version
-        let newest_idx = dates.iter().enumerate()
+        let newest_idx = dates
+            .iter()
+            .enumerate()
             .filter_map(|(i, d)| d.map(|date| (i, date)))
             .max_by_key(|(_, date)| *date)
             .map(|(i, _)| i);
 
         // Check if all commits match
-        let all_same = commits.iter()
+        let all_same = commits
+            .iter()
             .filter_map(|c| *c)
             .collect::<Vec<_>>()
             .windows(2)
             .all(|w| w[0] == w[1]);
 
-        if !all_same
-            && let Some(idx) = newest_idx {
-                print!("  <- {}", machine_names[idx]);
-            }
+        if !all_same && let Some(idx) = newest_idx {
+            print!("  <- {}", machine_names[idx]);
+        }
 
         println!();
     }
@@ -3298,18 +3688,18 @@ fn handle_config(ctx: &RuntimeContext, command: ConfigCommand) -> Result<()> {
 
 fn handle_secrets(ctx: &RuntimeContext, command: SecretsCommand) -> Result<()> {
     use std::process::Command;
-    
+
     // Check if gh is available
-    let gh_check = Command::new("gh")
-        .arg("--version")
-        .output();
-    
+    let gh_check = Command::new("gh").arg("--version").output();
+
     if gh_check.is_err() {
-        return Err(anyhow!("GitHub CLI (gh) not found. Install it from https://cli.github.com"));
+        return Err(anyhow!(
+            "GitHub CLI (gh) not found. Install it from https://cli.github.com"
+        ));
     }
-    
+
     let release_cfg = &ctx.config.release;
-    
+
     // Normalize repo name to full path using configured org
     let normalize_repo = |repo: &str| -> Result<String> {
         if repo.contains('/') {
@@ -3322,18 +3712,18 @@ fn handle_secrets(ctx: &RuntimeContext, command: SecretsCommand) -> Result<()> {
             ))
         }
     };
-    
+
     match command {
         SecretsCommand::Setup { repo, skip_aur } => {
             let repo_full = normalize_repo(&repo)?;
-            
+
             println!("Setting up release secrets for {}", repo_full);
             println!();
-            
+
             // 1. TAP_GITHUB_TOKEN
             let token_name = &release_cfg.tap_token_name;
             println!("=== {} ===", token_name);
-            
+
             // Show which repos need access
             let mut needs_access = Vec::new();
             if !release_cfg.homebrew_tap.is_empty() {
@@ -3343,43 +3733,51 @@ fn handle_secrets(ctx: &RuntimeContext, command: SecretsCommand) -> Result<()> {
                 needs_access.push(release_cfg.scoop_bucket.as_str());
             }
             if needs_access.is_empty() {
-                println!("This token needs 'repo' scope for your homebrew-tap and scoop-bucket repos");
+                println!(
+                    "This token needs 'repo' scope for your homebrew-tap and scoop-bucket repos"
+                );
             } else {
-                println!("This token needs 'repo' scope for: {}", needs_access.join(", "));
+                println!(
+                    "This token needs 'repo' scope for: {}",
+                    needs_access.join(", ")
+                );
             }
             println!();
-            
+
             // Check if already set
             let check = Command::new("gh")
                 .args(["secret", "list", "--repo", &repo_full])
                 .output()
                 .context("checking existing secrets")?;
-            
+
             let existing = String::from_utf8_lossy(&check.stdout);
             let has_tap_token = existing.lines().any(|l| l.starts_with(token_name));
-            
+
             if has_tap_token {
-                println!("{} is already set. Skipping (use 'byt secrets set' to update)", token_name);
+                println!(
+                    "{} is already set. Skipping (use 'byt secrets set' to update)",
+                    token_name
+                );
             } else {
                 println!("Enter your GitHub PAT (or press Enter to skip):");
                 print!("> ");
                 io::stdout().flush()?;
-                
+
                 let mut token = String::new();
                 io::stdin().read_line(&mut token)?;
                 let token = token.trim();
-                
+
                 if !token.is_empty() {
                     let mut child = Command::new("gh")
                         .args(["secret", "set", token_name, "--repo", &repo_full])
                         .stdin(std::process::Stdio::piped())
                         .spawn()
                         .context("setting secret")?;
-                    
+
                     if let Some(mut stdin) = child.stdin.take() {
                         stdin.write_all(token.as_bytes())?;
                     }
-                    
+
                     let status = child.wait()?;
                     if status.success() {
                         println!("{} set successfully", token_name);
@@ -3388,35 +3786,37 @@ fn handle_secrets(ctx: &RuntimeContext, command: SecretsCommand) -> Result<()> {
                     }
                 }
             }
-            
+
             // 2. AUR secrets (if not skipped)
             if !skip_aur {
                 println!();
                 println!("=== AUR_SSH_PRIVATE_KEY ===");
-                
-                let has_aur_key = existing.lines().any(|l| l.starts_with("AUR_SSH_PRIVATE_KEY"));
-                
+
+                let has_aur_key = existing
+                    .lines()
+                    .any(|l| l.starts_with("AUR_SSH_PRIVATE_KEY"));
+
                 if has_aur_key {
                     println!("AUR_SSH_PRIVATE_KEY is already set. Skipping.");
                 } else if let Some(ref key_path) = ctx.config.release.aur_ssh_key_path {
                     let expanded = shellexpand::tilde(key_path);
                     let key_file = Path::new(expanded.as_ref());
-                    
+
                     if key_file.exists() {
                         println!("Reading from: {}", key_file.display());
-                        let key_content = fs::read_to_string(key_file)
-                            .context("reading AUR SSH key")?;
-                        
+                        let key_content =
+                            fs::read_to_string(key_file).context("reading AUR SSH key")?;
+
                         let mut child = Command::new("gh")
                             .args(["secret", "set", "AUR_SSH_PRIVATE_KEY", "--repo", &repo_full])
                             .stdin(std::process::Stdio::piped())
                             .spawn()
                             .context("setting secret")?;
-                        
+
                         if let Some(mut stdin) = child.stdin.take() {
                             stdin.write_all(key_content.as_bytes())?;
                         }
-                        
+
                         let status = child.wait()?;
                         if status.success() {
                             println!("AUR_SSH_PRIVATE_KEY set successfully");
@@ -3431,12 +3831,12 @@ fn handle_secrets(ctx: &RuntimeContext, command: SecretsCommand) -> Result<()> {
                     eprintln!("No aur_ssh_key_path configured in ~/.config/byt/config.toml");
                     eprintln!("Skipping AUR_SSH_PRIVATE_KEY");
                 }
-                
+
                 println!();
                 println!("=== AUR_EMAIL ===");
-                
+
                 let has_aur_email = existing.lines().any(|l| l.starts_with("AUR_EMAIL"));
-                
+
                 if has_aur_email {
                     println!("AUR_EMAIL is already set. Skipping.");
                 } else if let Some(ref email) = ctx.config.release.aur_email {
@@ -3445,11 +3845,11 @@ fn handle_secrets(ctx: &RuntimeContext, command: SecretsCommand) -> Result<()> {
                         .stdin(std::process::Stdio::piped())
                         .spawn()
                         .context("setting secret")?;
-                    
+
                     if let Some(mut stdin) = child.stdin.take() {
                         stdin.write_all(email.as_bytes())?;
                     }
-                    
+
                     let status = child.wait()?;
                     if status.success() {
                         println!("AUR_EMAIL set to: {}", email);
@@ -3461,25 +3861,25 @@ fn handle_secrets(ctx: &RuntimeContext, command: SecretsCommand) -> Result<()> {
                     eprintln!("Skipping AUR_EMAIL");
                 }
             }
-            
+
             println!();
             println!("Done! Run 'byt secrets list {}' to verify.", repo);
             Ok(())
         }
-        
+
         SecretsCommand::List { repo } => {
             let repo_full = normalize_repo(&repo)?;
-            
+
             let output = Command::new("gh")
                 .args(["secret", "list", "--repo", &repo_full])
                 .output()
                 .context("listing secrets")?;
-            
+
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 return Err(anyhow!("Failed to list secrets: {}", stderr));
             }
-            
+
             let stdout = String::from_utf8_lossy(&output.stdout);
             if stdout.is_empty() {
                 println!("No secrets found for {}", repo_full);
@@ -3490,15 +3890,19 @@ fn handle_secrets(ctx: &RuntimeContext, command: SecretsCommand) -> Result<()> {
             }
             Ok(())
         }
-        
-        SecretsCommand::Set { repo, name, value, from_file } => {
+
+        SecretsCommand::Set {
+            repo,
+            name,
+            value,
+            from_file,
+        } => {
             let repo_full = normalize_repo(&repo)?;
-            
+
             let secret_value = if let Some(v) = value {
                 v
             } else if let Some(path) = from_file {
-                fs::read_to_string(&path)
-                    .with_context(|| format!("reading {}", path.display()))?
+                fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?
             } else {
                 // Prompt for value
                 println!("Enter value for {} (Ctrl+D when done):", name);
@@ -3506,17 +3910,17 @@ fn handle_secrets(ctx: &RuntimeContext, command: SecretsCommand) -> Result<()> {
                 io::stdin().read_line(&mut val)?;
                 val.trim().to_string()
             };
-            
+
             let mut child = Command::new("gh")
                 .args(["secret", "set", &name, "--repo", &repo_full])
                 .stdin(std::process::Stdio::piped())
                 .spawn()
                 .context("setting secret")?;
-            
+
             if let Some(mut stdin) = child.stdin.take() {
                 stdin.write_all(secret_value.as_bytes())?;
             }
-            
+
             let status = child.wait()?;
             if status.success() {
                 println!("Secret {} set for {}", name, repo_full);
@@ -3530,17 +3934,20 @@ fn handle_secrets(ctx: &RuntimeContext, command: SecretsCommand) -> Result<()> {
 
 fn handle_new(ctx: &RuntimeContext, cmd: NewCommand) -> Result<()> {
     use std::process::Command;
-    
+
     let release_cfg = &ctx.config.release;
-    
+
     // Determine output directory
     let output_dir = cmd.output.clone().unwrap_or_else(|| PathBuf::from("."));
     let project_dir = output_dir.join(&cmd.name);
-    
+
     if project_dir.exists() {
-        return Err(anyhow!("Directory '{}' already exists", project_dir.display()));
+        return Err(anyhow!(
+            "Directory '{}' already exists",
+            project_dir.display()
+        ));
     }
-    
+
     // Branch based on whether we're using git clone or templates
     if let Some(ref git_source) = cmd.from_git {
         // Git-based scaffolding
@@ -3549,32 +3956,33 @@ fn handle_new(ctx: &RuntimeContext, cmd: NewCommand) -> Result<()> {
         // Template-based scaffolding (original behavior)
         scaffold_from_template(ctx, &cmd, &project_dir)?;
     }
-    
+
     // Apply variable replacements unless skipped
     if !cmd.no_replace {
         println!("Configuring project...");
         replace_in_files(&project_dir, "{{project_name}}", &cmd.name)?;
         replace_in_files(&project_dir, "your-binary-name", &cmd.name)?;
-        
+
         // For git-cloned repos, also replace common template patterns
         if cmd.from_git.is_some() {
             // Extract the repo name from the git URL for replacements
             if let Some(ref source) = cmd.from_git
-                && let Some(source_name) = extract_repo_name(source) {
-                    replace_in_files(&project_dir, &source_name, &cmd.name)?;
-                    // Also try with underscores (for Python modules)
-                    let source_underscore = source_name.replace('-', "_");
-                    let name_underscore = cmd.name.replace('-', "_");
-                    if source_underscore != source_name {
-                        replace_in_files(&project_dir, &source_underscore, &name_underscore)?;
-                    }
+                && let Some(source_name) = extract_repo_name(source)
+            {
+                replace_in_files(&project_dir, &source_name, &cmd.name)?;
+                // Also try with underscores (for Python modules)
+                let source_underscore = source_name.replace('-', "_");
+                let name_underscore = cmd.name.replace('-', "_");
+                if source_underscore != source_name {
+                    replace_in_files(&project_dir, &source_underscore, &name_underscore)?;
+                }
             }
         } else {
             // Rename directories/files if needed (e.g., python_cli -> project_name)
             rename_template_dirs(&project_dir, &cmd.template, &cmd.name)?;
         }
     }
-    
+
     // Initialize git (only if not already a git repo from clone)
     if !project_dir.join(".git").exists() {
         println!("Initializing git...");
@@ -3583,7 +3991,7 @@ fn handle_new(ctx: &RuntimeContext, cmd: NewCommand) -> Result<()> {
             .current_dir(&project_dir)
             .output();
     }
-    
+
     // Initialize beads if not already present
     if !project_dir.join(".beads").exists() {
         println!("Initializing beads...");
@@ -3592,41 +4000,41 @@ fn handle_new(ctx: &RuntimeContext, cmd: NewCommand) -> Result<()> {
             .current_dir(&project_dir)
             .output();
     }
-    
+
     // Create GitHub repo if requested
     if cmd.github {
         println!("Creating GitHub repository...");
-        
+
         let mut gh_args = vec!["repo", "create"];
-        
+
         let repo_name = if !release_cfg.github_org.is_empty() {
             format!("{}/{}", release_cfg.github_org, cmd.name)
         } else {
             cmd.name.clone()
         };
         gh_args.push(&repo_name);
-        
+
         if cmd.private {
             gh_args.push("--private");
         } else {
             gh_args.push("--public");
         }
-        
+
         gh_args.push("--source");
         gh_args.push(project_dir.to_str().unwrap());
-        
+
         if let Some(ref desc) = cmd.description {
             gh_args.push("--description");
             gh_args.push(desc);
         }
-        
+
         gh_args.push("--push");
-        
+
         let output = Command::new("gh")
             .args(&gh_args)
             .output()
             .context("creating GitHub repo")?;
-        
+
         if output.status.success() {
             println!("GitHub repository created: {}", repo_name);
         } else {
@@ -3634,7 +4042,7 @@ fn handle_new(ctx: &RuntimeContext, cmd: NewCommand) -> Result<()> {
             eprintln!("Warning: Failed to create GitHub repo: {}", stderr.trim());
         }
     }
-    
+
     println!();
     println!("Project created at: {}", project_dir.display());
     println!();
@@ -3644,7 +4052,7 @@ fn handle_new(ctx: &RuntimeContext, cmd: NewCommand) -> Result<()> {
     if !cmd.github {
         println!("  # To create GitHub repo: byt new {} --github", cmd.name);
     }
-    
+
     Ok(())
 }
 
@@ -3656,68 +4064,62 @@ fn scaffold_from_git(
     git_source: &str,
 ) -> Result<()> {
     use std::process::Command;
-    
+
     // Normalize the git URL
     let git_url = normalize_git_url(git_source);
-    
+
     println!("Creating new project from git: {}", cmd.name);
     println!("Source: {}", git_url);
-    
+
     // Create temp dir for clone
     let temp_dir = std::env::temp_dir().join(format!("byt-git-{}", std::process::id()));
     fs::create_dir_all(&temp_dir)?;
-    
+
     let clone_dir = temp_dir.join("repo");
-    
+
     // Build git clone command
     let mut clone_args = vec!["clone", "--depth", "1"];
-    
+
     // Add branch/tag/ref if specified
     if let Some(ref git_ref) = cmd.git_ref {
         clone_args.push("--branch");
         clone_args.push(git_ref);
     }
-    
+
     clone_args.push(&git_url);
     clone_args.push(clone_dir.to_str().unwrap());
-    
+
     println!("Cloning repository...");
-    
+
     let output = Command::new("git")
         .args(&clone_args)
         .output()
         .context("cloning git repository")?;
-    
+
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let _ = fs::remove_dir_all(&temp_dir);
         return Err(anyhow!("Failed to clone repository: {}", stderr.trim()));
     }
-    
+
     // Determine source directory (either clone root or subdir)
     let source_dir = if let Some(ref subdir) = cmd.subdir {
         let subdir_path = clone_dir.join(subdir);
         if !subdir_path.exists() {
             let _ = fs::remove_dir_all(&temp_dir);
-            return Err(anyhow!(
-                "Subdirectory '{}' not found in repository",
-                subdir
-            ));
+            return Err(anyhow!("Subdirectory '{}' not found in repository", subdir));
         }
         if !subdir_path.is_dir() {
             let _ = fs::remove_dir_all(&temp_dir);
-            return Err(anyhow!(
-                "'{}' is not a directory",
-                subdir
-            ));
+            return Err(anyhow!("'{}' is not a directory", subdir));
         }
         subdir_path
     } else {
         clone_dir.clone()
     };
-    
+
     println!("Creating project structure...");
-    
+
     // Copy files to project directory, excluding .git if we're using a subdir
     // or if we want a fresh git history
     if cmd.subdir.is_some() {
@@ -3731,21 +4133,21 @@ fn scaffold_from_git(
             fs::remove_dir_all(&git_dir)?;
         }
     }
-    
+
     // Remove template.toml if present (byt-specific file)
     let template_toml = project_dir.join("template.toml");
     if template_toml.exists() {
         fs::remove_file(&template_toml)?;
     }
-    
+
     // Clean up temp
     let _ = fs::remove_dir_all(&temp_dir);
-    
+
     // If --dry-run, just show what would happen
     if ctx.common.dry_run {
         println!("dry-run: would create project at {}", project_dir.display());
     }
-    
+
     Ok(())
 }
 
@@ -3756,52 +4158,61 @@ fn scaffold_from_template(
     project_dir: &Path,
 ) -> Result<()> {
     use std::process::Command;
-    
+
     let templates_cfg = &_ctx.config.templates;
-    
+
     println!("Creating new {} project: {}", cmd.template, cmd.name);
-    
+
     // Clone template from GitHub
     let template_url = format!(
         "https://github.com/{}/archive/refs/heads/{}.zip",
         templates_cfg.repo, templates_cfg.branch
     );
-    
+
     // Create temp dir for download
     let temp_dir = std::env::temp_dir().join(format!("byt-template-{}", std::process::id()));
     fs::create_dir_all(&temp_dir)?;
-    
+
     // Download and extract template
     println!("Fetching template from {}...", templates_cfg.repo);
-    
+
     let zip_path = temp_dir.join("template.zip");
     let output = Command::new("curl")
         .args(["-sL", "-o", zip_path.to_str().unwrap(), &template_url])
         .output()
         .context("downloading template")?;
-    
+
     if !output.status.success() {
         let _ = fs::remove_dir_all(&temp_dir);
         return Err(anyhow!("Failed to download template"));
     }
-    
+
     // Extract zip
     let extract_dir = temp_dir.join("extracted");
     let output = Command::new("unzip")
-        .args(["-q", zip_path.to_str().unwrap(), "-d", extract_dir.to_str().unwrap()])
+        .args([
+            "-q",
+            zip_path.to_str().unwrap(),
+            "-d",
+            extract_dir.to_str().unwrap(),
+        ])
         .output()
         .context("extracting template")?;
-    
+
     if !output.status.success() {
         let _ = fs::remove_dir_all(&temp_dir);
         return Err(anyhow!("Failed to extract template"));
     }
-    
+
     // Find the templates root directory (repo-branch/)
-    let repo_name = templates_cfg.repo.split('/').next_back().unwrap_or("templates");
+    let repo_name = templates_cfg
+        .repo
+        .split('/')
+        .next_back()
+        .unwrap_or("templates");
     let templates_root = extract_dir.join(format!("{}-{}", repo_name, templates_cfg.branch));
     let template_src = templates_root.join(&cmd.template);
-    
+
     if !template_src.exists() {
         let _ = fs::remove_dir_all(&temp_dir);
         return Err(anyhow!(
@@ -3809,47 +4220,49 @@ fn scaffold_from_template(
             cmd.template
         ));
     }
-    
+
     // Check for template manifest (template.toml)
     let manifest_path = template_src.join("template.toml");
     let manifest: Option<TemplateManifest> = if manifest_path.exists() {
-        let content = fs::read_to_string(&manifest_path)
-            .context("reading template.toml")?;
+        let content = fs::read_to_string(&manifest_path).context("reading template.toml")?;
         Some(toml::from_str(&content).context("parsing template.toml")?)
     } else {
         None
     };
-    
+
     // Copy template to project directory
     println!("Creating project structure...");
     copy_dir_recursive(&template_src, project_dir)?;
-    
+
     // Remove template.toml from the project (it's only for byt)
     let project_manifest = project_dir.join("template.toml");
     if project_manifest.exists() {
         fs::remove_file(&project_manifest)?;
     }
-    
+
     // Apply template composition if defined
     if let Some(ref manifest) = manifest {
         for comp in &manifest.compose {
             let source_template = templates_root.join(&comp.source);
             if !source_template.exists() {
-                eprintln!("Warning: Composed template '{}' not found, skipping", comp.source);
+                eprintln!(
+                    "Warning: Composed template '{}' not found, skipping",
+                    comp.source
+                );
                 continue;
             }
-            
+
             let target_dir = project_dir.join(&comp.target);
             println!("  Composing {} -> {}", comp.source, comp.target);
-            
+
             // Remove target directory if it exists (will be replaced by composed template)
             if target_dir.exists() {
                 fs::remove_dir_all(&target_dir)?;
             }
-            
+
             // Copy composed template, excluding specified files
             copy_dir_filtered(&source_template, &target_dir, &comp.exclude)?;
-            
+
             // Remove template.toml from composed template too
             let composed_manifest = target_dir.join("template.toml");
             if composed_manifest.exists() {
@@ -3857,10 +4270,10 @@ fn scaffold_from_template(
             }
         }
     }
-    
+
     // Clean up temp
     let _ = fs::remove_dir_all(&temp_dir);
-    
+
     Ok(())
 }
 
@@ -3872,11 +4285,14 @@ fn scaffold_from_template(
 /// - Bitbucket shorthand: bitbucket:user/repo
 fn normalize_git_url(source: &str) -> String {
     // Already a full URL
-    if source.starts_with("https://") || source.starts_with("http://") 
-       || source.starts_with("git@") || source.starts_with("ssh://") {
+    if source.starts_with("https://")
+        || source.starts_with("http://")
+        || source.starts_with("git@")
+        || source.starts_with("ssh://")
+    {
         return source.to_string();
     }
-    
+
     // Platform-specific shorthand
     if let Some(path) = source.strip_prefix("gitlab:") {
         return format!("https://gitlab.com/{}", path);
@@ -3887,12 +4303,12 @@ fn normalize_git_url(source: &str) -> String {
     if let Some(path) = source.strip_prefix("github:") {
         return format!("https://github.com/{}", path);
     }
-    
+
     // Default: assume GitHub shorthand (user/repo)
     if source.contains('/') && !source.contains(':') {
         return format!("https://github.com/{}", source);
     }
-    
+
     // Return as-is if we can't parse it
     source.to_string()
 }
@@ -3917,7 +4333,7 @@ fn extract_repo_name(source: &str) -> Option<String> {
     } else {
         return None;
     };
-    
+
     // Remove .git suffix if present
     let name = path.strip_suffix(".git").unwrap_or(path);
     Some(name.to_string())
@@ -3926,31 +4342,31 @@ fn extract_repo_name(source: &str) -> Option<String> {
 /// Recursively copy a directory
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     fs::create_dir_all(dst)?;
-    
+
     for entry in fs::read_dir(src)? {
         let entry = entry?;
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
-        
+
         if src_path.is_dir() {
             copy_dir_recursive(&src_path, &dst_path)?;
         } else {
             fs::copy(&src_path, &dst_path)?;
         }
     }
-    
+
     Ok(())
 }
 
 /// Recursively copy a directory, excluding specified paths
 fn copy_dir_filtered(src: &Path, dst: &Path, exclude: &[String]) -> Result<()> {
     fs::create_dir_all(dst)?;
-    
+
     for entry in fs::read_dir(src)? {
         let entry = entry?;
         let src_path = entry.path();
         let file_name = entry.file_name().to_string_lossy().to_string();
-        
+
         // Check if this file/dir should be excluded
         let should_exclude = exclude.iter().any(|pattern| {
             // Simple matching: exact name or glob pattern
@@ -3967,20 +4383,20 @@ fn copy_dir_filtered(src: &Path, dst: &Path, exclude: &[String]) -> Result<()> {
                 file_name == *pattern
             }
         });
-        
+
         if should_exclude {
             continue;
         }
-        
+
         let dst_path = dst.join(entry.file_name());
-        
+
         if src_path.is_dir() {
             copy_dir_filtered(&src_path, &dst_path, exclude)?;
         } else {
             fs::copy(&src_path, &dst_path)?;
         }
     }
-    
+
     Ok(())
 }
 
@@ -3989,24 +4405,29 @@ fn replace_in_files(dir: &Path, from: &str, to: &str) -> Result<()> {
     for entry in walkdir::WalkDir::new(dir) {
         let entry = entry?;
         let path = entry.path();
-        
+
         if path.is_file() {
             // Skip binary files
             if let Some(ext) = path.extension() {
                 let ext = ext.to_string_lossy();
-                if ["png", "jpg", "jpeg", "gif", "ico", "woff", "woff2", "ttf", "lock"].contains(&ext.as_ref()) {
+                if [
+                    "png", "jpg", "jpeg", "gif", "ico", "woff", "woff2", "ttf", "lock",
+                ]
+                .contains(&ext.as_ref())
+                {
                     continue;
                 }
             }
-            
+
             if let Ok(content) = fs::read_to_string(path)
-                && content.contains(from) {
-                    let new_content = content.replace(from, to);
-                    fs::write(path, new_content)?;
-                }
+                && content.contains(from)
+            {
+                let new_content = content.replace(from, to);
+                fs::write(path, new_content)?;
+            }
         }
     }
-    
+
     Ok(())
 }
 
@@ -4019,12 +4440,12 @@ fn rename_template_dirs(project_dir: &Path, template: &str, project_name: &str) 
             let new_name = project_name.replace('-', "_");
             let new_dir = project_dir.join(&new_name);
             fs::rename(&old_dir, &new_dir)?;
-            
+
             // Also update imports in files
             replace_in_files(project_dir, "python_cli", &new_name)?;
         }
     }
-    
+
     // Rust workspace: rename crate directories
     if template == "rust-workspace" {
         let crates_dir = project_dir.join("crates");
@@ -4046,7 +4467,7 @@ fn rename_template_dirs(project_dir: &Path, template: &str, project_name: &str) 
             replace_in_files(project_dir, "rust-tui", &format!("{}-tui", project_name))?;
         }
     }
-    
+
     Ok(())
 }
 
@@ -4072,41 +4493,48 @@ fn handle_schema(ctx: &RuntimeContext, command: SchemaCommand) -> Result<()> {
 
 fn find_schemas(ctx: &RuntimeContext) -> Result<Vec<SchemaInfo>> {
     use glob::glob;
-    
+
     let workspace = ctx.workspace_root();
     let schema_cfg = &ctx.config.schemas;
-    
+
     // Get schemas repo path
     let schemas_repo = if PathBuf::from(&schema_cfg.repo_path).is_absolute() {
         PathBuf::from(&schema_cfg.repo_path)
     } else {
         workspace.join(&schema_cfg.repo_path)
     };
-    
+
     // Load catalog to get repo list
     let catalog_path = ctx.catalog_path();
     if !catalog_path.exists() {
-        return Err(anyhow!("Catalog not found at {}. Run 'byt catalog refresh' first.", catalog_path.display()));
+        return Err(anyhow!(
+            "Catalog not found at {}. Run 'byt catalog refresh' first.",
+            catalog_path.display()
+        ));
     }
-    
+
     let content = fs::read_to_string(&catalog_path)?;
     let catalog: Catalog = serde_json::from_str(&content)?;
-    
+
     let mut schemas = Vec::new();
-    
+
     for (repo_name, repo_info) in &catalog.repos {
         let repo_path = workspace.join(&repo_info.path);
-        
+
         // Check each pattern for schema files
         for pattern in &schema_cfg.patterns {
             let full_pattern = repo_path.join(pattern);
             if let Some(pattern_str) = full_pattern.to_str() {
-                for source_path in glob(pattern_str).unwrap_or_else(|_| glob("").unwrap()).flatten() {
+                for source_path in glob(pattern_str)
+                    .unwrap_or_else(|_| glob("").unwrap())
+                    .flatten()
+                {
                     // Determine destination path in schemas repo
-                    let file_name = source_path.file_name()
+                    let file_name = source_path
+                        .file_name()
                         .and_then(|n| n.to_str())
                         .unwrap_or("schema.json");
-                    
+
                     // Use repo name as directory, preserve original filename
                     // Only rename config.schema.json -> {repo}.config.schema.json for clarity
                     let dest_name = if file_name == "config.schema.json" {
@@ -4115,9 +4543,9 @@ fn find_schemas(ctx: &RuntimeContext) -> Result<Vec<SchemaInfo>> {
                         // Keep original filename for all other schemas
                         file_name.to_string()
                     };
-                    
+
                     let dest_path = schemas_repo.join(repo_name).join(&dest_name);
-                    
+
                     // Check if needs update
                     let needs_update = if dest_path.exists() {
                         // Compare file contents
@@ -4127,7 +4555,7 @@ fn find_schemas(ctx: &RuntimeContext) -> Result<Vec<SchemaInfo>> {
                     } else {
                         true
                     };
-                    
+
                     schemas.push(SchemaInfo {
                         repo: repo_name.clone(),
                         source_path,
@@ -4138,55 +4566,61 @@ fn find_schemas(ctx: &RuntimeContext) -> Result<Vec<SchemaInfo>> {
             }
         }
     }
-    
+
     Ok(schemas)
 }
 
 fn schema_check(ctx: &RuntimeContext) -> Result<()> {
     let schemas = find_schemas(ctx)?;
-    
+
     let needs_update: Vec<_> = schemas.iter().filter(|s| s.needs_update).collect();
-    
+
     if needs_update.is_empty() {
         println!("All schemas are up to date.");
         return Ok(());
     }
-    
+
     println!("Schemas needing update:\n");
     for schema in &needs_update {
-        let status = if schema.dest_path.exists() { "modified" } else { "new" };
-        println!("  [{}] {} -> {}", 
+        let status = if schema.dest_path.exists() {
+            "modified"
+        } else {
+            "new"
+        };
+        println!(
+            "  [{}] {} -> {}",
             status,
             schema.source_path.display(),
             schema.dest_path.display()
         );
     }
-    
+
     println!("\nRun 'byt schema sync' to update, or 'byt schema sync --push' to update and push.");
-    
+
     Ok(())
 }
 
 fn schema_sync(ctx: &RuntimeContext, push: bool, filter_repos: Vec<String>) -> Result<()> {
     use std::process::Command;
-    
+
     let schemas = find_schemas(ctx)?;
     let schema_cfg = &ctx.config.schemas;
-    
+
     // Filter schemas
     let schemas: Vec<_> = if filter_repos.is_empty() {
         schemas.into_iter().filter(|s| s.needs_update).collect()
     } else {
-        schemas.into_iter()
+        schemas
+            .into_iter()
             .filter(|s| s.needs_update && filter_repos.contains(&s.repo))
             .collect()
     };
-    
+
     if schemas.is_empty() {
         println!("No schemas to sync.");
         return Ok(());
     }
-    
+
     // Get schemas repo path
     let workspace = ctx.workspace_root();
     let schemas_repo = if PathBuf::from(&schema_cfg.repo_path).is_absolute() {
@@ -4194,53 +4628,65 @@ fn schema_sync(ctx: &RuntimeContext, push: bool, filter_repos: Vec<String>) -> R
     } else {
         workspace.join(&schema_cfg.repo_path)
     };
-    
+
     if !schemas_repo.exists() {
         return Err(anyhow!(
             "Schemas repo not found at {}. Clone it first or update schemas.repo_path in config.",
             schemas_repo.display()
         ));
     }
-    
+
     // Copy each schema
     for schema in &schemas {
         // Create destination directory
         if let Some(parent) = schema.dest_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        
+
         // Copy file
         fs::copy(&schema.source_path, &schema.dest_path)?;
-        
-        let status = if schema.dest_path.exists() { "updated" } else { "added" };
-        println!("[{}] {} -> {}", status, schema.repo, schema.dest_path.display());
+
+        let status = if schema.dest_path.exists() {
+            "updated"
+        } else {
+            "added"
+        };
+        println!(
+            "[{}] {} -> {}",
+            status,
+            schema.repo,
+            schema.dest_path.display()
+        );
     }
-    
+
     if push {
         println!("\nCommitting and pushing changes...");
-        
+
         // Git add
         let output = Command::new("git")
             .args(["add", "."])
             .current_dir(&schemas_repo)
             .output()
             .context("running git add")?;
-        
+
         if !output.status.success() {
-            return Err(anyhow!("git add failed: {}", String::from_utf8_lossy(&output.stderr)));
+            return Err(anyhow!(
+                "git add failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
         }
-        
+
         // Check if there are changes to commit
         let output = Command::new("git")
             .args(["diff", "--cached", "--quiet"])
             .current_dir(&schemas_repo)
             .output()?;
-        
+
         if output.status.success() {
             println!("No changes to commit.");
             return Ok(());
         }
-        
+
         // Generate commit message
         let repos: std::collections::HashSet<_> = schemas.iter().map(|s| s.repo.as_str()).collect();
         let commit_msg = if repos.len() == 1 {
@@ -4249,61 +4695,834 @@ fn schema_sync(ctx: &RuntimeContext, push: bool, filter_repos: Vec<String>) -> R
             let repo_list: Vec<_> = repos.into_iter().collect();
             format!("feat: update schemas for {}", repo_list.join(", "))
         };
-        
+
         // Git commit
         let output = Command::new("git")
             .args(["commit", "-m", &commit_msg])
             .current_dir(&schemas_repo)
             .output()
             .context("running git commit")?;
-        
+
         if !output.status.success() {
-            return Err(anyhow!("git commit failed: {}", String::from_utf8_lossy(&output.stderr)));
+            return Err(anyhow!(
+                "git commit failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
         }
-        
+
         // Git push
         let output = Command::new("git")
             .args(["push"])
             .current_dir(&schemas_repo)
             .output()
             .context("running git push")?;
-        
+
         if !output.status.success() {
-            return Err(anyhow!("git push failed: {}", String::from_utf8_lossy(&output.stderr)));
+            return Err(anyhow!(
+                "git push failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
         }
-        
+
         println!("Changes committed and pushed.");
     } else {
         println!("\nSchemas copied. Run 'byt schema sync --push' to commit and push.");
     }
-    
+
     Ok(())
 }
 
 fn schema_list(ctx: &RuntimeContext) -> Result<()> {
     let schemas = find_schemas(ctx)?;
-    
+
     if schemas.is_empty() {
         println!("No schemas found matching configured patterns.");
         println!("Patterns: {:?}", ctx.config.schemas.patterns);
         return Ok(());
     }
-    
+
     println!("Schemas in workspace:\n");
     for schema in &schemas {
         let status = if schema.needs_update {
-            if schema.dest_path.exists() { "needs update" } else { "new" }
+            if schema.dest_path.exists() {
+                "needs update"
+            } else {
+                "new"
+            }
         } else {
             "synced"
         };
-        
+
         println!("  {} [{}]", schema.repo, status);
         println!("    source: {}", schema.source_path.display());
         println!("    dest:   {}", schema.dest_path.display());
         println!();
     }
-    
+
     Ok(())
+}
+
+// ============================================================================
+// Website Sync
+// ============================================================================
+
+fn handle_website(ctx: &RuntimeContext, command: WebsiteCommand) -> Result<()> {
+    match command {
+        WebsiteCommand::Sync { commit, repos } => website_sync(ctx, commit, repos),
+        WebsiteCommand::List => website_list(ctx),
+        WebsiteCommand::Check => website_check(ctx),
+    }
+}
+
+/// Metadata from a tool.toml file
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ToolToml {
+    name: String,
+    title: String,
+    tagline: String,
+    #[serde(default)]
+    tagline_de: Option<String>,
+    description: String,
+    #[serde(default)]
+    description_de: Option<String>,
+    language: String,
+    category: String,
+    version: String,
+    license: String,
+    #[serde(default)]
+    install: ToolInstall,
+    #[serde(default)]
+    links: ToolLinks,
+    #[serde(default)]
+    features: Vec<ToolFeature>,
+    #[serde(default)]
+    examples: Vec<ToolExample>,
+    #[serde(default)]
+    media: ToolMedia,
+    #[serde(default)]
+    meta: ToolMeta,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ToolInstall {
+    #[serde(default)]
+    homebrew: Option<String>,
+    #[serde(default)]
+    aur: Option<String>,
+    #[serde(default)]
+    aur_cuda: Option<String>,
+    #[serde(default)]
+    cargo: Option<String>,
+    #[serde(default)]
+    go: Option<String>,
+    #[serde(default)]
+    npm: Option<String>,
+    #[serde(default)]
+    pip: Option<String>,
+    #[serde(default)]
+    binary: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ToolLinks {
+    #[serde(default)]
+    github: Option<String>,
+    #[serde(default)]
+    docs: Option<String>,
+    #[serde(default)]
+    changelog: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ToolFeature {
+    title: String,
+    #[serde(default)]
+    title_de: Option<String>,
+    description: String,
+    #[serde(default)]
+    description_de: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ToolExample {
+    title: String,
+    language: String,
+    code: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ToolMedia {
+    #[serde(default)]
+    icon: Option<String>,
+    #[serde(default)]
+    screenshot: Option<String>,
+    #[serde(default)]
+    video: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ToolMeta {
+    #[serde(default)]
+    keywords: Vec<String>,
+    #[serde(default)]
+    platforms: Vec<String>,
+    #[serde(default)]
+    related: Vec<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    listed: Option<bool>,
+}
+
+/// Found tool.toml with metadata
+#[derive(Debug)]
+struct FoundTool {
+    repo_name: String,
+    repo_path: PathBuf,
+    tool_toml_path: PathBuf,
+    tool: ToolToml,
+}
+
+fn find_tools(ctx: &RuntimeContext) -> Result<Vec<FoundTool>> {
+    let workspace = ctx.workspace_root();
+    let mut tools = Vec::new();
+
+    // Scan workspace for repos with tool.toml
+    for entry in fs::read_dir(&workspace)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        if !path.is_dir() {
+            continue;
+        }
+
+        // Skip ignored directories
+        let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if ctx.config.ignore_dirs.contains(&dir_name.to_string()) {
+            continue;
+        }
+
+        let tool_toml_path = path.join("tool.toml");
+        if tool_toml_path.exists() {
+            let content = fs::read_to_string(&tool_toml_path)
+                .with_context(|| format!("reading {}", tool_toml_path.display()))?;
+
+            let tool: ToolToml = toml::from_str(&content)
+                .with_context(|| format!("parsing {}", tool_toml_path.display()))?;
+
+            // Only include if listed != false
+            if tool.meta.listed.unwrap_or(true) {
+                tools.push(FoundTool {
+                    repo_name: dir_name.to_string(),
+                    repo_path: path.clone(),
+                    tool_toml_path,
+                    tool,
+                });
+            }
+        }
+    }
+
+    // Sort by name
+    tools.sort_by(|a, b| a.tool.name.cmp(&b.tool.name));
+
+    Ok(tools)
+}
+
+fn website_list(ctx: &RuntimeContext) -> Result<()> {
+    let tools = find_tools(ctx)?;
+
+    if tools.is_empty() {
+        println!("No tool.toml files found in workspace.");
+        return Ok(());
+    }
+
+    println!("Tools with tool.toml:\n");
+    for t in &tools {
+        let status = t.tool.meta.status.as_deref().unwrap_or("stable");
+        println!("  {} [{}] - {}", t.tool.name, status, t.tool.tagline);
+        println!("    repo: {}", t.repo_name);
+        println!("    version: {}", t.tool.version);
+        println!();
+    }
+
+    Ok(())
+}
+
+fn website_check(ctx: &RuntimeContext) -> Result<()> {
+    let tools = find_tools(ctx)?;
+    let website_cfg = &ctx.config.website;
+
+    let workspace = ctx.workspace_root();
+    let website_repo = if PathBuf::from(&website_cfg.repo_path).is_absolute() {
+        PathBuf::from(&website_cfg.repo_path)
+    } else {
+        workspace.join(&website_cfg.repo_path)
+    };
+
+    if !website_repo.exists() {
+        return Err(anyhow!(
+            "Website repo not found at {}. Clone it first or update website.repo_path in config.",
+            website_repo.display()
+        ));
+    }
+
+    let toolz_dir = website_repo.join(&website_cfg.toolz_dir);
+
+    println!("Checking tool pages:\n");
+    let mut needs_update = 0;
+
+    for t in &tools {
+        let page_path = toolz_dir.join(format!("{}.js", t.tool.name));
+        let status = if page_path.exists() {
+            "exists"
+        } else {
+            needs_update += 1;
+            "missing"
+        };
+        println!("  {} [{}]", t.tool.name, status);
+    }
+
+    if needs_update > 0 {
+        println!("\n{} tool(s) need website pages. Run 'byt website sync' to generate.", needs_update);
+    } else {
+        println!("\nAll tools have website pages.");
+    }
+
+    Ok(())
+}
+
+fn website_sync(ctx: &RuntimeContext, commit: bool, filter_repos: Vec<String>) -> Result<()> {
+    use std::process::Command;
+
+    let tools = find_tools(ctx)?;
+    let website_cfg = &ctx.config.website;
+
+    // Filter tools
+    let tools: Vec<_> = if filter_repos.is_empty() {
+        tools
+    } else {
+        tools.into_iter()
+            .filter(|t| filter_repos.contains(&t.repo_name) || filter_repos.contains(&t.tool.name))
+            .collect()
+    };
+
+    if tools.is_empty() {
+        println!("No tools to sync.");
+        return Ok(());
+    }
+
+    let workspace = ctx.workspace_root();
+    let website_repo = if PathBuf::from(&website_cfg.repo_path).is_absolute() {
+        PathBuf::from(&website_cfg.repo_path)
+    } else {
+        workspace.join(&website_cfg.repo_path)
+    };
+
+    if !website_repo.exists() {
+        return Err(anyhow!(
+            "Website repo not found at {}. Clone it first or update website.repo_path in config.",
+            website_repo.display()
+        ));
+    }
+
+    let toolz_dir = website_repo.join(&website_cfg.toolz_dir);
+    let public_dir = website_repo.join(&website_cfg.public_dir);
+
+    // Create directories if needed
+    fs::create_dir_all(&toolz_dir)?;
+    fs::create_dir_all(&public_dir)?;
+
+    // Generate tool pages
+    for t in &tools {
+        // Generate the page content
+        let page_content = generate_tool_page(&t.tool)?;
+        let page_path = toolz_dir.join(format!("{}.js", t.tool.name));
+
+        // Check if content changed
+        let needs_write = if page_path.exists() {
+            let existing = fs::read_to_string(&page_path)?;
+            existing != page_content
+        } else {
+            true
+        };
+
+        if needs_write {
+            fs::write(&page_path, &page_content)?;
+            println!("[updated] {}", t.tool.name);
+        } else {
+            println!("[unchanged] {}", t.tool.name);
+        }
+
+        // Copy media files if they exist
+        if let Some(ref screenshot) = t.tool.media.screenshot {
+            // Only copy if it's a local path (not a URL)
+            if !screenshot.starts_with("http") {
+                let src = t.repo_path.join(screenshot);
+                if src.exists() {
+                    let filename = src.file_name().unwrap_or_default();
+                    let dest = public_dir.join(&t.tool.name).join(filename);
+                    fs::create_dir_all(dest.parent().unwrap())?;
+                    fs::copy(&src, &dest)?;
+                    println!("  copied screenshot: {}", filename.to_string_lossy());
+                }
+            }
+        }
+
+        if let Some(ref icon) = t.tool.media.icon {
+            if !icon.starts_with("http") {
+                let src = t.repo_path.join(icon);
+                if src.exists() {
+                    let filename = src.file_name().unwrap_or_default();
+                    let dest = public_dir.join(&t.tool.name).join(filename);
+                    fs::create_dir_all(dest.parent().unwrap())?;
+                    fs::copy(&src, &dest)?;
+                    println!("  copied icon: {}", filename.to_string_lossy());
+                }
+            }
+        }
+    }
+
+    // Update the index page
+    let index_content = generate_toolz_index(&tools)?;
+    let index_path = toolz_dir.join("index.js");
+    fs::write(&index_path, &index_content)?;
+    println!("[updated] toolz/index.js");
+
+    if commit {
+        println!("\nCommitting changes...");
+
+        // Git add
+        let output = Command::new("git")
+            .args(["add", "."])
+            .current_dir(&website_repo)
+            .output()
+            .context("running git add")?;
+
+        if !output.status.success() {
+            return Err(anyhow!(
+                "git add failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+
+        // Check if there are changes to commit
+        let output = Command::new("git")
+            .args(["diff", "--cached", "--quiet"])
+            .current_dir(&website_repo)
+            .output()?;
+
+        if output.status.success() {
+            println!("No changes to commit.");
+            return Ok(());
+        }
+
+        // Generate commit message
+        let tool_names: Vec<_> = tools.iter().map(|t| t.tool.name.as_str()).collect();
+        let commit_msg = if tool_names.len() == 1 {
+            format!("Update {} tool page", tool_names[0])
+        } else {
+            format!("Update tool pages: {}", tool_names.join(", "))
+        };
+
+        // Git commit
+        let output = Command::new("git")
+            .args(["commit", "-m", &commit_msg])
+            .current_dir(&website_repo)
+            .output()
+            .context("running git commit")?;
+
+        if !output.status.success() {
+            return Err(anyhow!(
+                "git commit failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+
+        println!("Changes committed.");
+    } else {
+        println!("\nPages synced. Run 'byt website sync --commit' to commit changes.");
+    }
+
+    Ok(())
+}
+
+fn generate_tool_page(tool: &ToolToml) -> Result<String> {
+    // Generate JavaScript/React page from tool data
+    let features_json = serde_json::to_string_pretty(&tool.features)?;
+    let examples_json = serde_json::to_string_pretty(&tool.examples)?;
+    let platforms_json = serde_json::to_string_pretty(&tool.meta.platforms)?;
+
+    let screenshot_url = tool.media.screenshot.as_ref()
+        .map(|s| {
+            if s.starts_with("http") {
+                s.clone()
+            } else {
+                format!("/toolz/{}/{}", tool.name, s.split('/').last().unwrap_or(s))
+            }
+        });
+
+    let screenshot_line = screenshot_url
+        .map(|u| format!("    screenshot: \"{}\",", u))
+        .unwrap_or_default();
+
+    let install_lines = {
+        let mut lines = Vec::new();
+        if let Some(ref v) = tool.install.homebrew {
+            lines.push(format!("    homebrew: \"{}\",", v));
+        }
+        if let Some(ref v) = tool.install.aur {
+            lines.push(format!("    aur: \"{}\",", v));
+        }
+        if let Some(ref v) = tool.install.aur_cuda {
+            lines.push(format!("    aur_cuda: \"{}\",", v));
+        }
+        if let Some(ref v) = tool.install.cargo {
+            lines.push(format!("    cargo: \"{}\",", v));
+        }
+        if let Some(ref v) = tool.install.go {
+            lines.push(format!("    go: \"{}\",", v));
+        }
+        if let Some(ref v) = tool.install.npm {
+            lines.push(format!("    npm: \"{}\",", v));
+        }
+        if let Some(ref v) = tool.install.pip {
+            lines.push(format!("    pip: \"{}\",", v));
+        }
+        lines.join("\n")
+    };
+
+    let github_line = tool.links.github.as_ref()
+        .map(|g| format!("    github: \"{}\",", g))
+        .unwrap_or_default();
+
+    let status = tool.meta.status.as_deref().unwrap_or("stable");
+
+    let description_escaped = tool.description.replace('`', "\\`").replace("${", "\\${");
+
+    let page = format!(r#"import Link from "next/link";
+import Navbar from "../../components/Navbar";
+import Footer from "../../components/Footer";
+
+// Auto-generated from {name}/tool.toml by `byt website sync`
+const tool = {{
+  name: "{name}",
+  title: "{title}",
+  tagline: "{tagline}",
+  description: `{description}`,
+  language: "{language}",
+  category: "{category}",
+  version: "{version}",
+  license: "{license}",
+  install: {{
+{install}
+  }},
+  links: {{
+{github}
+  }},
+  features: {features},
+  examples: {examples},
+  media: {{
+{screenshot}
+  }},
+  meta: {{
+    keywords: {keywords:?},
+    platforms: {platforms},
+    status: "{status}",
+  }},
+}};
+
+function InstallBlock({{ install }}) {{
+  const methods = [];
+  
+  if (install.homebrew) {{
+    methods.push({{ label: "Homebrew", cmd: `brew install ${{install.homebrew}}` }});
+  }}
+  if (install.aur) {{
+    methods.push({{ label: "AUR", cmd: `yay -S ${{install.aur}}` }});
+  }}
+  if (install.cargo) {{
+    methods.push({{ label: "Cargo", cmd: `cargo install ${{install.cargo}}` }});
+  }}
+
+  return (
+    <div className="space-y-3">
+      {{methods.map((m, i) => (
+        <div key={{i}}>
+          <span className="text-xs text-gray-500 mb-1 block">{{m.label}}</span>
+          <code className="block bg-gray-800 px-4 py-2 rounded text-sm text-teal-400 font-mono">
+            {{m.cmd}}
+          </code>
+        </div>
+      ))}}
+    </div>
+  );
+}}
+
+function FeatureCard({{ feature }}) {{
+  return (
+    <div className="bg-gray-800/30 border border-gray-700/50 rounded-lg p-4">
+      <h4 className="text-white font-medium mb-1">{{feature.title}}</h4>
+      <p className="text-gray-400 text-sm">{{feature.description}}</p>
+    </div>
+  );
+}}
+
+function CodeExample({{ example }}) {{
+  return (
+    <div className="bg-gray-800/50 rounded-lg overflow-hidden">
+      <div className="bg-gray-700/50 px-4 py-2 border-b border-gray-700">
+        <span className="text-sm text-gray-300">{{example.title}}</span>
+      </div>
+      <pre className="p-4 text-sm overflow-x-auto">
+        <code className="text-gray-300 font-mono whitespace-pre">{{example.code}}</code>
+      </pre>
+    </div>
+  );
+}}
+
+export default function ToolPage() {{
+  return (
+    <div className="min-h-screen flex flex-col bg-gray-100 dark:bg-gray-900">
+      <Navbar />
+
+      <main className="flex-grow pt-24 px-4 pb-12">
+        <div className="container mx-auto max-w-4xl">
+          {{/* Breadcrumb */}}
+          <div className="mb-6">
+            <Link href="/toolz" className="text-gray-500 hover:text-gray-300 text-sm">
+              _toolz
+            </Link>
+            <span className="text-gray-600 mx-2">/</span>
+            <span className="text-gray-300 text-sm">_{{tool.name}}</span>
+          </div>
+
+          {{/* Header */}}
+          <div className="mb-8">
+            <div className="flex items-center gap-4 mb-4">
+              <h1 className="font-geo text-4xl text-white">_{{tool.name}}</h1>
+              <span className="text-xs bg-green-500/20 text-green-400 px-2 py-0.5 rounded">
+                {{tool.meta.status}}
+              </span>
+              <span className="text-xs bg-gray-700/50 text-gray-400 px-2 py-0.5 rounded">
+                v{{tool.version}}
+              </span>
+            </div>
+            <p className="text-xl text-gray-300 mb-4">{{tool.tagline}}</p>
+            <div className="flex items-center gap-4">
+              {{tool.links.github && (
+                <a
+                  href={{tool.links.github}}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-teal-500 hover:text-teal-400 text-sm flex items-center gap-2"
+                >
+                  <svg className="w-4 h-4 fill-current" viewBox="0 0 24 24">
+                    <path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/>
+                  </svg>
+                  GitHub
+                </a>
+              )}}
+              <span className="text-gray-600">|</span>
+              <span className="text-gray-500 text-sm">{{tool.license}}</span>
+              <span className="text-gray-600">|</span>
+              <span className="text-gray-500 text-sm">{{tool.language}}</span>
+            </div>
+          </div>
+
+          {{/* Screenshot */}}
+          {{tool.media?.screenshot && (
+            <div className="mb-8">
+              <img
+                src={{tool.media.screenshot}}
+                alt={{`${{tool.name}} screenshot`}}
+                className="rounded-lg border border-gray-700 w-full"
+              />
+            </div>
+          )}}
+
+          {{/* Description */}}
+          <div className="mb-12">
+            <p className="text-gray-300 whitespace-pre-line leading-relaxed">
+              {{tool.description}}
+            </p>
+          </div>
+
+          {{/* Install */}}
+          <section className="mb-12">
+            <h2 className="font-geo text-2xl text-white mb-4">_install</h2>
+            <InstallBlock install={{tool.install}} />
+          </section>
+
+          {{/* Features */}}
+          <section className="mb-12">
+            <h2 className="font-geo text-2xl text-white mb-4">_features</h2>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              {{tool.features.map((f, i) => (
+                <FeatureCard key={{i}} feature={{f}} />
+              ))}}
+            </div>
+          </section>
+
+          {{/* Examples */}}
+          <section className="mb-12">
+            <h2 className="font-geo text-2xl text-white mb-4">_usage</h2>
+            <div className="space-y-6">
+              {{tool.examples.map((ex, i) => (
+                <CodeExample key={{i}} example={{ex}} />
+              ))}}
+            </div>
+          </section>
+
+          {{/* Platforms */}}
+          <section className="mb-12">
+            <h2 className="font-geo text-2xl text-white mb-4">_platforms</h2>
+            <div className="flex gap-3">
+              {{tool.meta.platforms.map((p, i) => (
+                <span key={{i}} className="bg-gray-800/50 px-4 py-2 rounded text-gray-300 text-sm">
+                  {{p}}
+                </span>
+              ))}}
+            </div>
+          </section>
+
+          {{/* Back to toolz */}}
+          <div className="pt-8 border-t border-gray-800">
+            <Link href="/toolz" className="text-teal-500 hover:text-teal-400 text-sm">
+              ← Back to _toolz
+            </Link>
+          </div>
+        </div>
+      </main>
+
+      <Footer />
+    </div>
+  );
+}}
+"#,
+        name = tool.name,
+        title = tool.title,
+        tagline = tool.tagline,
+        description = description_escaped,
+        language = tool.language,
+        category = tool.category,
+        version = tool.version,
+        license = tool.license,
+        install = install_lines,
+        github = github_line,
+        features = features_json,
+        examples = examples_json,
+        screenshot = screenshot_line,
+        keywords = tool.meta.keywords,
+        platforms = platforms_json,
+        status = status,
+    );
+
+    Ok(page)
+}
+
+fn generate_toolz_index(tools: &[FoundTool]) -> Result<String> {
+    let tools_json: Vec<_> = tools.iter().map(|t| {
+        serde_json::json!({
+            "name": t.tool.name,
+            "title": t.tool.title,
+            "tagline": t.tool.tagline,
+            "category": t.tool.category,
+            "language": t.tool.language,
+            "status": t.tool.meta.status.as_deref().unwrap_or("stable"),
+        })
+    }).collect();
+
+    let tools_str = serde_json::to_string_pretty(&tools_json)?;
+
+    let page = format!(r#"import Link from "next/link";
+import Navbar from "../../components/Navbar";
+import Footer from "../../components/Footer";
+
+// Auto-generated by `byt website sync`
+const tools = {tools};
+
+function StatusBadge({{ status }}) {{
+  const colors = {{
+    stable: "bg-green-500/20 text-green-400",
+    beta: "bg-yellow-500/20 text-yellow-400",
+    alpha: "bg-orange-500/20 text-orange-400",
+    experimental: "bg-purple-500/20 text-purple-400",
+  }};
+
+  return (
+    <span className={{`text-xs px-2 py-0.5 rounded ${{colors[status] || colors.stable}}`}}>
+      {{status}}
+    </span>
+  );
+}}
+
+function ToolCard({{ tool }}) {{
+  return (
+    <Link href={{`/toolz/${{tool.name}}`}}>
+      <div className="bg-gray-800/50 border border-gray-700 rounded-lg p-6 hover:border-gray-500 hover:bg-gray-800/70 transition-all cursor-pointer group">
+        <div className="flex items-start justify-between mb-3">
+          <h3 className="font-geo text-xl text-white group-hover:text-teal-400 transition-colors">
+            _{{tool.name}}
+          </h3>
+          <StatusBadge status={{tool.status}} />
+        </div>
+        <p className="text-gray-400 text-sm mb-4">{{tool.tagline}}</p>
+        <div className="flex items-center gap-2 text-xs text-gray-500">
+          <span className="bg-gray-700/50 px-2 py-0.5 rounded">{{tool.language}}</span>
+        </div>
+      </div>
+    </Link>
+  );
+}}
+
+export default function ToolzIndex() {{
+  return (
+    <div className="min-h-screen flex flex-col bg-gray-100 dark:bg-gray-900">
+      <Navbar />
+
+      <main className="flex-grow pt-24 px-4 pb-12">
+        <div className="container mx-auto max-w-5xl">
+          {{/* Header */}}
+          <div className="mb-12 text-center">
+            <h1 className="font-geo text-4xl text-white mb-4">_toolz</h1>
+            <p className="text-gray-400 max-w-2xl mx-auto">
+              Open source tools built by byteowlz. Local-first, cross-platform, CLI-first.
+              No cloud dependencies, no subscriptions - your data stays yours.
+            </p>
+          </div>
+
+          {{/* Tool Grid */}}
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+            {{tools.map((tool) => (
+              <ToolCard key={{tool.name}} tool={{tool}} />
+            ))}}
+          </div>
+
+          {{/* Coming Soon */}}
+          <div className="mt-16 text-center">
+            <p className="text-gray-500 text-sm">
+              More tools coming soon. Check our{{" "}}
+              <a
+                href="https://github.com/byteowlz"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-teal-500 hover:underline"
+              >
+                GitHub
+              </a>{{" "}}
+              for the latest.
+            </p>
+          </div>
+        </div>
+      </main>
+
+      <Footer />
+    </div>
+  );
+}}
+"#, tools = tools_str);
+
+    Ok(page)
 }
 
 // ============================================================================
@@ -4340,7 +5559,7 @@ const TOOLS: &[ToolInfo] = &[
         binary: "bd",
         repo: "steveyegge/beads",
         install_method: InstallMethod::CurlScript(
-            "https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh"
+            "https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh",
         ),
     },
     ToolInfo {
@@ -4357,7 +5576,7 @@ const TOOLS: &[ToolInfo] = &[
         binary: "bv",
         repo: "Dicklesworthstone/beads_viewer",
         install_method: InstallMethod::CurlScript(
-            "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/main/install.sh"
+            "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/main/install.sh",
         ),
     },
     ToolInfo {
@@ -4366,7 +5585,7 @@ const TOOLS: &[ToolInfo] = &[
         binary: "cass",
         repo: "Dicklesworthstone/coding_agent_session_search",
         install_method: InstallMethod::CurlScript(
-            "https://raw.githubusercontent.com/Dicklesworthstone/coding_agent_session_search/main/install.sh"
+            "https://raw.githubusercontent.com/Dicklesworthstone/coding_agent_session_search/main/install.sh",
         ),
     },
     ToolInfo {
@@ -4397,12 +5616,12 @@ fn tools_list(ctx: &RuntimeContext) -> Result<()> {
         path: Option<String>,
         version: Option<String>,
     }
-    
+
     let mut statuses = Vec::new();
-    
+
     for tool in TOOLS {
         let (installed, path, version) = check_tool_installed(tool);
-        
+
         statuses.push(ToolStatus {
             name: tool.name.to_string(),
             description: tool.description.to_string(),
@@ -4411,98 +5630,99 @@ fn tools_list(ctx: &RuntimeContext) -> Result<()> {
             version,
         });
     }
-    
+
     if ctx.common.json {
         println!("{}", serde_json::to_string_pretty(&statuses)?);
     } else {
         println!("External Agent Tools");
         println!("====================\n");
-        
+
         for status in &statuses {
             let icon = if status.installed { "[+]" } else { "[ ]" };
             let version_str = status.version.as_deref().unwrap_or("");
             let path_str = status.path.as_deref().unwrap_or("not found");
-            
+
             println!("{} {} - {}", icon, status.name, status.description);
             if status.installed {
                 println!("    Path: {} {}", path_str, version_str);
             }
             println!();
         }
-        
+
         println!("Commands:");
         println!("  byt tools install <tool>   Install a tool");
         println!("  byt tools install all      Install all tools");
         println!("  byt tools update <tool>    Update a tool");
         println!("  byt tools doctor           Check tool health");
     }
-    
+
     Ok(())
 }
 
 fn check_tool_installed(tool: &ToolInfo) -> (bool, Option<String>, Option<String>) {
     use std::process::Command;
-    
+
     // Special handling for Python packages
     if matches!(tool.install_method, InstallMethod::Python(_)) {
         // Check if module is importable
         let output = Command::new("python3")
             .args(["-c", &format!("import {}", tool.name)])
             .output();
-        
+
         if let Ok(out) = output
-            && out.status.success() {
-                // Try to get version
-                let version_output = Command::new("python3")
-                    .args(["-c", &format!("import {}; print(getattr({}, '__version__', 'unknown'))", tool.name, tool.name)])
-                    .output();
-                
-                let version = version_output.ok()
-                    .filter(|o| o.status.success())
-                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
-                
-                return (true, Some("python module".to_string()), version);
-            }
-        
+            && out.status.success()
+        {
+            // Try to get version
+            let version_output = Command::new("python3")
+                .args([
+                    "-c",
+                    &format!(
+                        "import {}; print(getattr({}, '__version__', 'unknown'))",
+                        tool.name, tool.name
+                    ),
+                ])
+                .output();
+
+            let version = version_output
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+
+            return (true, Some("python module".to_string()), version);
+        }
+
         // Also check if installed via uv tool
-        let output = Command::new("uv")
-            .args(["tool", "list"])
-            .output();
-        
+        let output = Command::new("uv").args(["tool", "list"]).output();
+
         if let Ok(out) = output {
             let stdout = String::from_utf8_lossy(&out.stdout);
             if stdout.contains(tool.name) {
                 return (true, Some("uv tool".to_string()), None);
             }
         }
-        
+
         return (false, None, None);
     }
-    
+
     // Check for binary
-    let output = Command::new("which")
-        .arg(tool.binary)
-        .output();
-    
+    let output = Command::new("which").arg(tool.binary).output();
+
     if let Ok(out) = output
-        && out.status.success() {
-            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            
-            // Try to get version
-            let version_output = Command::new(tool.binary)
-                .arg("--version")
-                .output();
-            
-            let version = version_output.ok()
-                .filter(|o| o.status.success())
-                .map(|o| {
-                    let stdout = String::from_utf8_lossy(&o.stdout);
-                    stdout.lines().next().unwrap_or("").trim().to_string()
-                });
-            
-            return (true, Some(path), version);
-        }
-    
+        && out.status.success()
+    {
+        let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+        // Try to get version
+        let version_output = Command::new(tool.binary).arg("--version").output();
+
+        let version = version_output.ok().filter(|o| o.status.success()).map(|o| {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            stdout.lines().next().unwrap_or("").trim().to_string()
+        });
+
+        return (true, Some(path), version);
+    }
+
     (false, None, None)
 }
 
@@ -4515,44 +5735,48 @@ fn tools_install(ctx: &RuntimeContext, tool_name: &str, force: bool) -> Result<(
         }
         return Ok(());
     }
-    
-    let tool = TOOLS.iter()
-        .find(|t| t.name == tool_name)
-        .ok_or_else(|| anyhow!(
+
+    let tool = TOOLS.iter().find(|t| t.name == tool_name).ok_or_else(|| {
+        anyhow!(
             "Unknown tool '{}'. Available: {}",
             tool_name,
             TOOLS.iter().map(|t| t.name).collect::<Vec<_>>().join(", ")
-        ))?;
-    
+        )
+    })?;
+
     install_single_tool(ctx, tool, force)
 }
 
 fn install_single_tool(ctx: &RuntimeContext, tool: &ToolInfo, force: bool) -> Result<()> {
     use std::process::Command;
-    
+
     // Check if already installed
     let (installed, path, _) = check_tool_installed(tool);
     if installed && !force {
-        println!("{} is already installed at {}", tool.name, path.unwrap_or_default());
+        println!(
+            "{} is already installed at {}",
+            tool.name,
+            path.unwrap_or_default()
+        );
         println!("Use --force to reinstall");
         return Ok(());
     }
-    
+
     if ctx.common.dry_run {
         println!("Would install {} from {}", tool.name, tool.repo);
         return Ok(());
     }
-    
+
     match &tool.install_method {
         InstallMethod::CurlScript(url) => {
             println!("Installing {} via install script...", tool.name);
-            
+
             // Tool-specific arguments
             let script_args = match tool.name {
                 "cass" => "--easy-mode",
                 _ => "",
             };
-            
+
             let status = if script_args.is_empty() {
                 Command::new("bash")
                     .args(["-c", &format!("curl -fsSL '{}' | bash", url)])
@@ -4560,11 +5784,14 @@ fn install_single_tool(ctx: &RuntimeContext, tool: &ToolInfo, force: bool) -> Re
                     .context("running install script")?
             } else {
                 Command::new("bash")
-                    .args(["-c", &format!("curl -fsSL '{}' | bash -s -- {}", url, script_args)])
+                    .args([
+                        "-c",
+                        &format!("curl -fsSL '{}' | bash -s -- {}", url, script_args),
+                    ])
                     .status()
                     .context("running install script")?
             };
-            
+
             if !status.success() {
                 return Err(anyhow!("Install script failed"));
             }
@@ -4575,12 +5802,12 @@ fn install_single_tool(ctx: &RuntimeContext, tool: &ToolInfo, force: bool) -> Re
             let args: Vec<&str> = crate_args.split_whitespace().collect();
             let mut cmd_args = vec!["install"];
             cmd_args.extend(args);
-            
+
             let status = Command::new("cargo")
                 .args(&cmd_args)
                 .status()
                 .context("running cargo install")?;
-            
+
             if !status.success() {
                 return Err(anyhow!("cargo install failed"));
             }
@@ -4591,19 +5818,17 @@ fn install_single_tool(ctx: &RuntimeContext, tool: &ToolInfo, force: bool) -> Re
                 .args(["install", pkg])
                 .status()
                 .context("running go install")?;
-            
+
             if !status.success() {
                 return Err(anyhow!("go install failed"));
             }
         }
         InstallMethod::Python(pkg) => {
             println!("Installing {} via uv...", tool.name);
-            
+
             // First try uv pip install
-            let status = Command::new("uv")
-                .args(["pip", "install", pkg])
-                .status();
-            
+            let status = Command::new("uv").args(["pip", "install", pkg]).status();
+
             if status.is_ok() && status.unwrap().success() {
                 println!("{} installed successfully", tool.name);
             } else {
@@ -4613,14 +5838,14 @@ fn install_single_tool(ctx: &RuntimeContext, tool: &ToolInfo, force: bool) -> Re
                     .args(["install", pkg])
                     .status()
                     .context("running pip install")?;
-                
+
                 if !status.success() {
                     return Err(anyhow!("pip install failed"));
                 }
             }
         }
     }
-    
+
     println!("{} installed successfully", tool.name);
     Ok(())
 }
@@ -4635,77 +5860,67 @@ fn tools_update(ctx: &RuntimeContext, tool_name: &str) -> Result<()> {
         }
         return Ok(());
     }
-    
-    let tool = TOOLS.iter()
-        .find(|t| t.name == tool_name)
-        .ok_or_else(|| anyhow!(
+
+    let tool = TOOLS.iter().find(|t| t.name == tool_name).ok_or_else(|| {
+        anyhow!(
             "Unknown tool '{}'. Available: {}",
             tool_name,
             TOOLS.iter().map(|t| t.name).collect::<Vec<_>>().join(", ")
-        ))?;
-    
+        )
+    })?;
+
     install_single_tool(ctx, tool, true)
 }
 
 fn tools_doctor(_ctx: &RuntimeContext) -> Result<()> {
     use std::process::Command as ShellCommand;
-    
+
     println!("Tool Health Check");
     println!("=================\n");
-    
+
     let mut all_healthy = true;
-    
+
     for tool in TOOLS {
         let (installed, _path, version) = check_tool_installed(tool);
-        
+
         print!("{}: ", tool.name);
-        
+
         if !installed {
             println!("NOT INSTALLED");
             all_healthy = false;
             continue;
         }
-        
+
         // Tool-specific health checks
         let health_ok = match tool.name {
             "beads" => {
                 // Check if bd can run help
-                let output = ShellCommand::new("bd")
-                    .arg("help")
-                    .output();
+                let output = ShellCommand::new("bd").arg("help").output();
                 output.is_ok() && output.unwrap().status.success()
             }
             "mmry" => {
                 // Check if mmry can run help
-                let output = ShellCommand::new("mmry")
-                    .arg("--help")
-                    .output();
+                let output = ShellCommand::new("mmry").arg("--help").output();
                 output.is_ok() && output.unwrap().status.success()
             }
             "bv" => {
                 // Check if bv can access beads
-                let output = ShellCommand::new("bv")
-                    .arg("-help")
-                    .output();
+                let output = ShellCommand::new("bv").arg("-help").output();
                 output.is_ok() && output.unwrap().status.success()
             }
             "cass" => {
                 // Check if cass db exists
-                let output = ShellCommand::new("cass")
-                    .args(["--help"])
-                    .output();
+                let output = ShellCommand::new("cass").args(["--help"]).output();
                 output.is_ok() && output.unwrap().status.success()
             }
             "mailz" => {
                 // Check if mailz-mcp runs
-                let output = ShellCommand::new("mailz-mcp")
-                    .args(["--help"])
-                    .output();
+                let output = ShellCommand::new("mailz-mcp").args(["--help"]).output();
                 output.is_ok() && output.unwrap().status.success()
             }
             _ => true,
         };
-        
+
         if health_ok {
             let ver = version.as_deref().unwrap_or("");
             println!("OK {}", ver);
@@ -4714,13 +5929,13 @@ fn tools_doctor(_ctx: &RuntimeContext) -> Result<()> {
             all_healthy = false;
         }
     }
-    
+
     println!();
-    
+
     // Check for MCP configuration
     println!("MCP Configuration:");
     let opencode_config_path = get_opencode_config_path();
-    
+
     if opencode_config_path.exists() {
         if let Ok(content) = fs::read_to_string(&opencode_config_path) {
             if content.contains("mailz") {
@@ -4731,29 +5946,32 @@ fn tools_doctor(_ctx: &RuntimeContext) -> Result<()> {
             }
         }
     } else {
-        println!("  opencode config not found at {}", opencode_config_path.display());
+        println!(
+            "  opencode config not found at {}",
+            opencode_config_path.display()
+        );
     }
-    
+
     println!();
-    
+
     if all_healthy {
         println!("All tools are healthy!");
     } else {
         println!("Some tools need attention. Run 'byt tools install <tool>' to fix.");
     }
-    
+
     Ok(())
 }
 
 fn tools_config(ctx: &RuntimeContext, tool_name: &str, show: bool) -> Result<()> {
-    let tool = TOOLS.iter()
-        .find(|t| t.name == tool_name)
-        .ok_or_else(|| anyhow!(
+    let tool = TOOLS.iter().find(|t| t.name == tool_name).ok_or_else(|| {
+        anyhow!(
             "Unknown tool '{}'. Available: {}",
             tool_name,
             TOOLS.iter().map(|t| t.name).collect::<Vec<_>>().join(", ")
-        ))?;
-    
+        )
+    })?;
+
     match tool.name {
         "mailz" => config_mailz(ctx, show),
         "cass" => {
@@ -4879,7 +6097,7 @@ fn get_opencode_config_path() -> PathBuf {
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
         .unwrap_or_else(|| PathBuf::from(".config"));
-    
+
     config_dir.join("opencode").join("opencode.json")
 }
 
@@ -4959,9 +6177,10 @@ fn discover_workspace_root() -> Result<PathBuf> {
         if agents_md.exists() && beads.exists() {
             // Check if AGENTS.md mentions Govnr
             if let Ok(content) = fs::read_to_string(&agents_md)
-                && (content.contains("Govnr") || content.contains("govnr")) {
-                    return Ok(dir.to_path_buf());
-                }
+                && (content.contains("Govnr") || content.contains("govnr"))
+            {
+                return Ok(dir.to_path_buf());
+            }
         }
 
         if catalog.exists() {
@@ -5093,10 +6312,7 @@ mod tests {
 
     #[test]
     fn test_extract_repo_name_shorthand() {
-        assert_eq!(
-            extract_repo_name("user/myrepo"),
-            Some("myrepo".to_string())
-        );
+        assert_eq!(extract_repo_name("user/myrepo"), Some("myrepo".to_string()));
     }
 
     #[test]
@@ -5129,24 +6345,30 @@ mod tests {
         let temp = std::env::temp_dir().join("byt-test-copy");
         let src = temp.join("src");
         let dst = temp.join("dst");
-        
+
         // Clean up from previous runs
         let _ = fs::remove_dir_all(&temp);
-        
+
         // Create source structure
         fs::create_dir_all(src.join("subdir")).unwrap();
         fs::write(src.join("file1.txt"), "content1").unwrap();
         fs::write(src.join("subdir/file2.txt"), "content2").unwrap();
-        
+
         // Copy
         copy_dir_recursive(&src, &dst).unwrap();
-        
+
         // Verify
         assert!(dst.join("file1.txt").exists());
         assert!(dst.join("subdir/file2.txt").exists());
-        assert_eq!(fs::read_to_string(dst.join("file1.txt")).unwrap(), "content1");
-        assert_eq!(fs::read_to_string(dst.join("subdir/file2.txt")).unwrap(), "content2");
-        
+        assert_eq!(
+            fs::read_to_string(dst.join("file1.txt")).unwrap(),
+            "content1"
+        );
+        assert_eq!(
+            fs::read_to_string(dst.join("subdir/file2.txt")).unwrap(),
+            "content2"
+        );
+
         // Cleanup
         let _ = fs::remove_dir_all(&temp);
     }
@@ -5156,24 +6378,24 @@ mod tests {
         let temp = std::env::temp_dir().join("byt-test-filter");
         let src = temp.join("src");
         let dst = temp.join("dst");
-        
+
         // Clean up from previous runs
         let _ = fs::remove_dir_all(&temp);
-        
+
         // Create source structure
         fs::create_dir_all(src.join(".git")).unwrap();
         fs::write(src.join("keep.txt"), "keep").unwrap();
         fs::write(src.join(".git/config"), "git config").unwrap();
         fs::write(src.join("skip.lock"), "lock file").unwrap();
-        
+
         // Copy with exclusions
         copy_dir_filtered(&src, &dst, &[".git".to_string(), "*.lock".to_string()]).unwrap();
-        
+
         // Verify
         assert!(dst.join("keep.txt").exists());
         assert!(!dst.join(".git").exists());
         assert!(!dst.join("skip.lock").exists());
-        
+
         // Cleanup
         let _ = fs::remove_dir_all(&temp);
     }
@@ -5185,20 +6407,23 @@ mod tests {
     #[test]
     fn test_replace_in_files() {
         let temp = std::env::temp_dir().join("byt-test-replace");
-        
+
         // Clean up from previous runs
         let _ = fs::remove_dir_all(&temp);
         fs::create_dir_all(&temp).unwrap();
-        
+
         // Create test file
         fs::write(temp.join("test.txt"), "Hello {{project_name}}!").unwrap();
-        
+
         // Replace
         replace_in_files(&temp, "{{project_name}}", "myproject").unwrap();
-        
+
         // Verify
-        assert_eq!(fs::read_to_string(temp.join("test.txt")).unwrap(), "Hello myproject!");
-        
+        assert_eq!(
+            fs::read_to_string(temp.join("test.txt")).unwrap(),
+            "Hello myproject!"
+        );
+
         // Cleanup
         let _ = fs::remove_dir_all(&temp);
     }
@@ -5206,22 +6431,30 @@ mod tests {
     #[test]
     fn test_replace_in_files_skips_binary() {
         let temp = std::env::temp_dir().join("byt-test-binary");
-        
+
         // Clean up from previous runs
         let _ = fs::remove_dir_all(&temp);
         fs::create_dir_all(&temp).unwrap();
-        
+
         // Create a "binary" file (by extension)
         fs::write(temp.join("image.png"), "fake png {{project_name}}").unwrap();
         fs::write(temp.join("Cargo.lock"), "lock {{project_name}}").unwrap();
-        
+
         // Replace should skip these files
         replace_in_files(&temp, "{{project_name}}", "myproject").unwrap();
-        
+
         // Verify they are unchanged
-        assert!(fs::read_to_string(temp.join("image.png")).unwrap().contains("{{project_name}}"));
-        assert!(fs::read_to_string(temp.join("Cargo.lock")).unwrap().contains("{{project_name}}"));
-        
+        assert!(
+            fs::read_to_string(temp.join("image.png"))
+                .unwrap()
+                .contains("{{project_name}}")
+        );
+        assert!(
+            fs::read_to_string(temp.join("Cargo.lock"))
+                .unwrap()
+                .contains("{{project_name}}")
+        );
+
         // Cleanup
         let _ = fs::remove_dir_all(&temp);
     }
@@ -5233,10 +6466,10 @@ mod tests {
     #[test]
     fn test_new_command_default_template() {
         use clap::Parser;
-        
+
         let args = vec!["byt", "new", "myproject"];
         let cli = Cli::try_parse_from(args).unwrap();
-        
+
         if let Command::New(cmd) = cli.command {
             assert_eq!(cmd.name, "myproject");
             assert_eq!(cmd.template, "rust-cli");
@@ -5251,10 +6484,10 @@ mod tests {
     #[test]
     fn test_new_command_from_git() {
         use clap::Parser;
-        
+
         let args = vec!["byt", "new", "myproject", "--from-git", "user/repo"];
         let cli = Cli::try_parse_from(args).unwrap();
-        
+
         if let Command::New(cmd) = cli.command {
             assert_eq!(cmd.name, "myproject");
             assert_eq!(cmd.from_git, Some("user/repo".to_string()));
@@ -5266,10 +6499,18 @@ mod tests {
     #[test]
     fn test_new_command_from_git_with_subdir() {
         use clap::Parser;
-        
-        let args = vec!["byt", "new", "myproject", "--from-git", "user/repo", "--subdir", "templates/rust"];
+
+        let args = vec![
+            "byt",
+            "new",
+            "myproject",
+            "--from-git",
+            "user/repo",
+            "--subdir",
+            "templates/rust",
+        ];
         let cli = Cli::try_parse_from(args).unwrap();
-        
+
         if let Command::New(cmd) = cli.command {
             assert_eq!(cmd.from_git, Some("user/repo".to_string()));
             assert_eq!(cmd.subdir, Some("templates/rust".to_string()));
@@ -5281,10 +6522,18 @@ mod tests {
     #[test]
     fn test_new_command_from_git_with_ref() {
         use clap::Parser;
-        
-        let args = vec!["byt", "new", "myproject", "--from-git", "user/repo", "--git-ref", "v1.0.0"];
+
+        let args = vec![
+            "byt",
+            "new",
+            "myproject",
+            "--from-git",
+            "user/repo",
+            "--git-ref",
+            "v1.0.0",
+        ];
         let cli = Cli::try_parse_from(args).unwrap();
-        
+
         if let Command::New(cmd) = cli.command {
             assert_eq!(cmd.from_git, Some("user/repo".to_string()));
             assert_eq!(cmd.git_ref, Some("v1.0.0".to_string()));
@@ -5296,10 +6545,17 @@ mod tests {
     #[test]
     fn test_new_command_no_replace() {
         use clap::Parser;
-        
-        let args = vec!["byt", "new", "myproject", "--from-git", "user/repo", "--no-replace"];
+
+        let args = vec![
+            "byt",
+            "new",
+            "myproject",
+            "--from-git",
+            "user/repo",
+            "--no-replace",
+        ];
         let cli = Cli::try_parse_from(args).unwrap();
-        
+
         if let Command::New(cmd) = cli.command {
             assert!(cmd.no_replace);
         } else {
@@ -5310,7 +6566,7 @@ mod tests {
     #[test]
     fn test_new_command_subdir_requires_from_git() {
         use clap::Parser;
-        
+
         // --subdir without --from-git should fail
         let args = vec!["byt", "new", "myproject", "--subdir", "templates/rust"];
         let result = Cli::try_parse_from(args);
@@ -5320,7 +6576,7 @@ mod tests {
     #[test]
     fn test_new_command_git_ref_requires_from_git() {
         use clap::Parser;
-        
+
         // --git-ref without --from-git should fail
         let args = vec!["byt", "new", "myproject", "--git-ref", "v1.0.0"];
         let result = Cli::try_parse_from(args);
@@ -5330,10 +6586,121 @@ mod tests {
     #[test]
     fn test_new_command_from_git_conflicts_with_template() {
         use clap::Parser;
-        
+
         // --from-git with -t should fail (they conflict)
-        let args = vec!["byt", "new", "myproject", "--from-git", "user/repo", "-t", "python-cli"];
+        let args = vec![
+            "byt",
+            "new",
+            "myproject",
+            "--from-git",
+            "user/repo",
+            "-t",
+            "python-cli",
+        ];
         let result = Cli::try_parse_from(args);
         assert!(result.is_err());
+    }
+
+    // -------------------------------------------------------------------------
+    // Mail/reservation command tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_mail_inbox_command() {
+        use clap::Parser;
+
+        let args = vec!["byt", "mail", "inbox"];
+        let cli = Cli::try_parse_from(args).unwrap();
+
+        if let Command::Mail { command } = cli.command {
+            assert!(matches!(command, MailCommand::Inbox));
+        } else {
+            panic!("Expected Mail inbox command");
+        }
+    }
+
+    #[test]
+    fn test_mail_send_command() {
+        use clap::Parser;
+
+        let args = vec![
+            "byt", "mail", "send", "alice", "Hello", "--body", "Hi there",
+        ];
+        let cli = Cli::try_parse_from(args).unwrap();
+
+        if let Command::Mail { command } = cli.command {
+            if let MailCommand::Send { to, subject, body } = command {
+                assert_eq!(to, "alice");
+                assert_eq!(subject, "Hello");
+                assert_eq!(body, "Hi there");
+            } else {
+                panic!("Expected Mail send command");
+            }
+        } else {
+            panic!("Expected Mail command");
+        }
+    }
+
+    #[test]
+    fn test_reserve_command() {
+        use clap::Parser;
+
+        let args = vec![
+            "byt",
+            "reserve",
+            "src/main.rs",
+            "--ttl",
+            "30m",
+            "--reason",
+            "editing",
+        ];
+        let cli = Cli::try_parse_from(args).unwrap();
+
+        if let Command::Reserve(cmd) = cli.command {
+            assert_eq!(cmd.file, "src/main.rs");
+            assert_eq!(cmd.ttl, "30m");
+            assert_eq!(cmd.reason, "editing");
+        } else {
+            panic!("Expected Reserve command");
+        }
+    }
+
+    #[test]
+    fn test_reservations_command() {
+        use clap::Parser;
+
+        let args = vec!["byt", "reservations"];
+        let cli = Cli::try_parse_from(args).unwrap();
+
+        if !matches!(cli.command, Command::Reservations) {
+            panic!("Expected Reservations command");
+        }
+    }
+
+    #[test]
+    fn test_release_command() {
+        use clap::Parser;
+
+        let args = vec!["byt", "release", "src/main.rs"];
+        let cli = Cli::try_parse_from(args).unwrap();
+
+        if let Command::Release(cmd) = cli.command {
+            assert_eq!(cmd.file, "src/main.rs");
+        } else {
+            panic!("Expected Release command");
+        }
+    }
+
+    #[test]
+    fn test_parse_duration_to_seconds() {
+        assert_eq!(parse_duration_to_seconds("30m").unwrap(), 1800);
+        assert_eq!(parse_duration_to_seconds("1h").unwrap(), 3600);
+        assert_eq!(parse_duration_to_seconds("15s").unwrap(), 15);
+    }
+
+    #[test]
+    fn test_parse_duration_requires_unit() {
+        let err = parse_duration_to_seconds("10").unwrap_err();
+        assert!(err.to_string().contains("unit suffix"));
     }
 }
