@@ -89,32 +89,6 @@ base_url = "https://raw.githubusercontent.com/byteowlz/schemas/refs/heads/main"
 # Set to "govnr/.sync/memories" to keep sync files in the govnr repo (recommended)
 sync_dir = "govnr/.sync/memories"
 
-# External agent tools settings
-# These tools enhance agent coordination and history search
-[tools]
-# Auto-install missing tools on first use (e.g., when running byt triage without bv)
-auto_install = false
-
-# mailz - Agent coordination MCP server (messaging, file reservations)
-# Source: https://github.com/byteowlz/mailz
-[tools.mailz]
-# Database path (defaults to $XDG_DATA_HOME/mailz/mailz.db)
-# db_path = "~/.local/share/mailz/mailz.db"
-
-# cass - Coding Agent Session Search
-# Source: https://github.com/Dicklesworthstone/coding_agent_session_search
-# Wraps via: byt search "query"
-[tools.cass]
-# Data directory for cass index (uses default if not set)
-# data_dir = "~/.local/share/coding-agent-search"
-
-# bv - Beads Viewer with graph analytics
-# Source: https://github.com/Dicklesworthstone/beads_viewer
-# Wraps via: byt triage
-[tools.bv]
-# Default flags to pass to bv (empty by default)
-# default_flags = ["-robot-triage"]
-
 # Cross-machine sync settings
 # Configure remote machines for repository comparison
 [machines]
