@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
-use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use config::{Config, Environment, File, FileFormat};
 use env_logger::fmt::WriteStyle;
@@ -35,9 +35,6 @@ fn try_main() -> Result<()> {
         Command::Lint(cmd) => handle_lint(&ctx, cmd),
         Command::Status(cmd) => handle_status(&ctx, cmd),
         Command::Ready => handle_ready(&ctx),
-        Command::Triage(cmd) => handle_triage(&ctx, cmd),
-        Command::Search(cmd) => handle_search(&ctx, cmd),
-        Command::Mail { command } => handle_mail(&ctx, command),
         Command::Memory { command } => handle_memory(&ctx, command),
         Command::Sync { command } => handle_sync(&ctx, command),
         Command::Repos { command } => handle_repos(&ctx, command),
@@ -47,10 +44,6 @@ fn try_main() -> Result<()> {
         Command::New(cmd) => handle_new(&ctx, cmd),
         Command::Schema { command } => handle_schema(&ctx, command),
         Command::Website { command } => handle_website(&ctx, command),
-        Command::Tools { command } => handle_tools(&ctx, command),
-        Command::Reserve(cmd) => handle_reserve(&ctx, cmd),
-        Command::Reservations => handle_reservations(&ctx),
-        Command::Release(cmd) => handle_release(&ctx, cmd),
         Command::Completions { shell } => handle_completions(shell),
     }
 }
@@ -94,13 +87,6 @@ struct CommonOpts {
     dry_run: bool,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum ColorOption {
-    Auto,
-    Always,
-    Never,
-}
-
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Manage the project catalog
@@ -114,15 +100,6 @@ enum Command {
     Status(StatusCommand),
     /// Show ready work from govnr-level beads
     Ready,
-    /// Cross-repo triage and issue management (via bv workspace)
-    Triage(TriageCommand),
-    /// Search agent conversation history (via cass)
-    Search(SearchCommand),
-    /// Agent-to-agent messaging (via mailz)
-    Mail {
-        #[command(subcommand)]
-        command: MailCommand,
-    },
     /// Manage memories (via mmry)
     Memory {
         #[command(subcommand)]
@@ -162,17 +139,6 @@ enum Command {
         #[command(subcommand)]
         command: WebsiteCommand,
     },
-    /// Manage external agent tools (bv, cass, mailz)
-    Tools {
-        #[command(subcommand)]
-        command: ToolsCommand,
-    },
-    /// Reserve a file for exclusive work (via mailz)
-    Reserve(ReserveCommand),
-    /// List active file reservations (via mailz)
-    Reservations,
-    /// Release a file reservation (via mailz)
-    Release(ReleaseCommand),
     /// Generate shell completions
     Completions {
         #[arg(value_enum)]
@@ -234,63 +200,6 @@ struct StatusCommand {
     issues_only: bool,
 }
 
-#[derive(Debug, Clone, Args)]
-struct TriageCommand {
-    /// Regenerate workspace.yaml before running
-    #[arg(long)]
-    refresh: bool,
-    /// Show only next recommended item
-    #[arg(long)]
-    next: bool,
-    /// Show execution plan
-    #[arg(long)]
-    plan: bool,
-    /// Show insights
-    #[arg(long)]
-    insights: bool,
-}
-
-#[derive(Debug, Clone, Args)]
-struct SearchCommand {
-    /// Search query
-    query: String,
-    /// Filter by workspace/repo name
-    #[arg(long, short = 'r')]
-    repo: Option<String>,
-    /// Limit results
-    #[arg(long, short = 'l', default_value = "10")]
-    limit: usize,
-    /// Filter to last N days
-    #[arg(long)]
-    days: Option<u32>,
-}
-
-#[derive(Debug, Subcommand)]
-enum MailCommand {
-    /// List inbox messages
-    Inbox,
-    /// Send a message
-    Send {
-        /// Recipient
-        to: String,
-        /// Subject
-        subject: String,
-        /// Message body
-        #[arg(long)]
-        body: String,
-    },
-    /// Read a message
-    Read {
-        /// Message ID
-        id: String,
-    },
-    /// Acknowledge a message
-    Ack {
-        /// Message ID
-        id: String,
-    },
-}
-
 #[derive(Debug, Subcommand)]
 enum MemoryCommand {
     /// Add a memory
@@ -350,24 +259,6 @@ enum SyncCommand {
     },
     /// Show sync status (what would be synced)
     Status,
-}
-
-#[derive(Debug, Clone, Args)]
-struct ReserveCommand {
-    /// File path to reserve
-    file: String,
-    /// Reservation TTL (e.g. 1h, 30m)
-    #[arg(long, value_name = "DURATION")]
-    ttl: String,
-    /// Reservation reason
-    #[arg(long)]
-    reason: String,
-}
-
-#[derive(Debug, Clone, Args)]
-struct ReleaseCommand {
-    /// File path to release
-    file: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -509,35 +400,6 @@ enum WebsiteCommand {
     List,
     /// Check for tools that need website updates
     Check,
-}
-
-#[derive(Debug, Subcommand)]
-enum ToolsCommand {
-    /// List available and installed tools
-    List,
-    /// Install a tool
-    Install {
-        /// Tool name (bv, cass, mailz, or 'all')
-        tool: String,
-        /// Force reinstall even if already installed
-        #[arg(long)]
-        force: bool,
-    },
-    /// Update a tool to the latest version
-    Update {
-        /// Tool name (bv, cass, mailz, or 'all')
-        tool: String,
-    },
-    /// Check tool health and configuration
-    Doctor,
-    /// Configure a tool (e.g., set up MCP server)
-    Config {
-        /// Tool name
-        tool: String,
-        /// Show current configuration
-        #[arg(long)]
-        show: bool,
-    },
 }
 
 // ============================================================================
@@ -759,49 +621,9 @@ struct AppConfig {
     website: WebsiteConfig,
     /// Memory sync settings
     sync: SyncConfig,
-    /// External tools settings
-    tools: ToolsConfig,
     /// All machines in the ecosystem (byt auto-detects which is local via hostname)
     #[serde(default)]
     machines: MachinesConfig,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-#[derive(Default)]
-struct ToolsConfig {
-    /// Auto-install tools on first use
-    auto_install: bool,
-    /// mailz (agent coordination) configuration
-    mailz: MailzConfig,
-    /// cass (coding agent session search) configuration
-    cass: CassConfig,
-    /// bv (beads viewer) configuration
-    bv: BvConfig,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-#[derive(Default)]
-struct MailzConfig {
-    /// Database path (defaults to $XDG_DATA_HOME/mailz/mailz.db)
-    db_path: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-#[derive(Default)]
-struct CassConfig {
-    /// Data directory for cass
-    data_dir: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-#[derive(Default)]
-struct BvConfig {
-    /// Default flags to pass to bv
-    default_flags: Vec<String>,
 }
 
 /// Machine configuration - a flat list of all machines in the ecosystem.
@@ -1034,7 +856,6 @@ impl Default for AppConfig {
             schemas: SchemaConfig::default(),
             website: WebsiteConfig::default(),
             sync: SyncConfig::default(),
-            tools: ToolsConfig::default(),
             machines: Vec::new(),
         }
     }
@@ -1934,204 +1755,6 @@ fn handle_ready(ctx: &RuntimeContext) -> Result<()> {
     Ok(())
 }
 
-fn handle_triage(ctx: &RuntimeContext, cmd: TriageCommand) -> Result<()> {
-    use std::process::Command;
-
-    let workspace_config = ctx.workspace_root().join(".bv/workspace.yaml");
-
-    // Regenerate workspace.yaml if requested or if it doesn't exist
-    if cmd.refresh || !workspace_config.exists() {
-        generate_workspace_config(ctx)?;
-    }
-
-    // Determine which bv command to run
-    let bv_flag = if cmd.next {
-        "-robot-next"
-    } else if cmd.plan {
-        "-robot-plan"
-    } else if cmd.insights {
-        "-robot-insights"
-    } else {
-        "-robot-triage"
-    };
-
-    let output = Command::new("bv")
-        .args([
-            "-workspace",
-            &workspace_config.display().to_string(),
-            bv_flag,
-        ])
-        .current_dir(ctx.workspace_root())
-        .output()
-        .context("running bv - is bv installed?")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("bv failed: {}", stderr));
-    }
-
-    let content = String::from_utf8_lossy(&output.stdout);
-
-    if ctx.common.json {
-        println!("{}", content);
-    } else {
-        // Parse and display human-friendly output
-        if let Ok(triage) = serde_json::from_str::<serde_json::Value>(&content) {
-            display_triage(&triage, cmd.next);
-        } else {
-            println!("{}", content);
-        }
-    }
-
-    Ok(())
-}
-
-fn generate_workspace_config(ctx: &RuntimeContext) -> Result<()> {
-    let repos = scan_repositories(ctx, false)?;
-    let bv_dir = ctx.workspace_root().join(".bv");
-
-    fs::create_dir_all(&bv_dir)?;
-
-    let mut yaml = String::new();
-    yaml.push_str("# Byteowlz workspace configuration for bv\n");
-    yaml.push_str("# Auto-generated by byt - do not edit manually\n");
-    yaml.push_str("# Regenerate with: byt triage --refresh\n\n");
-    yaml.push_str("repos:\n");
-
-    for (name, info) in &repos {
-        if info.has_beads {
-            yaml.push_str(&format!("  - path: ./{}\n", name));
-            yaml.push_str(&format!("    name: {}\n", name));
-        }
-    }
-
-    let config_path = bv_dir.join("workspace.yaml");
-    fs::write(&config_path, yaml)?;
-    info!("Generated workspace config: {}", config_path.display());
-
-    Ok(())
-}
-
-fn display_triage(triage: &serde_json::Value, next_only: bool) {
-    if next_only {
-        // Display single next item
-        if let Some(id) = triage.get("id").and_then(|v| v.as_str()) {
-            let title = triage.get("title").and_then(|v| v.as_str()).unwrap_or("?");
-            let score = triage.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            println!("Next recommended: {} (score: {:.2})", id, score);
-            println!("  {}", title);
-            if let Some(reasons) = triage.get("reasons").and_then(|v| v.as_array()) {
-                for reason in reasons {
-                    if let Some(r) = reason.as_str() {
-                        println!("  {}", r);
-                    }
-                }
-            }
-        }
-        return;
-    }
-
-    // Full triage display
-    if let Some(triage_data) = triage.get("triage")
-        && let Some(quick_ref) = triage_data.get("quick_ref")
-    {
-        let open = quick_ref
-            .get("open_count")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-        let actionable = quick_ref
-            .get("actionable_count")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-        let blocked = quick_ref
-            .get("blocked_count")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-        let in_progress = quick_ref
-            .get("in_progress_count")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-
-        println!("Cross-Repo Triage");
-        println!("=================");
-        println!(
-            "Open: {}  Actionable: {}  Blocked: {}  In Progress: {}",
-            open, actionable, blocked, in_progress
-        );
-        println!();
-
-        if let Some(top_picks) = quick_ref.get("top_picks").and_then(|v| v.as_array()) {
-            println!("Top Picks:");
-            for pick in top_picks.iter().take(5) {
-                let id = pick.get("id").and_then(|v| v.as_str()).unwrap_or("?");
-                let title = pick.get("title").and_then(|v| v.as_str()).unwrap_or("?");
-                let score = pick.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let unblocks = pick.get("unblocks").and_then(|v| v.as_i64()).unwrap_or(0);
-                println!("  [{:.2}] {} (unblocks {})", score, id, unblocks);
-                println!("        {}", title);
-            }
-        }
-    }
-}
-
-fn handle_search(ctx: &RuntimeContext, cmd: SearchCommand) -> Result<()> {
-    use std::process::Command;
-
-    let mut args = vec!["search".to_string(), cmd.query.clone()];
-
-    // Add workspace filter if repo specified
-    if let Some(ref repo) = cmd.repo {
-        // Try to find the workspace path for this repo
-        let workspace_path = ctx.workspace_root().join(repo);
-        if workspace_path.exists() {
-            args.push("--workspace".to_string());
-            args.push(workspace_path.display().to_string());
-        }
-    }
-
-    args.push("--limit".to_string());
-    args.push(cmd.limit.to_string());
-
-    if let Some(days) = cmd.days {
-        args.push("--days".to_string());
-        args.push(days.to_string());
-    }
-
-    if ctx.common.json {
-        args.push("--json".to_string());
-    }
-
-    let output = Command::new("cass")
-        .args(&args)
-        .output()
-        .context("running cass search - is cass installed?")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("cass search failed: {}", stderr));
-    }
-
-    let content = String::from_utf8_lossy(&output.stdout);
-    println!("{}", content);
-
-    Ok(())
-}
-
-fn handle_mail(_ctx: &RuntimeContext, command: MailCommand) -> Result<()> {
-    match command {
-        MailCommand::Inbox => run_mailz_command(vec!["inbox".to_string()]),
-        MailCommand::Send { to, subject, body } => run_mailz_command(vec![
-            "send".to_string(),
-            to,
-            subject,
-            "--body".to_string(),
-            body,
-        ]),
-        MailCommand::Read { id } => run_mailz_command(vec!["read".to_string(), id]),
-        MailCommand::Ack { id } => run_mailz_command(vec!["ack".to_string(), id]),
-    }
-}
-
 fn handle_memory(ctx: &RuntimeContext, command: MemoryCommand) -> Result<()> {
     use std::process::Command;
 
@@ -2252,93 +1875,6 @@ fn handle_memory(ctx: &RuntimeContext, command: MemoryCommand) -> Result<()> {
     }
 
     Ok(())
-}
-
-fn handle_reserve(_ctx: &RuntimeContext, cmd: ReserveCommand) -> Result<()> {
-    let ttl_seconds = parse_duration_to_seconds(&cmd.ttl)?;
-    run_mailz_command(vec![
-        "reserve".to_string(),
-        cmd.file,
-        "--ttl".to_string(),
-        ttl_seconds.to_string(),
-        "--reason".to_string(),
-        cmd.reason,
-    ])
-}
-
-fn handle_reservations(_ctx: &RuntimeContext) -> Result<()> {
-    run_mailz_command(vec!["reservations".to_string()])
-}
-
-fn handle_release(_ctx: &RuntimeContext, cmd: ReleaseCommand) -> Result<()> {
-    run_mailz_command(vec!["release".to_string(), cmd.file])
-}
-
-fn run_mailz_command(args: Vec<String>) -> Result<()> {
-    use std::process::Command;
-
-    let output = Command::new("mailz-cli")
-        .args(&args)
-        .output()
-        .context("running mailz-cli - is mailz-cli installed?")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("mailz-cli failed: {}", stderr.trim()));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if !stdout.is_empty() {
-        println!("{}", stdout);
-    }
-
-    Ok(())
-}
-
-fn parse_duration_to_seconds(raw: &str) -> Result<u64> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(anyhow!("ttl duration is empty"));
-    }
-
-    let last = trimmed
-        .chars()
-        .last()
-        .ok_or_else(|| anyhow!("ttl duration is empty"))?;
-
-    if last.is_ascii_digit() {
-        return Err(anyhow!(
-            "ttl duration must include a unit suffix (s/m/h/d), got '{}'",
-            trimmed
-        ));
-    }
-
-    let (value_str, unit) = trimmed.split_at(trimmed.len() - 1);
-    if value_str.is_empty() {
-        return Err(anyhow!(
-            "ttl duration must include a numeric value before the unit"
-        ));
-    }
-
-    let value: u64 = value_str.parse().context("parsing ttl duration value")?;
-    let unit = unit.to_ascii_lowercase();
-
-    let multiplier = match unit.as_str() {
-        "s" => 1u64,
-        "m" => 60u64,
-        "h" => 60u64 * 60u64,
-        "d" => 60u64 * 60u64 * 24u64,
-        _ => {
-            return Err(anyhow!(
-                "unsupported ttl unit '{}'; use s, m, h, or d",
-                unit
-            ));
-        }
-    };
-
-    value
-        .checked_mul(multiplier)
-        .ok_or_else(|| anyhow!("ttl duration is too large"))
 }
 
 /// Detect the current project based on working directory
@@ -4879,7 +4415,6 @@ struct ToolMeta {
 struct FoundTool {
     repo_name: String,
     repo_path: PathBuf,
-    tool_toml_path: PathBuf,
     tool: ToolToml,
 }
 
@@ -4915,7 +4450,6 @@ fn find_tools(ctx: &RuntimeContext) -> Result<Vec<FoundTool>> {
                 tools.push(FoundTool {
                     repo_name: dir_name.to_string(),
                     repo_path: path.clone(),
-                    tool_toml_path,
                     tool,
                 });
             }
@@ -5087,6 +4621,34 @@ fn website_sync(ctx: &RuntimeContext, commit: bool, filter_repos: Vec<String>) -
     let index_path = toolz_dir.join("index.js");
     fs::write(&index_path, &index_content)?;
     println!("[updated] toolz/index.js");
+
+    // Generate markdown versions of tool pages for LLM consumption
+    let toolz_md_dir = website_repo.join("public").join("toolz");
+    fs::create_dir_all(&toolz_md_dir)?;
+    for t in &tools {
+        let md_content = generate_tool_markdown(&t.tool);
+        let md_path = toolz_md_dir.join(format!("{}.md", t.tool.name));
+        fs::write(&md_path, &md_content)?;
+        println!("[updated] public/toolz/{}.md", t.tool.name);
+    }
+
+    // Generate toolz index markdown
+    let toolz_index_md = generate_toolz_index_markdown(&tools);
+    let toolz_index_path = toolz_md_dir.join("index.md");
+    fs::write(&toolz_index_path, &toolz_index_md)?;
+    println!("[updated] public/toolz/index.md");
+
+    // Generate about page markdown
+    let about_md = generate_about_markdown();
+    let about_path = website_repo.join("public").join("about.md");
+    fs::write(&about_path, &about_md)?;
+    println!("[updated] public/about.md");
+
+    // Generate llms.txt (after all md files are created)
+    let llms_txt = generate_llms_txt(&tools, "https://byteowlz.com");
+    let llms_path = website_repo.join("public").join("llms.txt");
+    fs::write(&llms_path, &llms_txt)?;
+    println!("[updated] public/llms.txt");
 
     if commit {
         println!("\nCommitting changes...");
@@ -5525,558 +5087,165 @@ export default function ToolzIndex() {{
     Ok(page)
 }
 
-// ============================================================================
-// Tools Management
-// ============================================================================
+fn generate_llms_txt(tools: &[FoundTool], site_url: &str) -> String {
+    let mut content = String::new();
 
-/// Tool metadata
-#[derive(Debug)]
-struct ToolInfo {
-    name: &'static str,
-    description: &'static str,
-    binary: &'static str,
-    repo: &'static str,
-    install_method: InstallMethod,
+    // Header
+    content.push_str("# byteowlz\n\n");
+    content.push_str("> Open source tools for humans and AI agents. Local-first, cross-platform, CLI-first.\n\n");
+    content.push_str("byteowlz builds developer tools that run locally, work across platforms, and integrate seamlessly with AI workflows. No cloud dependencies, no subscriptions - your data stays yours.\n\n");
+
+    // Tools section
+    if !tools.is_empty() {
+        content.push_str("## Tools\n\n");
+        content.push_str(&format!(
+            "- [All Tools]({}/toolz/index.md): Overview of all byteowlz tools\n",
+            site_url
+        ));
+        for t in tools {
+            // Link to markdown version of tool page for LLM consumption
+            content.push_str(&format!(
+                "- [{}]({}/toolz/{}.md): {}\n",
+                t.tool.name,
+                site_url,
+                t.tool.name,
+                t.tool.tagline
+            ));
+        }
+        content.push('\n');
+    }
+
+    // Optional section
+    content.push_str("## Optional\n\n");
+    content.push_str("- [GitHub](https://github.com/byteowlz): All our open source projects\n");
+    content.push_str(&format!("- [About]({}/about.md): About byteowlz\n", site_url));
+
+    content
 }
 
-#[derive(Debug)]
-#[allow(dead_code)]
-enum InstallMethod {
-    /// Install via curl script
-    CurlScript(&'static str),
-    /// Install via cargo
-    Cargo(&'static str),
-    /// Install via go install
-    GoInstall(&'static str),
-    /// Install via uv/pip
-    Python(&'static str),
+fn generate_toolz_index_markdown(tools: &[FoundTool]) -> String {
+    let mut content = String::new();
+
+    content.push_str("# byteowlz Tools\n\n");
+    content.push_str("Open source tools built by byteowlz. Local-first, cross-platform, CLI-first. No cloud dependencies, no subscriptions - your data stays yours.\n\n");
+
+    if tools.is_empty() {
+        content.push_str("*No tools available yet. Check back soon!*\n");
+        return content;
+    }
+
+    content.push_str("## Available Tools\n\n");
+    content.push_str("| Tool | Description | Language | Status |\n");
+    content.push_str("|------|-------------|----------|--------|\n");
+
+    for t in tools {
+        let status = t.tool.meta.status.as_deref().unwrap_or("stable");
+        content.push_str(&format!(
+            "| [{}]({}.md) | {} | {} | {} |\n",
+            t.tool.name,
+            t.tool.name,
+            t.tool.tagline,
+            t.tool.language,
+            status
+        ));
+    }
+
+    content.push_str("\n---\n\n");
+    content.push_str("For more information, visit [github.com/byteowlz](https://github.com/byteowlz)\n");
+
+    content
 }
 
-const TOOLS: &[ToolInfo] = &[
-    ToolInfo {
-        name: "beads",
-        description: "Distributed git-backed graph issue tracker for AI agents (bd command)",
-        binary: "bd",
-        repo: "steveyegge/beads",
-        install_method: InstallMethod::CurlScript(
-            "https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh",
-        ),
-    },
-    ToolInfo {
-        name: "mmry",
-        description: "Local-first memory system for humans and AI agents",
-        binary: "mmry",
-        repo: "byteowlz/mmry",
-        // mmry uses an interactive install script; we use cargo install for automation
-        install_method: InstallMethod::Cargo("--git https://github.com/byteowlz/mmry mmry-cli"),
-    },
-    ToolInfo {
-        name: "bv",
-        description: "TUI for beads with graph analytics (PageRank, critical path, cycles)",
-        binary: "bv",
-        repo: "Dicklesworthstone/beads_viewer",
-        install_method: InstallMethod::CurlScript(
-            "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/main/install.sh",
-        ),
-    },
-    ToolInfo {
-        name: "cass",
-        description: "Unified search across all agent session history",
-        binary: "cass",
-        repo: "Dicklesworthstone/coding_agent_session_search",
-        install_method: InstallMethod::CurlScript(
-            "https://raw.githubusercontent.com/Dicklesworthstone/coding_agent_session_search/main/install.sh",
-        ),
-    },
-    ToolInfo {
-        name: "mailz",
-        description: "Agent coordination MCP server (messaging, file reservations)",
-        binary: "mailz-mcp",
-        repo: "byteowlz/mailz",
-        install_method: InstallMethod::Cargo("--git https://github.com/byteowlz/mailz mailz-mcp"),
-    },
-];
+fn generate_about_markdown() -> String {
+    let mut content = String::new();
 
-fn handle_tools(ctx: &RuntimeContext, command: ToolsCommand) -> Result<()> {
-    match command {
-        ToolsCommand::List => tools_list(ctx),
-        ToolsCommand::Install { tool, force } => tools_install(ctx, &tool, force),
-        ToolsCommand::Update { tool } => tools_update(ctx, &tool),
-        ToolsCommand::Doctor => tools_doctor(ctx),
-        ToolsCommand::Config { tool, show } => tools_config(ctx, &tool, show),
-    }
+    content.push_str("# About byteowlz\n\n");
+    content.push_str("byteowlz is a software company focused on building open source developer tools.\n\n");
+    content.push_str("## Philosophy\n\n");
+    content.push_str("- **Local-First**: Your data stays on your machine. No cloud dependencies, no subscriptions.\n");
+    content.push_str("- **Cross-Platform**: Linux, macOS, Windows. First-class support for all major platforms.\n");
+    content.push_str("- **CLI-First**: Designed for terminal workflows and AI agent integration.\n");
+    content.push_str("- **Open Source**: All our core tools are open source under permissive licenses.\n\n");
+    content.push_str("## Contact\n\n");
+    content.push_str("- GitHub: [github.com/byteowlz](https://github.com/byteowlz)\n");
+    content.push_str("- Website: [byteowlz.com](https://byteowlz.com)\n");
+
+    content
 }
 
-fn tools_list(ctx: &RuntimeContext) -> Result<()> {
-    #[derive(Serialize)]
-    struct ToolStatus {
-        name: String,
-        description: String,
-        installed: bool,
-        path: Option<String>,
-        version: Option<String>,
+fn generate_tool_markdown(tool: &ToolToml) -> String {
+    let mut content = String::new();
+
+    // Header
+    content.push_str(&format!("# {}\n\n", tool.name));
+    content.push_str(&format!("*{}*\n\n", tool.tagline));
+
+    // Metadata
+    content.push_str(&format!("**Version:** {} | **License:** {} | **Language:** {}\n\n", 
+        tool.version, tool.license, tool.language));
+
+    if let Some(ref github) = tool.links.github {
+        content.push_str(&format!("**GitHub:** {}\n\n", github));
     }
 
-    let mut statuses = Vec::new();
+    // Description
+    content.push_str("## Description\n\n");
+    content.push_str(&tool.description);
+    content.push_str("\n\n");
 
-    for tool in TOOLS {
-        let (installed, path, version) = check_tool_installed(tool);
-
-        statuses.push(ToolStatus {
-            name: tool.name.to_string(),
-            description: tool.description.to_string(),
-            installed,
-            path,
-            version,
-        });
+    // Installation
+    content.push_str("## Installation\n\n");
+    if let Some(ref v) = tool.install.homebrew {
+        content.push_str(&format!("**Homebrew:**\n```bash\nbrew install {}\n```\n\n", v));
+    }
+    if let Some(ref v) = tool.install.aur {
+        content.push_str(&format!("**AUR:**\n```bash\nyay -S {}\n```\n\n", v));
+    }
+    if let Some(ref v) = tool.install.cargo {
+        content.push_str(&format!("**Cargo:**\n```bash\ncargo install {}\n```\n\n", v));
+    }
+    if let Some(ref v) = tool.install.pip {
+        content.push_str(&format!("**pip:**\n```bash\npip install {}\n```\n\n", v));
+    }
+    if let Some(ref v) = tool.install.npm {
+        content.push_str(&format!("**npm:**\n```bash\nnpm install -g {}\n```\n\n", v));
+    }
+    if let Some(ref v) = tool.install.go {
+        content.push_str(&format!("**Go:**\n```bash\ngo install {}\n```\n\n", v));
     }
 
-    if ctx.common.json {
-        println!("{}", serde_json::to_string_pretty(&statuses)?);
-    } else {
-        println!("External Agent Tools");
-        println!("====================\n");
-
-        for status in &statuses {
-            let icon = if status.installed { "[+]" } else { "[ ]" };
-            let version_str = status.version.as_deref().unwrap_or("");
-            let path_str = status.path.as_deref().unwrap_or("not found");
-
-            println!("{} {} - {}", icon, status.name, status.description);
-            if status.installed {
-                println!("    Path: {} {}", path_str, version_str);
-            }
-            println!();
+    // Features
+    if !tool.features.is_empty() {
+        content.push_str("## Features\n\n");
+        for f in &tool.features {
+            content.push_str(&format!("- **{}**: {}\n", f.title, f.description));
         }
-
-        println!("Commands:");
-        println!("  byt tools install <tool>   Install a tool");
-        println!("  byt tools install all      Install all tools");
-        println!("  byt tools update <tool>    Update a tool");
-        println!("  byt tools doctor           Check tool health");
+        content.push_str("\n");
     }
 
-    Ok(())
-}
-
-fn check_tool_installed(tool: &ToolInfo) -> (bool, Option<String>, Option<String>) {
-    use std::process::Command;
-
-    // Special handling for Python packages
-    if matches!(tool.install_method, InstallMethod::Python(_)) {
-        // Check if module is importable
-        let output = Command::new("python3")
-            .args(["-c", &format!("import {}", tool.name)])
-            .output();
-
-        if let Ok(out) = output
-            && out.status.success()
-        {
-            // Try to get version
-            let version_output = Command::new("python3")
-                .args([
-                    "-c",
-                    &format!(
-                        "import {}; print(getattr({}, '__version__', 'unknown'))",
-                        tool.name, tool.name
-                    ),
-                ])
-                .output();
-
-            let version = version_output
-                .ok()
-                .filter(|o| o.status.success())
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
-
-            return (true, Some("python module".to_string()), version);
-        }
-
-        // Also check if installed via uv tool
-        let output = Command::new("uv").args(["tool", "list"]).output();
-
-        if let Ok(out) = output {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            if stdout.contains(tool.name) {
-                return (true, Some("uv tool".to_string()), None);
-            }
-        }
-
-        return (false, None, None);
-    }
-
-    // Check for binary
-    let output = Command::new("which").arg(tool.binary).output();
-
-    if let Ok(out) = output
-        && out.status.success()
-    {
-        let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-
-        // Try to get version
-        let version_output = Command::new(tool.binary).arg("--version").output();
-
-        let version = version_output.ok().filter(|o| o.status.success()).map(|o| {
-            let stdout = String::from_utf8_lossy(&o.stdout);
-            stdout.lines().next().unwrap_or("").trim().to_string()
-        });
-
-        return (true, Some(path), version);
-    }
-
-    (false, None, None)
-}
-
-fn tools_install(ctx: &RuntimeContext, tool_name: &str, force: bool) -> Result<()> {
-    if tool_name == "all" {
-        for tool in TOOLS {
-            println!("Installing {}...", tool.name);
-            install_single_tool(ctx, tool, force)?;
-            println!();
-        }
-        return Ok(());
-    }
-
-    let tool = TOOLS.iter().find(|t| t.name == tool_name).ok_or_else(|| {
-        anyhow!(
-            "Unknown tool '{}'. Available: {}",
-            tool_name,
-            TOOLS.iter().map(|t| t.name).collect::<Vec<_>>().join(", ")
-        )
-    })?;
-
-    install_single_tool(ctx, tool, force)
-}
-
-fn install_single_tool(ctx: &RuntimeContext, tool: &ToolInfo, force: bool) -> Result<()> {
-    use std::process::Command;
-
-    // Check if already installed
-    let (installed, path, _) = check_tool_installed(tool);
-    if installed && !force {
-        println!(
-            "{} is already installed at {}",
-            tool.name,
-            path.unwrap_or_default()
-        );
-        println!("Use --force to reinstall");
-        return Ok(());
-    }
-
-    if ctx.common.dry_run {
-        println!("Would install {} from {}", tool.name, tool.repo);
-        return Ok(());
-    }
-
-    match &tool.install_method {
-        InstallMethod::CurlScript(url) => {
-            println!("Installing {} via install script...", tool.name);
-
-            // Tool-specific arguments
-            let script_args = match tool.name {
-                "cass" => "--easy-mode",
-                _ => "",
-            };
-
-            let status = if script_args.is_empty() {
-                Command::new("bash")
-                    .args(["-c", &format!("curl -fsSL '{}' | bash", url)])
-                    .status()
-                    .context("running install script")?
-            } else {
-                Command::new("bash")
-                    .args([
-                        "-c",
-                        &format!("curl -fsSL '{}' | bash -s -- {}", url, script_args),
-                    ])
-                    .status()
-                    .context("running install script")?
-            };
-
-            if !status.success() {
-                return Err(anyhow!("Install script failed"));
-            }
-        }
-        InstallMethod::Cargo(crate_args) => {
-            println!("Installing {} via cargo...", tool.name);
-            // Parse the cargo args - may include --git URL and crate name
-            let args: Vec<&str> = crate_args.split_whitespace().collect();
-            let mut cmd_args = vec!["install"];
-            cmd_args.extend(args);
-
-            let status = Command::new("cargo")
-                .args(&cmd_args)
-                .status()
-                .context("running cargo install")?;
-
-            if !status.success() {
-                return Err(anyhow!("cargo install failed"));
-            }
-        }
-        InstallMethod::GoInstall(pkg) => {
-            println!("Installing {} via go install...", tool.name);
-            let status = Command::new("go")
-                .args(["install", pkg])
-                .status()
-                .context("running go install")?;
-
-            if !status.success() {
-                return Err(anyhow!("go install failed"));
-            }
-        }
-        InstallMethod::Python(pkg) => {
-            println!("Installing {} via uv...", tool.name);
-
-            // First try uv pip install
-            let status = Command::new("uv").args(["pip", "install", pkg]).status();
-
-            if status.is_ok() && status.unwrap().success() {
-                println!("{} installed successfully", tool.name);
-            } else {
-                // Fallback to pip
-                println!("Falling back to pip...");
-                let status = Command::new("pip3")
-                    .args(["install", pkg])
-                    .status()
-                    .context("running pip install")?;
-
-                if !status.success() {
-                    return Err(anyhow!("pip install failed"));
-                }
-            }
+    // Examples
+    if !tool.examples.is_empty() {
+        content.push_str("## Usage Examples\n\n");
+        for ex in &tool.examples {
+            content.push_str(&format!("### {}\n\n", ex.title));
+            let lang = if ex.language.is_empty() { "bash" } else { &ex.language };
+            content.push_str(&format!("```{}\n{}\n```\n\n", lang, ex.code));
         }
     }
 
-    println!("{} installed successfully", tool.name);
-    Ok(())
-}
-
-fn tools_update(ctx: &RuntimeContext, tool_name: &str) -> Result<()> {
-    // For now, update is just a force reinstall
-    if tool_name == "all" {
-        for tool in TOOLS {
-            println!("Updating {}...", tool.name);
-            install_single_tool(ctx, tool, true)?;
-            println!();
-        }
-        return Ok(());
+    // Platforms
+    if !tool.meta.platforms.is_empty() {
+        content.push_str("## Platforms\n\n");
+        content.push_str(&format!("{}\n\n", tool.meta.platforms.join(", ")));
     }
 
-    let tool = TOOLS.iter().find(|t| t.name == tool_name).ok_or_else(|| {
-        anyhow!(
-            "Unknown tool '{}'. Available: {}",
-            tool_name,
-            TOOLS.iter().map(|t| t.name).collect::<Vec<_>>().join(", ")
-        )
-    })?;
-
-    install_single_tool(ctx, tool, true)
-}
-
-fn tools_doctor(_ctx: &RuntimeContext) -> Result<()> {
-    use std::process::Command as ShellCommand;
-
-    println!("Tool Health Check");
-    println!("=================\n");
-
-    let mut all_healthy = true;
-
-    for tool in TOOLS {
-        let (installed, _path, version) = check_tool_installed(tool);
-
-        print!("{}: ", tool.name);
-
-        if !installed {
-            println!("NOT INSTALLED");
-            all_healthy = false;
-            continue;
-        }
-
-        // Tool-specific health checks
-        let health_ok = match tool.name {
-            "beads" => {
-                // Check if bd can run help
-                let output = ShellCommand::new("bd").arg("help").output();
-                output.is_ok() && output.unwrap().status.success()
-            }
-            "mmry" => {
-                // Check if mmry can run help
-                let output = ShellCommand::new("mmry").arg("--help").output();
-                output.is_ok() && output.unwrap().status.success()
-            }
-            "bv" => {
-                // Check if bv can access beads
-                let output = ShellCommand::new("bv").arg("-help").output();
-                output.is_ok() && output.unwrap().status.success()
-            }
-            "cass" => {
-                // Check if cass db exists
-                let output = ShellCommand::new("cass").args(["--help"]).output();
-                output.is_ok() && output.unwrap().status.success()
-            }
-            "mailz" => {
-                // Check if mailz-mcp runs
-                let output = ShellCommand::new("mailz-mcp").args(["--help"]).output();
-                output.is_ok() && output.unwrap().status.success()
-            }
-            _ => true,
-        };
-
-        if health_ok {
-            let ver = version.as_deref().unwrap_or("");
-            println!("OK {}", ver);
-        } else {
-            println!("ERROR (installed but not working)");
-            all_healthy = false;
-        }
+    // Keywords
+    if !tool.meta.keywords.is_empty() {
+        content.push_str("---\n\n");
+        content.push_str(&format!("*Keywords: {}*\n", tool.meta.keywords.join(", ")));
     }
 
-    println!();
-
-    // Check for MCP configuration
-    println!("MCP Configuration:");
-    let opencode_config_path = get_opencode_config_path();
-
-    if opencode_config_path.exists() {
-        if let Ok(content) = fs::read_to_string(&opencode_config_path) {
-            if content.contains("mailz") {
-                println!("  mailz: configured in opencode");
-            } else {
-                println!("  mailz: NOT configured in opencode");
-                println!("  Run 'byt tools config mailz' to set up");
-            }
-        }
-    } else {
-        println!(
-            "  opencode config not found at {}",
-            opencode_config_path.display()
-        );
-    }
-
-    println!();
-
-    if all_healthy {
-        println!("All tools are healthy!");
-    } else {
-        println!("Some tools need attention. Run 'byt tools install <tool>' to fix.");
-    }
-
-    Ok(())
-}
-
-fn tools_config(ctx: &RuntimeContext, tool_name: &str, show: bool) -> Result<()> {
-    let tool = TOOLS.iter().find(|t| t.name == tool_name).ok_or_else(|| {
-        anyhow!(
-            "Unknown tool '{}'. Available: {}",
-            tool_name,
-            TOOLS.iter().map(|t| t.name).collect::<Vec<_>>().join(", ")
-        )
-    })?;
-
-    match tool.name {
-        "mailz" => config_mailz(ctx, show),
-        "cass" => {
-            println!("cass configuration:");
-            println!("  Data dir: {:?}", ctx.config.tools.cass.data_dir);
-            println!();
-            println!("cass uses default paths. Configure in ~/.config/byt/config.toml:");
-            println!("  [tools.cass]");
-            println!("  data_dir = \"~/.local/share/coding-agent-search\"");
-            Ok(())
-        }
-        "bv" => {
-            println!("bv configuration:");
-            println!("  Default flags: {:?}", ctx.config.tools.bv.default_flags);
-            println!();
-            println!("bv uses .beads/ in each repo. No global config needed.");
-            println!("Configure in ~/.config/byt/config.toml:");
-            println!("  [tools.bv]");
-            println!("  default_flags = [\"-robot-triage\"]");
-            Ok(())
-        }
-        _ => {
-            println!("No configuration available for {}", tool_name);
-            Ok(())
-        }
-    }
-}
-
-fn config_mailz(ctx: &RuntimeContext, show: bool) -> Result<()> {
-    let config = &ctx.config.tools.mailz;
-
-    if show {
-        println!("mailz configuration:");
-        println!("  Database path: {:?}", config.db_path);
-        return Ok(());
-    }
-
-    // Check if mailz-mcp is installed
-    let mailz_path = which::which("mailz-mcp");
-    if mailz_path.is_err() {
-        println!("mailz-mcp is not installed.");
-        println!();
-        println!("To install mailz, run:");
-        println!("  byt tools install mailz");
-        println!();
-        println!("After installation, run 'byt tools config mailz' again.");
-        return Ok(());
-    }
-
-    let mailz_bin = mailz_path.unwrap();
-    println!("Found mailz-mcp at: {}", mailz_bin.display());
-    println!();
-
-    // Generate MCP server configuration for opencode
-    println!("Setting up mailz for opencode...\n");
-
-    let config_path = get_opencode_config_path();
-    let opencode_config_dir = config_path
-        .parent()
-        .ok_or_else(|| anyhow!("Could not determine config directory"))?;
-
-    // Load existing config or create new
-    let mut config_value: serde_json::Value = if config_path.exists() {
-        let content = fs::read_to_string(&config_path)?;
-        serde_json::from_str(&content).unwrap_or(serde_json::json!({}))
-    } else {
-        serde_json::json!({})
-    };
-
-    // Add mailz MCP server config (opencode local MCP format)
-    // mailz-mcp is a standalone binary, much simpler than Python
-    let mut mcp_config = serde_json::json!({
-        "type": "local",
-        "command": [mailz_bin.to_string_lossy()],
-        "environment": {}
-    });
-
-    // Add custom db_path if configured
-    if let Some(db_path) = &config.db_path {
-        mcp_config["environment"]["MAILZ_DB_PATH"] = serde_json::Value::String(db_path.clone());
-    }
-
-    // Ensure mcp exists (opencode uses "mcp" key)
-    if config_value.get("mcp").is_none() {
-        config_value["mcp"] = serde_json::json!({});
-    }
-
-    config_value["mcp"]["mailz"] = mcp_config;
-
-    if ctx.common.dry_run {
-        println!("Would update {}:", config_path.display());
-        println!("{}", serde_json::to_string_pretty(&config_value)?);
-        return Ok(());
-    }
-
-    // Write config
-    fs::create_dir_all(opencode_config_dir)?;
-    fs::write(&config_path, serde_json::to_string_pretty(&config_value)?)?;
-
-    println!("Updated {}", config_path.display());
-    println!();
-    println!("mailz is now configured for opencode.");
-    println!("Restart opencode to activate the MCP server.");
-
-    Ok(())
+    content
 }
 
 fn handle_completions(shell: Shell) -> Result<()> {
@@ -6088,18 +5257,6 @@ fn handle_completions(shell: Shell) -> Result<()> {
 // ============================================================================
 // Utility Functions
 // ============================================================================
-
-/// Get the path to opencode's config file
-/// Uses XDG_CONFIG_HOME if set, otherwise ~/.config/opencode/opencode.json
-fn get_opencode_config_path() -> PathBuf {
-    let config_dir = env::var_os("XDG_CONFIG_HOME")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
-        .unwrap_or_else(|| PathBuf::from(".config"));
-
-    config_dir.join("opencode").join("opencode.json")
-}
 
 fn load_config(paths: &AppPaths) -> Result<AppConfig> {
     if !paths.config_file.exists() {
@@ -6163,28 +5320,31 @@ fn default_config_dir() -> Result<PathBuf> {
 }
 
 fn discover_workspace_root() -> Result<PathBuf> {
-    // First check if we're in a byteowlz workspace (has AGENTS.md with govnr markers)
+    // Find the byteowlz workspace root.
+    // The workspace root contains multiple repos including govnr/.
+    // We look for: govnr/CATALOG.json (primary marker of workspace root)
     let current = env::current_dir()?;
 
     // Walk up looking for the workspace root
     let mut dir = current.as_path();
     loop {
-        // Check for govnr markers
-        let agents_md = dir.join("AGENTS.md");
-        let catalog = dir.join("CATALOG.json");
-        let beads = dir.join(".beads");
-
-        if agents_md.exists() && beads.exists() {
-            // Check if AGENTS.md mentions Govnr
-            if let Ok(content) = fs::read_to_string(&agents_md)
-                && (content.contains("Govnr") || content.contains("govnr"))
-            {
-                return Ok(dir.to_path_buf());
-            }
+        // Primary check: workspace root has govnr/ subdirectory with CATALOG.json
+        let govnr_catalog = dir.join("govnr").join("CATALOG.json");
+        if govnr_catalog.exists() {
+            return Ok(dir.to_path_buf());
         }
 
-        if catalog.exists() {
-            return Ok(dir.to_path_buf());
+        // Secondary check: we might be inside govnr/, so check if parent has govnr/CATALOG.json
+        if let Some(dir_name) = dir.file_name().and_then(|n| n.to_str()) {
+            if dir_name == "govnr" {
+                let catalog = dir.join("CATALOG.json");
+                if catalog.exists() {
+                    // We're in the govnr dir, parent is the workspace root
+                    if let Some(parent) = dir.parent() {
+                        return Ok(parent.to_path_buf());
+                    }
+                }
+            }
         }
 
         match dir.parent() {
@@ -6601,106 +5761,4 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // -------------------------------------------------------------------------
-    // Mail/reservation command tests
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn test_mail_inbox_command() {
-        use clap::Parser;
-
-        let args = vec!["byt", "mail", "inbox"];
-        let cli = Cli::try_parse_from(args).unwrap();
-
-        if let Command::Mail { command } = cli.command {
-            assert!(matches!(command, MailCommand::Inbox));
-        } else {
-            panic!("Expected Mail inbox command");
-        }
-    }
-
-    #[test]
-    fn test_mail_send_command() {
-        use clap::Parser;
-
-        let args = vec![
-            "byt", "mail", "send", "alice", "Hello", "--body", "Hi there",
-        ];
-        let cli = Cli::try_parse_from(args).unwrap();
-
-        if let Command::Mail { command } = cli.command {
-            if let MailCommand::Send { to, subject, body } = command {
-                assert_eq!(to, "alice");
-                assert_eq!(subject, "Hello");
-                assert_eq!(body, "Hi there");
-            } else {
-                panic!("Expected Mail send command");
-            }
-        } else {
-            panic!("Expected Mail command");
-        }
-    }
-
-    #[test]
-    fn test_reserve_command() {
-        use clap::Parser;
-
-        let args = vec![
-            "byt",
-            "reserve",
-            "src/main.rs",
-            "--ttl",
-            "30m",
-            "--reason",
-            "editing",
-        ];
-        let cli = Cli::try_parse_from(args).unwrap();
-
-        if let Command::Reserve(cmd) = cli.command {
-            assert_eq!(cmd.file, "src/main.rs");
-            assert_eq!(cmd.ttl, "30m");
-            assert_eq!(cmd.reason, "editing");
-        } else {
-            panic!("Expected Reserve command");
-        }
-    }
-
-    #[test]
-    fn test_reservations_command() {
-        use clap::Parser;
-
-        let args = vec!["byt", "reservations"];
-        let cli = Cli::try_parse_from(args).unwrap();
-
-        if !matches!(cli.command, Command::Reservations) {
-            panic!("Expected Reservations command");
-        }
-    }
-
-    #[test]
-    fn test_release_command() {
-        use clap::Parser;
-
-        let args = vec!["byt", "release", "src/main.rs"];
-        let cli = Cli::try_parse_from(args).unwrap();
-
-        if let Command::Release(cmd) = cli.command {
-            assert_eq!(cmd.file, "src/main.rs");
-        } else {
-            panic!("Expected Release command");
-        }
-    }
-
-    #[test]
-    fn test_parse_duration_to_seconds() {
-        assert_eq!(parse_duration_to_seconds("30m").unwrap(), 1800);
-        assert_eq!(parse_duration_to_seconds("1h").unwrap(), 3600);
-        assert_eq!(parse_duration_to_seconds("15s").unwrap(), 15);
-    }
-
-    #[test]
-    fn test_parse_duration_requires_unit() {
-        let err = parse_duration_to_seconds("10").unwrap_err();
-        assert!(err.to_string().contains("unit suffix"));
-    }
 }

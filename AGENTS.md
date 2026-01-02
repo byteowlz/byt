@@ -2,7 +2,7 @@
 
 ## Overview
 
-`byt` is the meta-tool for managing the Byteowlz ecosystem. It provides cross-repository management, governance compliance checking, and integration with key tools (bv, cass, mmry).
+`byt` is the meta-tool for managing the Byteowlz ecosystem. It provides cross-repository management, governance compliance checking, and integration with key tools (bd, mmry).
 
 ## Commands
 
@@ -17,10 +17,6 @@
 | `byt lint`                      | Check governance compliance (justfile, beads, AGENTS.md) |
 | `byt status`           | Show repository status and compliance matrix             |
 | `byt ready`            | Show ready work from govnr-level beads                   |
-| `byt triage`           | Cross-repo triage via bv workspace aggregation           |
-| `byt triage --next`    | Get single top recommendation                            |
-| `byt triage --refresh` | Regenerate workspace.yaml before triage                  |
-| `byt search <query>`   | Search agent conversation history (via cass)             |
 | `byt memory add`       | Add a memory (via mmry)                                  |
 | `byt memory search`    | Search memories (via mmry)                               |
 | `byt memory projects`  | List available memory stores                             |
@@ -33,14 +29,11 @@
 byt integrates with:
 
 - **bd (beads)** - Issue tracking at govnr and repo levels
-- **bv (beads_viewer)** - Cross-repo issue triage via workspace config
-- **cass** - Agent conversation search across all sessions
 - **mmry** - Memory storage for architectural decisions
 
 ## Key Files
 
 - `CATALOG.json` - Generated catalog of all repos with metadata
-- `.bv/workspace.yaml` - Auto-generated bv workspace config
 - `.sync/memories/` - Cross-machine memory sync directory
 - `.ignore` - Makes gitignored repos visible to AI tools
 

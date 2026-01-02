@@ -22,11 +22,8 @@ byt status               # Show repo status matrix
 
 # Issue tracking
 byt ready                # Govnr-level ready work
-byt triage               # Cross-repo triage (via bv)
-byt triage --next        # Single top recommendation
 
 # Knowledge
-byt search "query"       # Search agent sessions (via cass)
 byt memory search "q"    # Search memories (via mmry)
 byt memory add "content" # Add memory
 ```
@@ -35,8 +32,7 @@ byt memory add "content" # Add memory
 
 byt integrates with:
 
-- `bd` / `bv` for issue tracking
-- `cass` for agent session search
+- `bd` for issue tracking
 - `mmry` for memory management
 
 ## License
