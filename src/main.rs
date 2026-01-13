@@ -570,6 +570,38 @@ impl RuntimeContext {
             self.paths.workspace_root.join("govnr").join("CATALOG.json")
         }
     }
+
+    /// Load and parse the catalog with helpful error messages
+    fn load_catalog(&self) -> Result<Catalog> {
+        let catalog_path = self.catalog_path();
+        if !catalog_path.exists() {
+            anyhow::bail!(
+                "Catalog not found at {}. Run 'byt catalog refresh' to generate it.",
+                catalog_path.display()
+            );
+        }
+
+        let content = fs::read_to_string(&catalog_path)
+            .with_context(|| format!("reading catalog from {}", catalog_path.display()))?;
+
+        // Check for merge conflict markers
+        if content.contains("<<<<<<<") || content.contains(">>>>>>>") {
+            anyhow::bail!(
+                "Catalog file has merge conflicts: {}\n\n\
+                 The catalog contains git merge conflict markers.\n\
+                 Run 'byt catalog refresh' to regenerate it.",
+                catalog_path.display()
+            );
+        }
+
+        serde_json::from_str(&content).with_context(|| {
+            format!(
+                "Failed to parse catalog at {}.\n\
+                 The file may be corrupted. Run 'byt catalog refresh' to regenerate it.",
+                catalog_path.display()
+            )
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -654,11 +686,6 @@ struct Machine {
 }
 
 impl Machine {
-    /// Get the hostname to match against (falls back to name if not set)
-    fn match_hostname(&self) -> &str {
-        self.hostname.as_deref().unwrap_or(&self.name)
-    }
-
     /// Get the SSH host to connect to (falls back to hostname, then name)
     fn ssh_host(&self) -> &str {
         self.host
@@ -671,6 +698,41 @@ fn default_ssh_port() -> u16 {
     22
 }
 
+/// Get the XDG state directory for byt
+fn get_state_dir() -> Result<PathBuf> {
+    if let Some(dir) = env::var_os("XDG_STATE_HOME").filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(dir).join(APP_NAME));
+    }
+
+    dirs::home_dir()
+        .map(|home| home.join(".local").join("state").join(APP_NAME))
+        .ok_or_else(|| anyhow!("unable to determine state directory"))
+}
+
+/// Get the path to the machine identity state file
+fn get_machine_state_path() -> Result<PathBuf> {
+    Ok(get_state_dir()?.join("machine"))
+}
+
+/// Read the local machine name from state file
+fn read_machine_state() -> Option<String> {
+    get_machine_state_path()
+        .ok()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Write the local machine name to state file
+fn write_machine_state(name: &str) -> Result<()> {
+    let state_path = get_machine_state_path()?;
+    if let Some(parent) = state_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&state_path, format!("{}\n", name))?;
+    Ok(())
+}
+
 /// Get the current machine's hostname
 fn get_current_hostname() -> String {
     hostname::get()
@@ -678,17 +740,133 @@ fn get_current_hostname() -> String {
         .unwrap_or_else(|_| "unknown".to_string())
 }
 
-/// Find the local machine from the config (matches by hostname)
-fn find_local_machine(machines: &[Machine]) -> Option<&Machine> {
-    let current = get_current_hostname();
-    machines.iter().find(|m| m.match_hostname() == current)
+/// Try to auto-detect the local machine by fuzzy hostname matching
+fn auto_detect_local_machine(machines: &[Machine]) -> Option<&Machine> {
+    let current = get_current_hostname().to_lowercase();
+
+    // Try exact match on hostname field first
+    if let Some(m) = machines
+        .iter()
+        .find(|m| m.hostname.as_ref().map(|h| h.to_lowercase()) == Some(current.clone()))
+    {
+        return Some(m);
+    }
+
+    // Try if machine name is a prefix of current hostname (e.g., "macbook" matches "macbook.local")
+    if let Some(m) = machines
+        .iter()
+        .find(|m| current.starts_with(&m.name.to_lowercase()))
+    {
+        return Some(m);
+    }
+
+    // Try if current hostname is a prefix of machine name
+    if let Some(m) = machines
+        .iter()
+        .find(|m| m.name.to_lowercase().starts_with(&current))
+    {
+        return Some(m);
+    }
+
+    None
 }
 
-/// Get the local machine name (from config or hostname)
+/// Prompt user to select their machine (interactive)
+fn prompt_machine_selection(machines: &[Machine]) -> Result<String> {
+    use std::io::{self, IsTerminal, Write};
+
+    if machines.is_empty() {
+        return Err(anyhow!("No machines configured in config.toml"));
+    }
+
+    // Check if stdin is a terminal - if not, we can't prompt
+    if !io::stdin().is_terminal() {
+        return Err(anyhow!(
+            "Cannot determine local machine identity.\n\n\
+             No machine state file found and stdin is not a terminal.\n\
+             Run 'byt repos compare' interactively to set your machine identity,\n\
+             or create {} with your machine name.",
+            get_machine_state_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "~/.local/state/byt/machine".to_string())
+        ));
+    }
+
+    eprintln!("No local machine identity found.\n");
+    eprintln!("Available machines in config:");
+    for (i, machine) in machines.iter().enumerate() {
+        eprintln!("  {}. {}", i + 1, machine.name);
+    }
+    eprintln!();
+    eprint!("Which machine is this? [1-{}]: ", machines.len());
+    io::stderr().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+
+    let choice: usize = input
+        .trim()
+        .parse()
+        .map_err(|_| anyhow!("Invalid selection"))?;
+
+    if choice < 1 || choice > machines.len() {
+        return Err(anyhow!("Selection out of range"));
+    }
+
+    let selected = &machines[choice - 1];
+
+    // Save to state file
+    write_machine_state(&selected.name)?;
+
+    let state_path = get_machine_state_path()?;
+    eprintln!("\nSaved to: {}", state_path.display());
+
+    Ok(selected.name.clone())
+}
+
+/// Check if a machine is the local machine
+fn is_local_machine(machine: &Machine, local_name: &str) -> bool {
+    machine.name == local_name
+}
+
+/// Get the local machine name, prompting if necessary
+fn get_local_machine_name_interactive(machines: &[Machine]) -> Result<String> {
+    // 1. Check state file first
+    if let Some(name) = read_machine_state() {
+        // Verify it's still in config
+        if machines.iter().any(|m| m.name == name) {
+            return Ok(name);
+        }
+        // State file has invalid machine, will re-prompt
+    }
+
+    // 2. Try auto-detection by hostname
+    if let Some(machine) = auto_detect_local_machine(machines) {
+        // Auto-detected, save to state for next time
+        let _ = write_machine_state(&machine.name);
+        return Ok(machine.name.clone());
+    }
+
+    // 3. Prompt user
+    prompt_machine_selection(machines)
+}
+
+/// Get the local machine name (non-interactive fallback)
 fn get_local_machine_name(machines: &[Machine]) -> String {
-    find_local_machine(machines)
-        .map(|m| m.name.clone())
-        .unwrap_or_else(get_current_hostname)
+    // Try state file
+    if let Some(name) = read_machine_state() {
+        if machines.iter().any(|m| m.name == name) {
+            return name;
+        }
+    }
+
+    // Try auto-detection
+    if let Some(machine) = auto_detect_local_machine(machines) {
+        return machine.name.clone();
+    }
+
+    // Fallback to hostname
+    get_current_hostname()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -914,15 +1092,7 @@ fn refresh_catalog(ctx: &RuntimeContext, full: bool) -> Result<()> {
 }
 
 fn show_catalog(ctx: &RuntimeContext) -> Result<()> {
-    let catalog_path = ctx.catalog_path();
-    if !catalog_path.exists() {
-        return Err(anyhow!(
-            "Catalog not found. Run 'byt catalog refresh' first."
-        ));
-    }
-
-    let content = fs::read_to_string(&catalog_path)?;
-    let catalog: Catalog = serde_json::from_str(&content)?;
+    let catalog = ctx.load_catalog()?;
 
     if ctx.common.json {
         println!("{}", serde_json::to_string_pretty(&catalog)?);
@@ -987,19 +1157,13 @@ fn get_local_repo_list(ctx: &RuntimeContext) -> Result<Vec<String>> {
 }
 
 /// Get machine catalog for local machine
-fn get_local_machine_catalog(ctx: &RuntimeContext) -> Result<MachineCatalog> {
+fn get_local_machine_catalog(ctx: &RuntimeContext, local_name: &str) -> Result<MachineCatalog> {
     let repos = get_local_repo_list(ctx)?;
     Ok(MachineCatalog {
-        machine: get_local_machine_name(&ctx.config.machines),
+        machine: local_name.to_string(),
         generated: Utc::now(),
         repos,
     })
-}
-
-/// Check if a machine is the local machine (by hostname match)
-fn is_local_machine(machine: &Machine) -> bool {
-    let current = get_current_hostname();
-    machine.match_hostname() == current
 }
 
 /// Fetch machine catalog from remote via SSH
@@ -1053,10 +1217,10 @@ fn fetch_remote_machine_catalog(machine: &Machine) -> Result<MachineCatalog> {
 
 /// Show repos available on each machine
 fn catalog_machines_show(ctx: &RuntimeContext, explicit_machines: Vec<String>) -> Result<()> {
-    let local_name = get_local_machine_name(&ctx.config.machines);
+    let local_name = get_local_machine_name_interactive(&ctx.config.machines)?;
 
     // Get local catalog
-    let local_catalog = get_local_machine_catalog(ctx)?;
+    let local_catalog = get_local_machine_catalog(ctx, &local_name)?;
 
     // Determine which machines to query
     let machines: Vec<&Machine> = if !explicit_machines.is_empty() {
@@ -1078,7 +1242,7 @@ fn catalog_machines_show(ctx: &RuntimeContext, explicit_machines: Vec<String>) -
     }
 
     for machine in &machines {
-        if is_local_machine(machine) {
+        if is_local_machine(machine, &local_name) {
             // Skip - already added local catalog above (or will add if in explicit list)
             if !catalogs.iter().any(|c| c.machine == machine.name) {
                 catalogs.push(MachineCatalog {
@@ -1130,10 +1294,10 @@ fn catalog_machines_show(ctx: &RuntimeContext, explicit_machines: Vec<String>) -
 fn catalog_machines_compare(ctx: &RuntimeContext, explicit_machines: Vec<String>) -> Result<()> {
     use std::collections::{HashMap as StdHashMap, HashSet};
 
-    let local_name = get_local_machine_name(&ctx.config.machines);
+    let local_name = get_local_machine_name_interactive(&ctx.config.machines)?;
 
     // Get local catalog
-    let local_catalog = get_local_machine_catalog(ctx)?;
+    let local_catalog = get_local_machine_catalog(ctx, &local_name)?;
 
     // Determine which machines to query
     let machines: Vec<&Machine> = if !explicit_machines.is_empty() {
@@ -1151,7 +1315,7 @@ fn catalog_machines_compare(ctx: &RuntimeContext, explicit_machines: Vec<String>
     catalogs.insert(local_name.clone(), local_catalog);
 
     for machine in &machines {
-        if is_local_machine(machine) {
+        if is_local_machine(machine, &local_name) {
             // Already have local catalog
             continue;
         }
@@ -1177,7 +1341,7 @@ fn catalog_machines_compare(ctx: &RuntimeContext, explicit_machines: Vec<String>
     // Build ordered machine list (local first)
     let mut machine_names: Vec<String> = vec![local_name.clone()];
     for machine in &machines {
-        if !is_local_machine(machine) && catalogs.contains_key(&machine.name) {
+        if !is_local_machine(machine, &local_name) && catalogs.contains_key(&machine.name) {
             machine_names.push(machine.name.clone());
         }
     }
@@ -1274,7 +1438,7 @@ fn catalog_machines_compare(ctx: &RuntimeContext, explicit_machines: Vec<String>
 fn catalog_machines_missing(ctx: &RuntimeContext) -> Result<()> {
     use std::collections::HashSet;
 
-    let local_name = get_local_machine_name(&ctx.config.machines);
+    let local_name = get_local_machine_name_interactive(&ctx.config.machines)?;
 
     // Get local repos
     let local_repos: HashSet<String> = get_local_repo_list(ctx)?.into_iter().collect();
@@ -1284,7 +1448,7 @@ fn catalog_machines_missing(ctx: &RuntimeContext) -> Result<()> {
         .config
         .machines
         .iter()
-        .filter(|m| !is_local_machine(m))
+        .filter(|m| !is_local_machine(m, &local_name))
         .collect();
 
     if remote_machines.is_empty() {
@@ -1889,11 +2053,7 @@ fn detect_current_project(ctx: &RuntimeContext) -> Result<String> {
             && let Some(name) = first.as_os_str().to_str()
         {
             // Check if this is a valid repo in the catalog
-            let catalog_path = ctx.catalog_path();
-            if catalog_path.exists() {
-                let content = fs::read_to_string(&catalog_path)?;
-                let catalog: Catalog = serde_json::from_str(&content)?;
-
+            if let Ok(catalog) = ctx.load_catalog() {
                 if catalog.repos.contains_key(name) {
                     info!("Auto-detected project: {}", name);
                     return Ok(name.to_string());
@@ -1915,34 +2075,30 @@ fn validate_project_name(ctx: &RuntimeContext, project: &str) -> Result<String> 
     }
 
     // Check if project exists in catalog
-    let catalog_path = ctx.catalog_path();
-    if catalog_path.exists() {
-        let content = fs::read_to_string(&catalog_path)?;
-        let catalog: Catalog = serde_json::from_str(&content)?;
+    let catalog = ctx.load_catalog()?;
 
-        if catalog.repos.contains_key(project) {
-            return Ok(project.to_string());
-        }
+    if catalog.repos.contains_key(project) {
+        return Ok(project.to_string());
+    }
 
-        // Suggest similar names if not found
-        let similar: Vec<&String> = catalog
-            .repos
-            .keys()
-            .filter(|k| k.contains(project) || project.contains(k.as_str()))
-            .take(3)
-            .collect();
+    // Suggest similar names if not found
+    let similar: Vec<&String> = catalog
+        .repos
+        .keys()
+        .filter(|k| k.contains(project) || project.contains(k.as_str()))
+        .take(3)
+        .collect();
 
-        if !similar.is_empty() {
-            return Err(anyhow!(
-                "Unknown project '{}'. Did you mean: {}?\nRun 'byt memory projects' to list available projects.",
-                project,
-                similar
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
+    if !similar.is_empty() {
+        return Err(anyhow!(
+            "Unknown project '{}'. Did you mean: {}?\nRun 'byt memory projects' to list available projects.",
+            project,
+            similar
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
 
     Err(anyhow!(
@@ -2012,13 +2168,9 @@ fn list_memory_projects(ctx: &RuntimeContext) -> Result<()> {
         .collect();
 
     // Get catalog repos
-    let catalog_path = ctx.catalog_path();
-    let catalog_repos: Vec<String> = if catalog_path.exists() {
-        let content = fs::read_to_string(&catalog_path)?;
-        let catalog: Catalog = serde_json::from_str(&content)?;
-        catalog.repos.keys().cloned().collect()
-    } else {
-        Vec::new()
+    let catalog_repos: Vec<String> = match ctx.load_catalog() {
+        Ok(catalog) => catalog.repos.keys().cloned().collect(),
+        Err(_) => Vec::new(),
     };
 
     if ctx.common.json {
@@ -2092,11 +2244,7 @@ fn get_syncable_stores(ctx: &RuntimeContext, explicit_stores: Vec<String>) -> Re
     let mut stores = vec!["govnr".to_string()];
 
     // Get repos from catalog that exist locally
-    let catalog_path = ctx.catalog_path();
-    if catalog_path.exists() {
-        let content = fs::read_to_string(&catalog_path)?;
-        let catalog: Catalog = serde_json::from_str(&content)?;
-
+    if let Ok(catalog) = ctx.load_catalog() {
         // Get existing mmry stores
         let existing = get_existing_stores()?;
 
@@ -2236,13 +2384,9 @@ fn sync_pull(ctx: &RuntimeContext, explicit_stores: Vec<String>) -> Result<()> {
     // Get stores to import
     let stores = if explicit_stores.is_empty() {
         // Auto-detect from files in sync dir that match local repos
-        let catalog_path = ctx.catalog_path();
-        let local_repos: Vec<String> = if catalog_path.exists() {
-            let content = fs::read_to_string(&catalog_path)?;
-            let catalog: Catalog = serde_json::from_str(&content)?;
-            catalog.repos.keys().cloned().collect()
-        } else {
-            Vec::new()
+        let local_repos: Vec<String> = match ctx.load_catalog() {
+            Ok(catalog) => catalog.repos.keys().cloned().collect(),
+            Err(_) => Vec::new(),
         };
 
         let mut stores = Vec::new();
@@ -2371,13 +2515,9 @@ fn sync_status(ctx: &RuntimeContext) -> Result<()> {
     let existing_stores = get_existing_stores()?;
 
     // Get catalog repos
-    let catalog_path = ctx.catalog_path();
-    let catalog_repos: Vec<String> = if catalog_path.exists() {
-        let content = fs::read_to_string(&catalog_path)?;
-        let catalog: Catalog = serde_json::from_str(&content)?;
-        catalog.repos.keys().cloned().collect()
-    } else {
-        Vec::new()
+    let catalog_repos: Vec<String> = match ctx.load_catalog() {
+        Ok(catalog) => catalog.repos.keys().cloned().collect(),
+        Err(_) => Vec::new(),
     };
 
     if ctx.common.json {
@@ -2489,12 +2629,9 @@ fn repos_sync(
     let workspace = ctx.workspace_root();
 
     // Load catalog to get all repos
-    let catalog_path = ctx.catalog_path();
     let repos: Vec<String> = if !explicit_repos.is_empty() {
         explicit_repos
-    } else if catalog_path.exists() {
-        let content = fs::read_to_string(&catalog_path)?;
-        let catalog: Catalog = serde_json::from_str(&content)?;
+    } else if let Ok(catalog) = ctx.load_catalog() {
         catalog.repos.keys().cloned().collect()
     } else {
         // Fallback: scan workspace for git repos
@@ -2524,6 +2661,7 @@ fn repos_sync(
     let mut push_ok = 0;
     let mut push_failed = 0;
     let mut has_changes = Vec::new();
+    let mut needs_attention = Vec::new(); // Repos with conflicts or other issues
 
     for repo_name in &repos {
         let repo_path = workspace.join(repo_name);
@@ -2562,8 +2700,18 @@ fn repos_sync(
                     .current_dir(&repo_path)
                     .output()?;
 
-                if output.status.success() {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let combined = format!("{}{}", stdout, stderr);
+
+                // Check for conflict indicators (even if exit code is 0)
+                let has_conflict = combined.contains("CONFLICT")
+                    || combined.contains("could not apply")
+                    || combined.contains("Applying autostash resulted in conflicts")
+                    || combined.contains("needs merge")
+                    || combined.contains("fix conflicts");
+
+                if output.status.success() && !has_conflict {
                     let summary = if stdout.contains("Already up to date") {
                         "up to date"
                     } else if stdout.contains("Fast-forward") {
@@ -2575,13 +2723,27 @@ fn repos_sync(
                         println!("  {} - {}", repo_name, summary);
                     }
                     pull_ok += 1;
+                } else if has_conflict {
+                    // Conflict detected (might still have exit code 0 for autostash conflicts)
+                    eprintln!(
+                        "  {} - CONFLICT detected, manual resolution required",
+                        repo_name
+                    );
+                    needs_attention.push((repo_name.clone(), "merge conflict".to_string()));
+                    pull_failed += 1;
                 } else {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    // Other failure
+                    let error_msg: String = stderr.lines().take(3).collect::<Vec<_>>().join(" | ");
                     eprintln!(
                         "  {} - pull failed: {}",
                         repo_name,
-                        stderr.lines().next().unwrap_or("unknown error")
+                        if error_msg.is_empty() {
+                            "unknown error".to_string()
+                        } else {
+                            error_msg
+                        }
                     );
+                    needs_attention.push((repo_name.clone(), "pull failed".to_string()));
                     pull_failed += 1;
                 }
             }
@@ -2614,11 +2776,18 @@ fn repos_sync(
                         push_ok += 1;
                     } else {
                         let stderr = String::from_utf8_lossy(&push_output.stderr);
+                        let error_msg: String =
+                            stderr.lines().take(3).collect::<Vec<_>>().join(" | ");
                         eprintln!(
                             "  {} - push failed: {}",
                             repo_name,
-                            stderr.lines().next().unwrap_or("unknown error")
+                            if error_msg.is_empty() {
+                                "unknown error".to_string()
+                            } else {
+                                error_msg
+                            }
                         );
+                        needs_attention.push((repo_name.clone(), "push failed".to_string()));
                         push_failed += 1;
                     }
                 }
@@ -2739,6 +2908,22 @@ fn repos_sync(
     if do_push {
         println!("Push: {} ok, {} failed", push_ok, push_failed);
     }
+
+    // Show repos needing attention (conflicts, failures)
+    if !needs_attention.is_empty() {
+        println!();
+        println!("Repos requiring attention:");
+        for (repo, reason) in &needs_attention {
+            println!("  - {} ({})", repo, reason);
+        }
+        println!();
+        println!("To resolve conflicts:");
+        println!("  cd <repo> && git status    # See conflict details");
+        println!("  git diff                   # Review conflicts");
+        println!("  # Edit files to resolve, then:");
+        println!("  git add <files> && git rebase --continue");
+    }
+
     if !has_changes.is_empty() {
         println!();
         println!("Repos with uncommitted changes:");
@@ -2877,14 +3062,17 @@ fn get_repo_status(repo_path: &Path, repo_name: &str) -> RepoStatusInfo {
 /// Show status of all repositories
 fn repos_status(ctx: &RuntimeContext) -> Result<()> {
     let workspace = ctx.workspace_root();
-    let catalog_path = ctx.catalog_path();
 
-    let repos: Vec<String> = if catalog_path.exists() {
-        let content = fs::read_to_string(&catalog_path)?;
-        let catalog: Catalog = serde_json::from_str(&content)?;
-        catalog.repos.keys().cloned().collect()
-    } else {
-        Vec::new()
+    let repos: Vec<String> = match ctx.load_catalog() {
+        Ok(catalog) => catalog.repos.keys().cloned().collect(),
+        Err(e) => {
+            if ctx.common.json {
+                println!("[]");
+            } else {
+                eprintln!("{}", e);
+            }
+            return Ok(());
+        }
     };
 
     if repos.is_empty() {
@@ -2958,17 +3146,14 @@ fn repos_compare(
     use std::process::Command as ShellCommand;
 
     let workspace = ctx.workspace_root();
-    let catalog_path = ctx.catalog_path();
+    let local_name = get_local_machine_name_interactive(&ctx.config.machines)?;
 
     // Get repos to compare
     let repos: Vec<String> = if !explicit_repos.is_empty() {
         explicit_repos
-    } else if catalog_path.exists() {
-        let content = fs::read_to_string(&catalog_path)?;
-        let catalog: Catalog = serde_json::from_str(&content)?;
-        catalog.repos.keys().cloned().collect()
     } else {
-        Vec::new()
+        let catalog = ctx.load_catalog()?;
+        catalog.repos.keys().cloned().collect()
     };
 
     if repos.is_empty() {
@@ -2981,13 +3166,13 @@ fn repos_compare(
         ctx.config
             .machines
             .iter()
-            .filter(|m| explicit_machines.contains(&m.name) && !is_local_machine(m))
+            .filter(|m| explicit_machines.contains(&m.name) && !is_local_machine(m, &local_name))
             .collect()
     } else {
         ctx.config
             .machines
             .iter()
-            .filter(|m| !is_local_machine(m))
+            .filter(|m| !is_local_machine(m, &local_name))
             .collect()
     };
 
@@ -2996,7 +3181,7 @@ fn repos_compare(
             .config
             .machines
             .iter()
-            .filter(|m| !is_local_machine(m))
+            .filter(|m| !is_local_machine(m, &local_name))
             .count()
             == 0
     {
@@ -3011,7 +3196,6 @@ fn repos_compare(
     }
 
     // Collect status from local machine
-    let local_name = get_local_machine_name(&ctx.config.machines);
     let local_statuses: Vec<RepoStatusInfo> = repos
         .iter()
         .map(|name| get_repo_status(&workspace.join(name), name))
@@ -4041,16 +4225,7 @@ fn find_schemas(ctx: &RuntimeContext) -> Result<Vec<SchemaInfo>> {
     };
 
     // Load catalog to get repo list
-    let catalog_path = ctx.catalog_path();
-    if !catalog_path.exists() {
-        return Err(anyhow!(
-            "Catalog not found at {}. Run 'byt catalog refresh' first.",
-            catalog_path.display()
-        ));
-    }
-
-    let content = fs::read_to_string(&catalog_path)?;
-    let catalog: Catalog = serde_json::from_str(&content)?;
+    let catalog = ctx.load_catalog()?;
 
     let mut schemas = Vec::new();
 
@@ -4517,7 +4692,10 @@ fn website_check(ctx: &RuntimeContext) -> Result<()> {
     }
 
     if needs_update > 0 {
-        println!("\n{} tool(s) need website pages. Run 'byt website sync' to generate.", needs_update);
+        println!(
+            "\n{} tool(s) need website pages. Run 'byt website sync' to generate.",
+            needs_update
+        );
     } else {
         println!("\nAll tools have website pages.");
     }
@@ -4535,7 +4713,8 @@ fn website_sync(ctx: &RuntimeContext, commit: bool, filter_repos: Vec<String>) -
     let tools: Vec<_> = if filter_repos.is_empty() {
         tools
     } else {
-        tools.into_iter()
+        tools
+            .into_iter()
             .filter(|t| filter_repos.contains(&t.repo_name) || filter_repos.contains(&t.tool.name))
             .collect()
     };
@@ -4714,14 +4893,13 @@ fn generate_tool_page(tool: &ToolToml) -> Result<String> {
     let examples_json = serde_json::to_string_pretty(&tool.examples)?;
     let platforms_json = serde_json::to_string_pretty(&tool.meta.platforms)?;
 
-    let screenshot_url = tool.media.screenshot.as_ref()
-        .map(|s| {
-            if s.starts_with("http") {
-                s.clone()
-            } else {
-                format!("/toolz/{}/{}", tool.name, s.split('/').last().unwrap_or(s))
-            }
-        });
+    let screenshot_url = tool.media.screenshot.as_ref().map(|s| {
+        if s.starts_with("http") {
+            s.clone()
+        } else {
+            format!("/toolz/{}/{}", tool.name, s.split('/').last().unwrap_or(s))
+        }
+    });
 
     let screenshot_line = screenshot_url
         .map(|u| format!("    screenshot: \"{}\",", u))
@@ -4753,7 +4931,10 @@ fn generate_tool_page(tool: &ToolToml) -> Result<String> {
         lines.join("\n")
     };
 
-    let github_line = tool.links.github.as_ref()
+    let github_line = tool
+        .links
+        .github
+        .as_ref()
         .map(|g| format!("    github: \"{}\",", g))
         .unwrap_or_default();
 
@@ -4761,7 +4942,8 @@ fn generate_tool_page(tool: &ToolToml) -> Result<String> {
 
     let description_escaped = tool.description.replace('`', "\\`").replace("${", "\\${");
 
-    let page = format!(r#"import Link from "next/link";
+    let page = format!(
+        r#"import Link from "next/link";
 import Navbar from "../../components/Navbar";
 import Footer from "../../components/Footer";
 
@@ -4983,20 +5165,24 @@ export default function ToolPage() {{
 }
 
 fn generate_toolz_index(tools: &[FoundTool]) -> Result<String> {
-    let tools_json: Vec<_> = tools.iter().map(|t| {
-        serde_json::json!({
-            "name": t.tool.name,
-            "title": t.tool.title,
-            "tagline": t.tool.tagline,
-            "category": t.tool.category,
-            "language": t.tool.language,
-            "status": t.tool.meta.status.as_deref().unwrap_or("stable"),
+    let tools_json: Vec<_> = tools
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "name": t.tool.name,
+                "title": t.tool.title,
+                "tagline": t.tool.tagline,
+                "category": t.tool.category,
+                "language": t.tool.language,
+                "status": t.tool.meta.status.as_deref().unwrap_or("stable"),
+            })
         })
-    }).collect();
+        .collect();
 
     let tools_str = serde_json::to_string_pretty(&tools_json)?;
 
-    let page = format!(r#"import Link from "next/link";
+    let page = format!(
+        r#"import Link from "next/link";
 import Navbar from "../../components/Navbar";
 import Footer from "../../components/Footer";
 
@@ -5082,7 +5268,9 @@ export default function ToolzIndex() {{
     </div>
   );
 }}
-"#, tools = tools_str);
+"#,
+        tools = tools_str
+    );
 
     Ok(page)
 }
@@ -5092,7 +5280,9 @@ fn generate_llms_txt(tools: &[FoundTool], site_url: &str) -> String {
 
     // Header
     content.push_str("# byteowlz\n\n");
-    content.push_str("> Open source tools for humans and AI agents. Local-first, cross-platform, CLI-first.\n\n");
+    content.push_str(
+        "> Open source tools for humans and AI agents. Local-first, cross-platform, CLI-first.\n\n",
+    );
     content.push_str("byteowlz builds developer tools that run locally, work across platforms, and integrate seamlessly with AI workflows. No cloud dependencies, no subscriptions - your data stays yours.\n\n");
 
     // Tools section
@@ -5106,10 +5296,7 @@ fn generate_llms_txt(tools: &[FoundTool], site_url: &str) -> String {
             // Link to markdown version of tool page for LLM consumption
             content.push_str(&format!(
                 "- [{}]({}/toolz/{}.md): {}\n",
-                t.tool.name,
-                site_url,
-                t.tool.name,
-                t.tool.tagline
+                t.tool.name, site_url, t.tool.name, t.tool.tagline
             ));
         }
         content.push('\n');
@@ -5118,7 +5305,10 @@ fn generate_llms_txt(tools: &[FoundTool], site_url: &str) -> String {
     // Optional section
     content.push_str("## Optional\n\n");
     content.push_str("- [GitHub](https://github.com/byteowlz): All our open source projects\n");
-    content.push_str(&format!("- [About]({}/about.md): About byteowlz\n", site_url));
+    content.push_str(&format!(
+        "- [About]({}/about.md): About byteowlz\n",
+        site_url
+    ));
 
     content
 }
@@ -5142,16 +5332,14 @@ fn generate_toolz_index_markdown(tools: &[FoundTool]) -> String {
         let status = t.tool.meta.status.as_deref().unwrap_or("stable");
         content.push_str(&format!(
             "| [{}]({}.md) | {} | {} | {} |\n",
-            t.tool.name,
-            t.tool.name,
-            t.tool.tagline,
-            t.tool.language,
-            status
+            t.tool.name, t.tool.name, t.tool.tagline, t.tool.language, status
         ));
     }
 
     content.push_str("\n---\n\n");
-    content.push_str("For more information, visit [github.com/byteowlz](https://github.com/byteowlz)\n");
+    content.push_str(
+        "For more information, visit [github.com/byteowlz](https://github.com/byteowlz)\n",
+    );
 
     content
 }
@@ -5160,12 +5348,17 @@ fn generate_about_markdown() -> String {
     let mut content = String::new();
 
     content.push_str("# About byteowlz\n\n");
-    content.push_str("byteowlz is a software company focused on building open source developer tools.\n\n");
+    content.push_str(
+        "byteowlz is a software company focused on building open source developer tools.\n\n",
+    );
     content.push_str("## Philosophy\n\n");
     content.push_str("- **Local-First**: Your data stays on your machine. No cloud dependencies, no subscriptions.\n");
     content.push_str("- **Cross-Platform**: Linux, macOS, Windows. First-class support for all major platforms.\n");
-    content.push_str("- **CLI-First**: Designed for terminal workflows and AI agent integration.\n");
-    content.push_str("- **Open Source**: All our core tools are open source under permissive licenses.\n\n");
+    content
+        .push_str("- **CLI-First**: Designed for terminal workflows and AI agent integration.\n");
+    content.push_str(
+        "- **Open Source**: All our core tools are open source under permissive licenses.\n\n",
+    );
     content.push_str("## Contact\n\n");
     content.push_str("- GitHub: [github.com/byteowlz](https://github.com/byteowlz)\n");
     content.push_str("- Website: [byteowlz.com](https://byteowlz.com)\n");
@@ -5181,8 +5374,10 @@ fn generate_tool_markdown(tool: &ToolToml) -> String {
     content.push_str(&format!("*{}*\n\n", tool.tagline));
 
     // Metadata
-    content.push_str(&format!("**Version:** {} | **License:** {} | **Language:** {}\n\n", 
-        tool.version, tool.license, tool.language));
+    content.push_str(&format!(
+        "**Version:** {} | **License:** {} | **Language:** {}\n\n",
+        tool.version, tool.license, tool.language
+    ));
 
     if let Some(ref github) = tool.links.github {
         content.push_str(&format!("**GitHub:** {}\n\n", github));
@@ -5196,13 +5391,19 @@ fn generate_tool_markdown(tool: &ToolToml) -> String {
     // Installation
     content.push_str("## Installation\n\n");
     if let Some(ref v) = tool.install.homebrew {
-        content.push_str(&format!("**Homebrew:**\n```bash\nbrew install {}\n```\n\n", v));
+        content.push_str(&format!(
+            "**Homebrew:**\n```bash\nbrew install {}\n```\n\n",
+            v
+        ));
     }
     if let Some(ref v) = tool.install.aur {
         content.push_str(&format!("**AUR:**\n```bash\nyay -S {}\n```\n\n", v));
     }
     if let Some(ref v) = tool.install.cargo {
-        content.push_str(&format!("**Cargo:**\n```bash\ncargo install {}\n```\n\n", v));
+        content.push_str(&format!(
+            "**Cargo:**\n```bash\ncargo install {}\n```\n\n",
+            v
+        ));
     }
     if let Some(ref v) = tool.install.pip {
         content.push_str(&format!("**pip:**\n```bash\npip install {}\n```\n\n", v));
@@ -5228,7 +5429,11 @@ fn generate_tool_markdown(tool: &ToolToml) -> String {
         content.push_str("## Usage Examples\n\n");
         for ex in &tool.examples {
             content.push_str(&format!("### {}\n\n", ex.title));
-            let lang = if ex.language.is_empty() { "bash" } else { &ex.language };
+            let lang = if ex.language.is_empty() {
+                "bash"
+            } else {
+                &ex.language
+            };
             content.push_str(&format!("```{}\n{}\n```\n\n", lang, ex.code));
         }
     }
@@ -5760,5 +5965,4 @@ mod tests {
         let result = Cli::try_parse_from(args);
         assert!(result.is_err());
     }
-
 }
