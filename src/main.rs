@@ -289,6 +289,15 @@ enum ReposCommand {
         #[arg(long, short = 'm')]
         machines: Vec<String>,
     },
+    /// Clean build artifacts from Rust repositories
+    Clean {
+        /// Only clean specific repos (default: all Rust repos in catalog)
+        #[arg(long, short = 'r')]
+        repos: Vec<String>,
+        /// Keep release builds
+        #[arg(long)]
+        keep_release: bool,
+    },
 }
 
 #[derive(Debug, Clone, Args)]
@@ -2613,6 +2622,10 @@ fn handle_repos(ctx: &RuntimeContext, command: ReposCommand) -> Result<()> {
         } => repos_sync(ctx, !no_pull, push, !no_memories, repos),
         ReposCommand::Status => repos_status(ctx),
         ReposCommand::Compare { repos, machines } => repos_compare(ctx, repos, machines),
+        ReposCommand::Clean {
+            repos,
+            keep_release,
+        } => repos_clean(ctx, repos, keep_release),
     }
 }
 
@@ -3366,6 +3379,234 @@ fn repos_compare(
 
     println!();
     println!("Legend: * = has uncommitted changes, <- = newest version");
+
+    Ok(())
+}
+
+/// Recursively count files in a directory
+fn count_files(dir: &Path) -> Result<usize> {
+    let mut count = 0;
+    for entry in walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if entry.file_type().is_file() {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+/// Clean build artifacts from Rust repositories
+fn repos_clean(
+    ctx: &RuntimeContext,
+    explicit_repos: Vec<String>,
+    keep_release: bool,
+) -> Result<()> {
+    use std::process::Command as ShellCommand;
+
+    let workspace = ctx.workspace_root();
+
+    // Get repos to clean
+    let repos: Vec<String> = if !explicit_repos.is_empty() {
+        explicit_repos
+    } else if let Ok(catalog) = ctx.load_catalog() {
+        // Filter to Rust repos only
+        catalog
+            .repos
+            .iter()
+            .filter(|(_, info)| info.languages.contains(&"rust".to_string()))
+            .map(|(name, _)| name.clone())
+            .collect()
+    } else {
+        // Fallback: scan for Rust workspaces
+        scan_repositories(ctx, false)?
+            .iter()
+            .filter(|(_, info)| info.languages.contains(&"rust".to_string()))
+            .map(|(name, _)| name.clone())
+            .collect()
+    };
+
+    if repos.is_empty() {
+        println!("No Rust repositories to clean.");
+        return Ok(());
+    }
+
+    let mut total_freed = 0u64;
+    let mut total_files = 0usize;
+
+    for repo_name in &repos {
+        let repo_path = workspace.join(repo_name);
+
+        if !repo_path.exists() {
+            if !ctx.common.quiet {
+                eprintln!("Skipping: {} (not found)", repo_name);
+            }
+            continue;
+        }
+
+        // Check if this is a workspace
+        let cargo_toml = repo_path.join("Cargo.toml");
+        if !cargo_toml.exists() {
+            continue; // Not a Rust project
+        }
+
+        // Read Cargo.toml to check if it's a workspace
+        let is_workspace = fs::read_to_string(&cargo_toml)
+            .ok()
+            .and_then(|content| {
+                content.parse::<toml::Table>().ok().and_then(|toml| {
+                    toml.get("workspace")
+                        .and_then(|w| w.as_table())
+                        .map(|_| true)
+                })
+            })
+            .unwrap_or(false);
+
+        if !is_workspace {
+            // Single crate - check if it has a target directory
+            if !repo_path.join("target").exists() {
+                continue; // Nothing to clean
+            }
+        }
+
+        if !ctx.common.quiet {
+            eprint!("Cleaning: {}... ", repo_name);
+        }
+
+        let target_dir = repo_path.join("target");
+
+        let mut freed_space: u64 = 0;
+        let mut removed_files: usize = 0;
+
+        if keep_release {
+            // Only clean debug builds
+            let debug_dir = target_dir.join("debug");
+            if debug_dir.exists() {
+                let output = ShellCommand::new("du")
+                    .args(["-sb", debug_dir.to_str().unwrap()])
+                    .output()
+                    .ok();
+
+                if let Some(ref o) = output {
+                    let stdout = String::from_utf8_lossy(&o.stdout);
+                    if let Some(size_str) = stdout.split_whitespace().next() {
+                        freed_space = size_str.parse::<u64>().unwrap_or(0);
+                    }
+                }
+
+                // Remove debug directory
+                if let Ok(count) = count_files(&debug_dir) {
+                    removed_files = count;
+                }
+
+                if ctx.common.dry_run {
+                    if !ctx.common.quiet {
+                        let mib = freed_space / 1024 / 1024;
+                        eprintln!("dry-run (would remove debug: {} files, {} MiB)", removed_files, mib);
+                    }
+                } else {
+                    fs::remove_dir_all(&debug_dir)
+                        .with_context(|| format!("Failed to remove debug directory in {}", repo_name))?;
+                    if !ctx.common.quiet {
+                        let mib = freed_space / 1024 / 1024;
+                        eprintln!("✓ Removed debug ({} files, {} MiB)", removed_files, mib);
+                    }
+                }
+            } else {
+                if !ctx.common.quiet {
+                    eprintln!("✓ no debug artifacts to clean");
+                }
+            }
+        } else {
+            // Clean everything (default)
+            let cargo_clean_args = vec!["clean", "--manifest-path", cargo_toml.to_str().unwrap()];
+
+            if ctx.common.dry_run {
+                if !ctx.common.quiet {
+                    eprintln!("dry-run");
+                }
+                continue;
+            }
+
+            let output = ShellCommand::new("cargo")
+                .args(&cargo_clean_args)
+                .output()
+                .with_context(|| format!("Failed to run cargo clean in {}", repo_name))?;
+
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+
+                // Try stdout first, then stderr for "Removed" line
+                let output_text = if stdout.contains("Removed") {
+                    &stdout
+                } else if stderr.contains("Removed") {
+                    &stderr
+                } else {
+                    &stdout
+                };
+
+                if let Some(line) = output_text.lines().find(|l| l.contains("Removed")) {
+                    if !ctx.common.quiet {
+                        eprintln!("✓ {}", line.trim());
+                    }
+                    // Parse freed space
+                    if let Some(freed_str) = line.split_whitespace().find(|s| {
+                        s.ends_with("GiB") || s.ends_with("MiB") || s.ends_with("KiB")
+                    }) {
+                        let num_str = freed_str.trim_end_matches("GiB").trim_end_matches("MiB").trim_end_matches("KiB");
+                        if let Ok(num) = num_str.parse::<f64>() {
+                            total_freed += if freed_str.ends_with("GiB") {
+                                (num * 1024.0 * 1024.0 * 1024.0) as u64  // GiB to bytes
+                            } else if freed_str.ends_with("MiB") {
+                                (num * 1024.0 * 1024.0) as u64  // MiB to bytes
+                            } else {
+                                (num * 1024.0) as u64  // KiB to bytes
+                            };
+                        }
+                    }
+                    if let Some(files_str) = line.split_whitespace().next() {
+                        if let Ok(files) = files_str.parse::<usize>() {
+                            total_files += files;
+                        }
+                    }
+                } else {
+                    if !ctx.common.quiet {
+                        eprintln!("✓ cleaned (no target dir)");
+                    }
+                }
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if !ctx.common.quiet {
+                    eprintln!("✗ {}", stderr.lines().next().unwrap_or("unknown error"));
+                }
+            }
+        }
+
+        // Track totals for both modes
+        total_freed += freed_space;
+        total_files += removed_files;
+    }
+
+    // Print summary
+    if !ctx.common.quiet {
+        println!();
+        if total_freed > 0 {
+            let gib = total_freed as f64 / 1024.0 / 1024.0 / 1024.0;
+            let mib = total_freed as f64 / 1024.0 / 1024.0;
+            if gib >= 1.0 {
+                println!("Total space freed: {:.1} GiB", gib);
+            } else if mib >= 1.0 {
+                println!("Total space freed: {:.1} MiB", mib);
+            } else {
+                println!("Total space freed: {} KiB", total_freed / 1024);
+            }
+        }
+        if total_files > 0 {
+            println!("Total files removed: {}", total_files);
+        }
+    }
 
     Ok(())
 }
