@@ -4807,6 +4807,8 @@ struct ToolMedia {
     #[serde(default)]
     icon: Option<String>,
     #[serde(default)]
+    logo: Option<String>,
+    #[serde(default)]
     screenshot: Option<String>,
     #[serde(default)]
     video: Option<String>,
@@ -5031,6 +5033,18 @@ fn website_sync(ctx: &RuntimeContext, commit: bool, filter_repos: Vec<String>) -
                 }
             }
         }
+
+        if let Some(ref logo) = t.tool.media.logo {
+            if !logo.starts_with("http") {
+                let src = t.repo_path.join(logo);
+                if src.exists() {
+                    let filename = src.file_name().unwrap_or_default();
+                    let dest = tool_public_dir.join(filename);
+                    fs::copy(&src, &dest)?;
+                    println!("  copied logo: {}", filename.to_string_lossy());
+                }
+            }
+        }
     }
 
     // Generate tools index JSON (consumed by website index.tsx)
@@ -5135,6 +5149,14 @@ fn generate_tool_data_json(tool: &ToolToml) -> Result<String> {
         }
     });
 
+    let logo_url = tool.media.logo.as_ref().map(|s| {
+        if s.starts_with("http") {
+            s.clone()
+        } else {
+            format!("/toolz/{}/{}", tool.name, s.split('/').last().unwrap_or(s))
+        }
+    });
+
     let status = tool.meta.status.as_deref().unwrap_or("stable");
 
     let data = serde_json::json!({
@@ -5172,6 +5194,7 @@ fn generate_tool_data_json(tool: &ToolToml) -> Result<String> {
         "examples": tool.examples,
         "media": {
             "screenshot": screenshot_url,
+            "logo": logo_url,
             "icon": tool.media.icon,
             "video": tool.media.video,
         },
@@ -5191,6 +5214,13 @@ fn generate_tools_index_json(tools: &[FoundTool]) -> Result<String> {
     let tools_json: Vec<_> = tools
         .iter()
         .map(|t| {
+            let logo_url = t.tool.media.logo.as_ref().map(|s| {
+                if s.starts_with("http") {
+                    s.clone()
+                } else {
+                    format!("/toolz/{}/{}", t.tool.name, s.split('/').last().unwrap_or(s))
+                }
+            });
             serde_json::json!({
                 "name": t.tool.name,
                 "title": t.tool.title,
@@ -5199,6 +5229,7 @@ fn generate_tools_index_json(tools: &[FoundTool]) -> Result<String> {
                 "category": t.tool.category,
                 "language": t.tool.language,
                 "status": t.tool.meta.status.as_deref().unwrap_or("stable"),
+                "logo": logo_url,
             })
         })
         .collect();
