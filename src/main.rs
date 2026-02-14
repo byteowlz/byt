@@ -4916,14 +4916,14 @@ fn website_check(ctx: &RuntimeContext) -> Result<()> {
         ));
     }
 
-    let toolz_dir = website_repo.join(&website_cfg.toolz_dir);
+    let public_dir = website_repo.join(&website_cfg.public_dir);
 
-    println!("Checking tool pages:\n");
+    println!("Checking tool data files:\n");
     let mut needs_update = 0;
 
     for t in &tools {
-        let page_path = toolz_dir.join(format!("{}.js", t.tool.name));
-        let status = if page_path.exists() {
+        let data_path = public_dir.join(&t.tool.name).join("data.json");
+        let status = if data_path.exists() {
             "exists"
         } else {
             needs_update += 1;
@@ -4934,11 +4934,11 @@ fn website_check(ctx: &RuntimeContext) -> Result<()> {
 
     if needs_update > 0 {
         println!(
-            "\n{} tool(s) need website pages. Run 'byt website sync' to generate.",
+            "\n{} tool(s) need data files. Run 'byt website sync' to generate.",
             needs_update
         );
     } else {
-        println!("\nAll tools have website pages.");
+        println!("\nAll tools have data files.");
     }
 
     Ok(())
@@ -4979,29 +4979,28 @@ fn website_sync(ctx: &RuntimeContext, commit: bool, filter_repos: Vec<String>) -
         ));
     }
 
-    let toolz_dir = website_repo.join(&website_cfg.toolz_dir);
     let public_dir = website_repo.join(&website_cfg.public_dir);
 
     // Create directories if needed
-    fs::create_dir_all(&toolz_dir)?;
     fs::create_dir_all(&public_dir)?;
 
-    // Generate tool pages
+    // Generate tool data JSON files (consumed by website .tsx pages)
     for t in &tools {
-        // Generate the page content
-        let page_content = generate_tool_page(&t.tool)?;
-        let page_path = toolz_dir.join(format!("{}.js", t.tool.name));
+        let tool_data = generate_tool_data_json(&t.tool)?;
+        let tool_public_dir = public_dir.join(&t.tool.name);
+        fs::create_dir_all(&tool_public_dir)?;
+        let data_path = tool_public_dir.join("data.json");
 
         // Check if content changed
-        let needs_write = if page_path.exists() {
-            let existing = fs::read_to_string(&page_path)?;
-            existing != page_content
+        let needs_write = if data_path.exists() {
+            let existing = fs::read_to_string(&data_path)?;
+            existing != tool_data
         } else {
             true
         };
 
         if needs_write {
-            fs::write(&page_path, &page_content)?;
+            fs::write(&data_path, &tool_data)?;
             println!("[updated] {}", t.tool.name);
         } else {
             println!("[unchanged] {}", t.tool.name);
@@ -5014,8 +5013,7 @@ fn website_sync(ctx: &RuntimeContext, commit: bool, filter_repos: Vec<String>) -
                 let src = t.repo_path.join(screenshot);
                 if src.exists() {
                     let filename = src.file_name().unwrap_or_default();
-                    let dest = public_dir.join(&t.tool.name).join(filename);
-                    fs::create_dir_all(dest.parent().unwrap())?;
+                    let dest = tool_public_dir.join(filename);
                     fs::copy(&src, &dest)?;
                     println!("  copied screenshot: {}", filename.to_string_lossy());
                 }
@@ -5027,8 +5025,7 @@ fn website_sync(ctx: &RuntimeContext, commit: bool, filter_repos: Vec<String>) -
                 let src = t.repo_path.join(icon);
                 if src.exists() {
                     let filename = src.file_name().unwrap_or_default();
-                    let dest = public_dir.join(&t.tool.name).join(filename);
-                    fs::create_dir_all(dest.parent().unwrap())?;
+                    let dest = tool_public_dir.join(filename);
                     fs::copy(&src, &dest)?;
                     println!("  copied icon: {}", filename.to_string_lossy());
                 }
@@ -5036,11 +5033,11 @@ fn website_sync(ctx: &RuntimeContext, commit: bool, filter_repos: Vec<String>) -
         }
     }
 
-    // Update the index page
-    let index_content = generate_toolz_index(&tools)?;
-    let index_path = toolz_dir.join("index.js");
-    fs::write(&index_path, &index_content)?;
-    println!("[updated] toolz/index.js");
+    // Generate tools index JSON (consumed by website index.tsx)
+    let tools_index = generate_tools_index_json(&tools)?;
+    let tools_json_path = public_dir.join("tools.json");
+    fs::write(&tools_json_path, &tools_index)?;
+    println!("[updated] public/toolz/tools.json");
 
     // Generate markdown versions of tool pages for LLM consumption
     let toolz_md_dir = website_repo.join("public").join("toolz");
@@ -5128,12 +5125,8 @@ fn website_sync(ctx: &RuntimeContext, commit: bool, filter_repos: Vec<String>) -
     Ok(())
 }
 
-fn generate_tool_page(tool: &ToolToml) -> Result<String> {
-    // Generate JavaScript/React page from tool data
-    let features_json = serde_json::to_string_pretty(&tool.features)?;
-    let examples_json = serde_json::to_string_pretty(&tool.examples)?;
-    let platforms_json = serde_json::to_string_pretty(&tool.meta.platforms)?;
-
+/// Generate a JSON data file for a single tool (consumed by website .tsx pages)
+fn generate_tool_data_json(tool: &ToolToml) -> Result<String> {
     let screenshot_url = tool.media.screenshot.as_ref().map(|s| {
         if s.starts_with("http") {
             s.clone()
@@ -5142,270 +5135,59 @@ fn generate_tool_page(tool: &ToolToml) -> Result<String> {
         }
     });
 
-    let screenshot_line = screenshot_url
-        .map(|u| format!("    screenshot: \"{}\",", u))
-        .unwrap_or_default();
-
-    let install_lines = {
-        let mut lines = Vec::new();
-        if let Some(ref v) = tool.install.homebrew {
-            lines.push(format!("    homebrew: \"{}\",", v));
-        }
-        if let Some(ref v) = tool.install.aur {
-            lines.push(format!("    aur: \"{}\",", v));
-        }
-        if let Some(ref v) = tool.install.aur_cuda {
-            lines.push(format!("    aur_cuda: \"{}\",", v));
-        }
-        if let Some(ref v) = tool.install.cargo {
-            lines.push(format!("    cargo: \"{}\",", v));
-        }
-        if let Some(ref v) = tool.install.go {
-            lines.push(format!("    go: \"{}\",", v));
-        }
-        if let Some(ref v) = tool.install.npm {
-            lines.push(format!("    npm: \"{}\",", v));
-        }
-        if let Some(ref v) = tool.install.pip {
-            lines.push(format!("    pip: \"{}\",", v));
-        }
-        lines.join("\n")
-    };
-
-    let github_line = tool
-        .links
-        .github
-        .as_ref()
-        .map(|g| format!("    github: \"{}\",", g))
-        .unwrap_or_default();
-
     let status = tool.meta.status.as_deref().unwrap_or("stable");
 
-    let description_escaped = tool.description.replace('`', "\\`").replace("${", "\\${");
+    let data = serde_json::json!({
+        "name": tool.name,
+        "title": tool.title,
+        "tagline": tool.tagline,
+        "tagline_de": tool.tagline_de,
+        "description": tool.description,
+        "description_de": tool.description_de,
+        "language": tool.language,
+        "category": tool.category,
+        "version": tool.version,
+        "license": tool.license,
+        "install": {
+            "homebrew": tool.install.homebrew,
+            "aur": tool.install.aur,
+            "aur_cuda": tool.install.aur_cuda,
+            "cargo": tool.install.cargo,
+            "go": tool.install.go,
+            "npm": tool.install.npm,
+            "pip": tool.install.pip,
+            "binary": tool.install.binary,
+        },
+        "links": {
+            "github": tool.links.github,
+            "docs": tool.links.docs,
+            "changelog": tool.links.changelog,
+        },
+        "features": tool.features.iter().map(|f| serde_json::json!({
+            "title": f.title,
+            "title_de": f.title_de,
+            "description": f.description,
+            "description_de": f.description_de,
+        })).collect::<Vec<_>>(),
+        "examples": tool.examples,
+        "media": {
+            "screenshot": screenshot_url,
+            "icon": tool.media.icon,
+            "video": tool.media.video,
+        },
+        "meta": {
+            "keywords": tool.meta.keywords,
+            "platforms": tool.meta.platforms,
+            "related": tool.meta.related,
+            "status": status,
+        },
+    });
 
-    let page = format!(
-        r#"import Link from "next/link";
-import Navbar from "../../components/Navbar";
-import Footer from "../../components/Footer";
-
-// Auto-generated from {name}/tool.toml by `byt website sync`
-const tool = {{
-  name: "{name}",
-  title: "{title}",
-  tagline: "{tagline}",
-  description: `{description}`,
-  language: "{language}",
-  category: "{category}",
-  version: "{version}",
-  license: "{license}",
-  install: {{
-{install}
-  }},
-  links: {{
-{github}
-  }},
-  features: {features},
-  examples: {examples},
-  media: {{
-{screenshot}
-  }},
-  meta: {{
-    keywords: {keywords:?},
-    platforms: {platforms},
-    status: "{status}",
-  }},
-}};
-
-function InstallBlock({{ install }}) {{
-  const methods = [];
-  
-  if (install.homebrew) {{
-    methods.push({{ label: "Homebrew", cmd: `brew install ${{install.homebrew}}` }});
-  }}
-  if (install.aur) {{
-    methods.push({{ label: "AUR", cmd: `yay -S ${{install.aur}}` }});
-  }}
-  if (install.cargo) {{
-    methods.push({{ label: "Cargo", cmd: `cargo install ${{install.cargo}}` }});
-  }}
-
-  return (
-    <div className="space-y-3">
-      {{methods.map((m, i) => (
-        <div key={{i}}>
-          <span className="text-xs text-gray-500 mb-1 block">{{m.label}}</span>
-          <code className="block bg-gray-800 px-4 py-2 rounded text-sm text-teal-400 font-mono">
-            {{m.cmd}}
-          </code>
-        </div>
-      ))}}
-    </div>
-  );
-}}
-
-function FeatureCard({{ feature }}) {{
-  return (
-    <div className="bg-gray-800/30 border border-gray-700/50 rounded-lg p-4">
-      <h4 className="text-white font-medium mb-1">{{feature.title}}</h4>
-      <p className="text-gray-400 text-sm">{{feature.description}}</p>
-    </div>
-  );
-}}
-
-function CodeExample({{ example }}) {{
-  return (
-    <div className="bg-gray-800/50 rounded-lg overflow-hidden">
-      <div className="bg-gray-700/50 px-4 py-2 border-b border-gray-700">
-        <span className="text-sm text-gray-300">{{example.title}}</span>
-      </div>
-      <pre className="p-4 text-sm overflow-x-auto">
-        <code className="text-gray-300 font-mono whitespace-pre">{{example.code}}</code>
-      </pre>
-    </div>
-  );
-}}
-
-export default function ToolPage() {{
-  return (
-    <div className="min-h-screen flex flex-col bg-gray-100 dark:bg-gray-900">
-      <Navbar />
-
-      <main className="flex-grow pt-24 px-4 pb-12">
-        <div className="container mx-auto max-w-4xl">
-          {{/* Breadcrumb */}}
-          <div className="mb-6">
-            <Link href="/toolz" className="text-gray-500 hover:text-gray-300 text-sm">
-              _toolz
-            </Link>
-            <span className="text-gray-600 mx-2">/</span>
-            <span className="text-gray-300 text-sm">_{{tool.name}}</span>
-          </div>
-
-          {{/* Header */}}
-          <div className="mb-8">
-            <div className="flex items-center gap-4 mb-4">
-              <h1 className="font-geo text-4xl text-white">_{{tool.name}}</h1>
-              <span className="text-xs bg-green-500/20 text-green-400 px-2 py-0.5 rounded">
-                {{tool.meta.status}}
-              </span>
-              <span className="text-xs bg-gray-700/50 text-gray-400 px-2 py-0.5 rounded">
-                v{{tool.version}}
-              </span>
-            </div>
-            <p className="text-xl text-gray-300 mb-4">{{tool.tagline}}</p>
-            <div className="flex items-center gap-4">
-              {{tool.links.github && (
-                <a
-                  href={{tool.links.github}}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-teal-500 hover:text-teal-400 text-sm flex items-center gap-2"
-                >
-                  <svg className="w-4 h-4 fill-current" viewBox="0 0 24 24">
-                    <path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/>
-                  </svg>
-                  GitHub
-                </a>
-              )}}
-              <span className="text-gray-600">|</span>
-              <span className="text-gray-500 text-sm">{{tool.license}}</span>
-              <span className="text-gray-600">|</span>
-              <span className="text-gray-500 text-sm">{{tool.language}}</span>
-            </div>
-          </div>
-
-          {{/* Screenshot */}}
-          {{tool.media?.screenshot && (
-            <div className="mb-8">
-              <img
-                src={{tool.media.screenshot}}
-                alt={{`${{tool.name}} screenshot`}}
-                className="rounded-lg border border-gray-700 w-full"
-              />
-            </div>
-          )}}
-
-          {{/* Description */}}
-          <div className="mb-12">
-            <p className="text-gray-300 whitespace-pre-line leading-relaxed">
-              {{tool.description}}
-            </p>
-          </div>
-
-          {{/* Install */}}
-          <section className="mb-12">
-            <h2 className="font-geo text-2xl text-white mb-4">_install</h2>
-            <InstallBlock install={{tool.install}} />
-          </section>
-
-          {{/* Features */}}
-          <section className="mb-12">
-            <h2 className="font-geo text-2xl text-white mb-4">_features</h2>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {{tool.features.map((f, i) => (
-                <FeatureCard key={{i}} feature={{f}} />
-              ))}}
-            </div>
-          </section>
-
-          {{/* Examples */}}
-          <section className="mb-12">
-            <h2 className="font-geo text-2xl text-white mb-4">_usage</h2>
-            <div className="space-y-6">
-              {{tool.examples.map((ex, i) => (
-                <CodeExample key={{i}} example={{ex}} />
-              ))}}
-            </div>
-          </section>
-
-          {{/* Platforms */}}
-          <section className="mb-12">
-            <h2 className="font-geo text-2xl text-white mb-4">_platforms</h2>
-            <div className="flex gap-3">
-              {{tool.meta.platforms.map((p, i) => (
-                <span key={{i}} className="bg-gray-800/50 px-4 py-2 rounded text-gray-300 text-sm">
-                  {{p}}
-                </span>
-              ))}}
-            </div>
-          </section>
-
-          {{/* Back to toolz */}}
-          <div className="pt-8 border-t border-gray-800">
-            <Link href="/toolz" className="text-teal-500 hover:text-teal-400 text-sm">
-              ← Back to _toolz
-            </Link>
-          </div>
-        </div>
-      </main>
-
-      <Footer />
-    </div>
-  );
-}}
-"#,
-        name = tool.name,
-        title = tool.title,
-        tagline = tool.tagline,
-        description = description_escaped,
-        language = tool.language,
-        category = tool.category,
-        version = tool.version,
-        license = tool.license,
-        install = install_lines,
-        github = github_line,
-        features = features_json,
-        examples = examples_json,
-        screenshot = screenshot_line,
-        keywords = tool.meta.keywords,
-        platforms = platforms_json,
-        status = status,
-    );
-
-    Ok(page)
+    Ok(serde_json::to_string_pretty(&data)?)
 }
 
-fn generate_toolz_index(tools: &[FoundTool]) -> Result<String> {
+/// Generate a JSON index of all tools (consumed by website index.tsx)
+fn generate_tools_index_json(tools: &[FoundTool]) -> Result<String> {
     let tools_json: Vec<_> = tools
         .iter()
         .map(|t| {
@@ -5413,6 +5195,7 @@ fn generate_toolz_index(tools: &[FoundTool]) -> Result<String> {
                 "name": t.tool.name,
                 "title": t.tool.title,
                 "tagline": t.tool.tagline,
+                "tagline_de": t.tool.tagline_de,
                 "category": t.tool.category,
                 "language": t.tool.language,
                 "status": t.tool.meta.status.as_deref().unwrap_or("stable"),
@@ -5420,100 +5203,7 @@ fn generate_toolz_index(tools: &[FoundTool]) -> Result<String> {
         })
         .collect();
 
-    let tools_str = serde_json::to_string_pretty(&tools_json)?;
-
-    let page = format!(
-        r#"import Link from "next/link";
-import Navbar from "../../components/Navbar";
-import Footer from "../../components/Footer";
-
-// Auto-generated by `byt website sync`
-const tools = {tools};
-
-function StatusBadge({{ status }}) {{
-  const colors = {{
-    stable: "bg-green-500/20 text-green-400",
-    beta: "bg-yellow-500/20 text-yellow-400",
-    alpha: "bg-orange-500/20 text-orange-400",
-    experimental: "bg-purple-500/20 text-purple-400",
-  }};
-
-  return (
-    <span className={{`text-xs px-2 py-0.5 rounded ${{colors[status] || colors.stable}}`}}>
-      {{status}}
-    </span>
-  );
-}}
-
-function ToolCard({{ tool }}) {{
-  return (
-    <Link href={{`/toolz/${{tool.name}}`}}>
-      <div className="bg-gray-800/50 border border-gray-700 rounded-lg p-6 hover:border-gray-500 hover:bg-gray-800/70 transition-all cursor-pointer group">
-        <div className="flex items-start justify-between mb-3">
-          <h3 className="font-geo text-xl text-white group-hover:text-teal-400 transition-colors">
-            _{{tool.name}}
-          </h3>
-          <StatusBadge status={{tool.status}} />
-        </div>
-        <p className="text-gray-400 text-sm mb-4">{{tool.tagline}}</p>
-        <div className="flex items-center gap-2 text-xs text-gray-500">
-          <span className="bg-gray-700/50 px-2 py-0.5 rounded">{{tool.language}}</span>
-        </div>
-      </div>
-    </Link>
-  );
-}}
-
-export default function ToolzIndex() {{
-  return (
-    <div className="min-h-screen flex flex-col bg-gray-100 dark:bg-gray-900">
-      <Navbar />
-
-      <main className="flex-grow pt-24 px-4 pb-12">
-        <div className="container mx-auto max-w-5xl">
-          {{/* Header */}}
-          <div className="mb-12 text-center">
-            <h1 className="font-geo text-4xl text-white mb-4">_toolz</h1>
-            <p className="text-gray-400 max-w-2xl mx-auto">
-              Open source tools built by byteowlz. Local-first, cross-platform, CLI-first.
-              No cloud dependencies, no subscriptions - your data stays yours.
-            </p>
-          </div>
-
-          {{/* Tool Grid */}}
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-            {{tools.map((tool) => (
-              <ToolCard key={{tool.name}} tool={{tool}} />
-            ))}}
-          </div>
-
-          {{/* Coming Soon */}}
-          <div className="mt-16 text-center">
-            <p className="text-gray-500 text-sm">
-              More tools coming soon. Check our{{" "}}
-              <a
-                href="https://github.com/byteowlz"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="text-teal-500 hover:underline"
-              >
-                GitHub
-              </a>{{" "}}
-              for the latest.
-            </p>
-          </div>
-        </div>
-      </main>
-
-      <Footer />
-    </div>
-  );
-}}
-"#,
-        tools = tools_str
-    );
-
-    Ok(page)
+    Ok(serde_json::to_string_pretty(&tools_json)?)
 }
 
 fn generate_llms_txt(tools: &[FoundTool], site_url: &str) -> String {
