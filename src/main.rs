@@ -98,7 +98,7 @@ enum Command {
     Lint(LintCommand),
     /// Show status of all repositories
     Status(StatusCommand),
-    /// Show ready work from govnr-level beads
+    /// Show ready work from govnr-level trx
     Ready,
     /// Manage memories (via mmry)
     Memory {
@@ -150,7 +150,7 @@ enum Command {
 enum CatalogCommand {
     /// Refresh the catalog by scanning all repositories
     Refresh {
-        /// Include git commit dates and beads issue counts (slower)
+        /// Include git commit dates and trx issue counts (slower)
         #[arg(long)]
         full: bool,
     },
@@ -430,7 +430,7 @@ struct RepoInfo {
     description: Option<String>,
     languages: Vec<String>,
     status: RepoStatus,
-    has_beads: bool,
+    has_trx: bool,
     has_justfile: bool,
     has_agents_md: bool,
     last_commit: Option<String>,
@@ -1037,7 +1037,7 @@ impl Default for AppConfig {
                 ".venv".to_string(),
                 "__pycache__".to_string(),
             ],
-            required_files: vec!["justfile".to_string(), ".beads".to_string()],
+            required_files: vec!["justfile".to_string(), ".trx".to_string()],
             release: ReleaseConfig::default(),
             templates: TemplatesConfig::default(),
             schemas: SchemaConfig::default(),
@@ -1585,7 +1585,7 @@ fn scan_repositories(ctx: &RuntimeContext, full: bool) -> Result<HashMap<String,
 }
 
 fn analyze_repo(path: &Path, name: &str, full: bool) -> Result<RepoInfo> {
-    let has_beads = path.join(".beads").exists();
+    let has_trx = path.join(".trx").exists();
     let has_justfile = path.join("justfile").exists() || path.join("Justfile").exists();
     let has_agents_md = path.join("AGENTS.md").exists();
 
@@ -1617,7 +1617,7 @@ fn analyze_repo(path: &Path, name: &str, full: bool) -> Result<RepoInfo> {
     // Get description from various sources
     let description = get_repo_description(path);
 
-    // Only fetch slow data (git, beads) if --full is specified
+    // Only fetch slow data (git, trx) if --full is specified
     let (last_commit, status, open_issues) = if full {
         let last_commit = get_last_commit_date(path);
 
@@ -1637,8 +1637,8 @@ fn analyze_repo(path: &Path, name: &str, full: bool) -> Result<RepoInfo> {
             None => RepoStatus::Unknown,
         };
 
-        let open_issues = if has_beads {
-            get_beads_open_count(path)
+        let open_issues = if has_trx {
+            get_trx_open_count(path)
         } else {
             None
         };
@@ -1653,7 +1653,7 @@ fn analyze_repo(path: &Path, name: &str, full: bool) -> Result<RepoInfo> {
         description,
         languages,
         status,
-        has_beads,
+        has_trx,
         has_justfile,
         has_agents_md,
         last_commit,
@@ -1710,11 +1710,11 @@ fn get_last_commit_date(path: &Path) -> Option<String> {
     None
 }
 
-fn get_beads_open_count(path: &Path) -> Option<u32> {
+fn get_trx_open_count(path: &Path) -> Option<u32> {
     use std::process::Command;
 
-    let output = Command::new("bd")
-        .args(["list", "--status", "open", "--json"])
+    let output = Command::new("trx")
+        .args(["list", "--json"])
         .current_dir(path)
         .output()
         .ok()?;
@@ -1722,7 +1722,11 @@ fn get_beads_open_count(path: &Path) -> Option<u32> {
     if output.status.success() {
         let content = String::from_utf8_lossy(&output.stdout);
         if let Ok(issues) = serde_json::from_str::<Vec<serde_json::Value>>(&content) {
-            return Some(issues.len() as u32);
+            // Count only open issues
+            let open_count = issues.iter().filter(|i| {
+                i.get("status").and_then(|s| s.as_str()) == Some("open")
+            }).count();
+            return Some(open_count as u32);
         }
     }
 
@@ -1755,13 +1759,13 @@ fn handle_lint(ctx: &RuntimeContext, cmd: LintCommand) -> Result<()> {
             });
         }
 
-        // Rule: Must have .beads for issue tracking
-        if !info.has_beads {
+        // Rule: Must have .trx for issue tracking
+        if !info.has_trx {
             issues.push(LintIssue {
                 repo: name.clone(),
-                rule: "missing-beads".to_string(),
+                rule: "missing-trx".to_string(),
                 severity: Severity::Warning,
-                message: "Repository should use bd (beads) for issue tracking".to_string(),
+                message: "Repository should use trx for issue tracking".to_string(),
             });
         }
 
@@ -1859,7 +1863,7 @@ fn handle_status(ctx: &RuntimeContext, cmd: StatusCommand) -> Result<()> {
         let compliance = format!(
             "{}{}{}",
             if info.has_justfile { "J" } else { "-" },
-            if info.has_beads { "B" } else { "-" },
+            if info.has_trx { "T" } else { "-" },
             if info.has_agents_md { "A" } else { "-" }
         );
 
@@ -1872,7 +1876,7 @@ fn handle_status(ctx: &RuntimeContext, cmd: StatusCommand) -> Result<()> {
     }
 
     println!();
-    println!("Legend: J=justfile, B=beads, A=AGENTS.md");
+    println!("Legend: J=justfile, T=trx, A=AGENTS.md");
     println!(
         "Active: {}, Stale: {}, Total: {}",
         active,
@@ -3953,10 +3957,10 @@ fn handle_new(ctx: &RuntimeContext, cmd: NewCommand) -> Result<()> {
             .output();
     }
 
-    // Initialize beads if not already present
-    if !project_dir.join(".beads").exists() {
-        println!("Initializing beads...");
-        let _ = Command::new("bd")
+    // Initialize trx if not already present
+    if !project_dir.join(".trx").exists() {
+        println!("Initializing trx...");
+        let _ = Command::new("trx")
             .args(["init"])
             .current_dir(&project_dir)
             .output();

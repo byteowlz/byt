@@ -24,7 +24,7 @@ ignore_dirs = [
 # Files required for governance compliance
 required_files = [
     "justfile",
-    ".beads",
+    ".trx",
 ]
 
 # Release and distribution settings

@@ -1,0 +1,29 @@
+{
+  "todos": [
+    {
+      "id": "5d419610",
+      "content": "Replace beads references in src/main.rs",
+      "status": "completed",
+      "priority": "high"
+    },
+    {
+      "id": "fde66615",
+      "content": "Update examples/config.toml",
+      "status": "completed",
+      "priority": "high"
+    },
+    {
+      "id": "0e18359b",
+      "content": "Update examples/config.schema.json",
+      "status": "completed",
+      "priority": "high"
+    },
+    {
+      "id": "73a6e543",
+      "content": "Build and verify",
+      "status": "completed",
+      "priority": "high"
+    }
+  ],
+  "updated_at": "2026-04-02T18:18:22.207Z"
+}
