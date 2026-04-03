@@ -1890,16 +1890,16 @@ fn handle_status(ctx: &RuntimeContext, cmd: StatusCommand) -> Result<()> {
 fn handle_ready(ctx: &RuntimeContext) -> Result<()> {
     use std::process::Command;
 
-    // Use bd ready from the govnr workspace (not scanning all repos)
-    let output = Command::new("bd")
+    // Use trx ready from the govnr workspace (not scanning all repos)
+    let output = Command::new("trx")
         .args(["ready", "--json"])
         .current_dir(ctx.workspace_root())
         .output()
-        .context("running bd ready")?;
+        .context("running trx ready")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("bd ready failed: {}", stderr));
+        return Err(anyhow!("trx ready failed: {}", stderr));
     }
 
     let content = String::from_utf8_lossy(&output.stdout);
@@ -1912,7 +1912,7 @@ fn handle_ready(ctx: &RuntimeContext) -> Result<()> {
 
         if issues.is_empty() {
             println!("No ready work found at govnr level.");
-            println!("Tip: Use 'bd ready' in individual repos for repo-specific work.");
+            println!("Tip: Use 'trx ready' in individual repos for repo-specific work.");
         } else {
             println!("Ready Work (Govnr Level)");
             println!("========================");

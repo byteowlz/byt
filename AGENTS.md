@@ -2,7 +2,7 @@
 
 ## Overview
 
-`byt` is the meta-tool for managing the Byteowlz ecosystem. It provides cross-repository management, governance compliance checking, and integration with key tools (bd, mmry).
+`byt` is the meta-tool for managing the Byteowlz ecosystem. It provides cross-repository management, governance compliance checking, and integration with key tools (trx, mmry).
 
 ## Commands
 

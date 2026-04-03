@@ -32,7 +32,7 @@ byt memory add "content" # Add memory
 
 byt integrates with:
 
-- `bd` for issue tracking
+- `trx` for issue tracking
 - `mmry` for memory management
 
 ## License
