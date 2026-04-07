@@ -415,6 +415,21 @@ enum WebsiteCommand {
 // Catalog Types
 // ============================================================================
 
+/// Repo info with backward compatibility for has_beads (old) vs has_trx (new)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RepoInfo {
+    path: String,
+    description: Option<String>,
+    languages: Vec<String>,
+    status: RepoStatus,
+    #[serde(alias = "has_beads")]
+    has_trx: bool,
+    has_justfile: bool,
+    has_agents_md: bool,
+    last_commit: Option<String>,
+    open_issues: Option<u32>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Catalog {
     #[serde(rename = "$schema")]
@@ -422,19 +437,6 @@ struct Catalog {
     generated: DateTime<Utc>,
     workspace: String,
     repos: HashMap<String, RepoInfo>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct RepoInfo {
-    path: String,
-    description: Option<String>,
-    languages: Vec<String>,
-    status: RepoStatus,
-    has_trx: bool,
-    has_justfile: bool,
-    has_agents_md: bool,
-    last_commit: Option<String>,
-    open_issues: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -3258,17 +3260,38 @@ fn repos_compare(
 
         match output {
             Ok(o) if o.status.success() => {
-                let stdout = String::from_utf8_lossy(&o.stdout);
-                match serde_json::from_str::<MachineStatus>(&stdout) {
-                    Ok(status) => {
-                        if !ctx.common.quiet {
-                            eprintln!("OK");
+                let stdout = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                
+                // Handle various response formats from remote byt
+                if stdout.is_empty() {
+                    if !ctx.common.quiet {
+                        eprintln!("failed: empty response");
+                        if !stderr.is_empty() {
+                            eprintln!("         (stderr: {})", stderr.lines().next().unwrap_or("").trim());
                         }
-                        all_statuses.insert(machine.name.clone(), status);
                     }
-                    Err(e) => {
-                        if !ctx.common.quiet {
-                            eprintln!("parse error: {}", e);
+                } else if stdout == "[]" || stdout.starts_with('[') {
+                    // Remote byt returned an array (likely old version or catalog issue)
+                    if !ctx.common.quiet {
+                        eprintln!("failed: invalid format (received array, expected object)");
+                        eprintln!("         Remote byt may need update: run 'byt catalog refresh' on {}", machine.name);
+                    }
+                } else {
+                    match serde_json::from_str::<MachineStatus>(&stdout) {
+                        Ok(status) => {
+                            if !ctx.common.quiet {
+                                eprintln!("OK");
+                            }
+                            all_statuses.insert(machine.name.clone(), status);
+                        }
+                        Err(e) => {
+                            if !ctx.common.quiet {
+                                eprintln!("parse error: {}", e);
+                                if !stdout.is_empty() && stdout.len() < 200 {
+                                    eprintln!("             received: {}", stdout);
+                                }
+                            }
                         }
                     }
                 }
