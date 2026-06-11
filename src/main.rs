@@ -32,6 +32,7 @@ fn try_main() -> Result<()> {
 
     match cli.command {
         Command::Catalog { command } => handle_catalog(&ctx, command),
+        Command::Current { repo, machines } => handle_current(&ctx, repo, machines),
         Command::Lint(cmd) => handle_lint(&ctx, cmd),
         Command::Status(cmd) => handle_status(&ctx, cmd),
         Command::Ready => handle_ready(&ctx),
@@ -93,6 +94,14 @@ enum Command {
     Catalog {
         #[command(subcommand)]
         command: CatalogCommand,
+    },
+    /// Identify the active/latest repository copy across machines
+    Current {
+        /// Repository name (default: detect from current directory)
+        repo: Option<String>,
+        /// Only check specific machines (default: all configured)
+        #[arg(long, short = 'm')]
+        machines: Vec<String>,
     },
     /// Check governance compliance across repos
     Lint(LintCommand),
@@ -471,6 +480,15 @@ struct RepoAvailability {
     present_on: Vec<String>,
     /// Which machines are missing this repo
     missing_on: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CurrentRepo {
+    name: String,
+    path: String,
+    workspace: String,
+    in_catalog: bool,
+    machine: String,
 }
 
 // ============================================================================
@@ -1059,6 +1077,221 @@ fn handle_catalog(ctx: &RuntimeContext, command: CatalogCommand) -> Result<()> {
         CatalogCommand::List => list_repos(ctx),
         CatalogCommand::Machines { command } => handle_catalog_machines(ctx, command),
     }
+}
+
+fn handle_current(
+    ctx: &RuntimeContext,
+    explicit_repo: Option<String>,
+    explicit_machines: Vec<String>,
+) -> Result<()> {
+    let repo_name = match explicit_repo {
+        Some(repo) => repo,
+        None => detect_current_repo(ctx)?.name,
+    };
+
+    let statuses = collect_repo_status_across_machines(ctx, &repo_name, explicit_machines)?;
+
+    if ctx.common.json {
+        println!("{}", serde_json::to_string_pretty(&statuses)?);
+        return Ok(());
+    }
+
+    print_current_recommendation(&repo_name, &statuses);
+    Ok(())
+}
+
+fn collect_repo_status_across_machines(
+    ctx: &RuntimeContext,
+    repo_name: &str,
+    explicit_machines: Vec<String>,
+) -> Result<Vec<(String, String, RepoStatusInfo)>> {
+    use std::process::Command as ShellCommand;
+
+    let local_name = get_local_machine_name_interactive(&ctx.config.machines)?;
+    let workspace = ctx.workspace_root();
+    let mut statuses = Vec::new();
+
+    statuses.push((
+        local_name.clone(),
+        workspace.join(repo_name).display().to_string(),
+        get_repo_status(&workspace.join(repo_name), repo_name),
+    ));
+
+    let remote_machines: Vec<&Machine> = if !explicit_machines.is_empty() {
+        ctx.config
+            .machines
+            .iter()
+            .filter(|m| explicit_machines.contains(&m.name) && !is_local_machine(m, &local_name))
+            .collect()
+    } else {
+        ctx.config
+            .machines
+            .iter()
+            .filter(|m| !is_local_machine(m, &local_name))
+            .collect()
+    };
+
+    for machine in remote_machines {
+        if !ctx.common.quiet {
+            eprint!("Querying {}... ", machine.name);
+        }
+
+        let workspace_path = machine.workspace.as_deref().unwrap_or("~/byteowlz");
+        let repo_path = format!("{}/{}", workspace_path.trim_end_matches('/'), repo_name);
+        let remote_cmd = format!(
+            "cd {} && ($HOME/.cargo/bin/byt repos status --json 2>/dev/null || byt repos status --json)",
+            workspace_path
+        );
+
+        let port_str = machine.port.to_string();
+        let ssh_host = machine.ssh_host();
+        let mut ssh_args: Vec<&str> = vec!["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"];
+        if machine.port != 22 {
+            ssh_args.extend(["-p", &port_str]);
+        }
+        if let Some(ref identity) = machine.identity_file {
+            ssh_args.extend(["-i", identity]);
+        }
+        ssh_args.push(ssh_host);
+        ssh_args.push(&remote_cmd);
+
+        match ShellCommand::new("ssh").args(&ssh_args).output() {
+            Ok(o) if o.status.success() => {
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                match serde_json::from_str::<MachineStatus>(&stdout) {
+                    Ok(machine_status) => {
+                        if let Some(repo_status) = machine_status
+                            .repos
+                            .into_iter()
+                            .find(|repo| repo.name == repo_name)
+                        {
+                            statuses.push((machine.name.clone(), repo_path, repo_status));
+                        } else {
+                            statuses.push((
+                                machine.name.clone(),
+                                repo_path,
+                                get_missing_repo_status(repo_name),
+                            ));
+                        }
+                        if !ctx.common.quiet {
+                            eprintln!("OK");
+                        }
+                    }
+                    Err(e) => {
+                        if !ctx.common.quiet {
+                            eprintln!("parse error: {}", e);
+                        }
+                    }
+                }
+            }
+            Ok(o) => {
+                if !ctx.common.quiet {
+                    let stderr = String::from_utf8_lossy(&o.stderr);
+                    eprintln!(
+                        "failed: {}",
+                        stderr.lines().next().unwrap_or("unknown error")
+                    );
+                }
+            }
+            Err(e) => {
+                if !ctx.common.quiet {
+                    eprintln!("error: {}", e);
+                }
+            }
+        }
+    }
+
+    Ok(statuses)
+}
+
+fn get_missing_repo_status(repo_name: &str) -> RepoStatusInfo {
+    RepoStatusInfo {
+        name: repo_name.to_string(),
+        exists: false,
+        head_commit: None,
+        head_date: None,
+        branch: None,
+        uncommitted: 0,
+        ahead: 0,
+        behind: 0,
+    }
+}
+
+fn print_current_recommendation(repo_name: &str, statuses: &[(String, String, RepoStatusInfo)]) {
+    let existing: Vec<_> = statuses
+        .iter()
+        .filter(|(_, _, status)| status.exists)
+        .collect();
+    let dirty: Vec<_> = existing
+        .iter()
+        .filter(|(_, _, status)| status.uncommitted > 0)
+        .copied()
+        .collect();
+    let ahead: Vec<_> = existing
+        .iter()
+        .filter(|(_, _, status)| status.ahead > 0)
+        .copied()
+        .collect();
+
+    let recommendation = if dirty.len() > 1 {
+        format!("{}: CONFLICT (dirty on multiple machines)", repo_name)
+    } else if let Some((machine, _, _)) = dirty.first() {
+        format!("{}: use {}", repo_name, machine)
+    } else if ahead.len() > 1 {
+        format!(
+            "{}: CONFLICT (unpushed commits on multiple machines)",
+            repo_name
+        )
+    } else if let Some((machine, _, _)) = ahead.first() {
+        format!("{}: use {}", repo_name, machine)
+    } else if all_existing_same_head(&existing) {
+        format!("{}: synced", repo_name)
+    } else if let Some((machine, _, _)) = newest_by_date(&existing) {
+        format!("{}: likely latest on {}", repo_name, machine)
+    } else {
+        format!("{}: not found", repo_name)
+    };
+
+    println!("{}", recommendation);
+    println!();
+
+    for (machine, path, status) in statuses {
+        if !status.exists {
+            println!("{:<10} {:<35} -", machine, path);
+            continue;
+        }
+
+        let branch = status.branch.as_deref().unwrap_or("?");
+        let head = status.head_commit.as_deref().unwrap_or("?");
+        let dirty = if status.uncommitted > 0 {
+            format!("dirty:{}", status.uncommitted)
+        } else {
+            "clean".to_string()
+        };
+        let sync = format!("ahead:{} behind:{}", status.ahead, status.behind);
+        println!(
+            "{:<10} {:<35} {:<12} {:<8} {:<10} {}",
+            machine, path, branch, head, dirty, sync
+        );
+    }
+}
+
+fn all_existing_same_head(existing: &[&(String, String, RepoStatusInfo)]) -> bool {
+    let heads: Vec<&str> = existing
+        .iter()
+        .filter_map(|(_, _, status)| status.head_commit.as_deref())
+        .collect();
+    !heads.is_empty() && heads.windows(2).all(|w| w[0] == w[1])
+}
+
+fn newest_by_date<'a>(
+    existing: &'a [&'a (String, String, RepoStatusInfo)],
+) -> Option<&'a (String, String, RepoStatusInfo)> {
+    existing
+        .iter()
+        .filter(|(_, _, status)| status.head_date.is_some())
+        .max_by_key(|(_, _, status)| status.head_date.as_deref())
+        .copied()
 }
 
 fn refresh_catalog(ctx: &RuntimeContext, full: bool) -> Result<()> {
@@ -1723,9 +1956,10 @@ fn get_trx_open_count(path: &Path) -> Option<u32> {
         let content = String::from_utf8_lossy(&output.stdout);
         if let Ok(issues) = serde_json::from_str::<Vec<serde_json::Value>>(&content) {
             // Count only open issues
-            let open_count = issues.iter().filter(|i| {
-                i.get("status").and_then(|s| s.as_str()) == Some("open")
-            }).count();
+            let open_count = issues
+                .iter()
+                .filter(|i| i.get("status").and_then(|s| s.as_str()) == Some("open"))
+                .count();
             return Some(open_count as u32);
         }
     }
@@ -2078,6 +2312,57 @@ fn detect_current_project(ctx: &RuntimeContext) -> Result<String> {
     // If at workspace root or outside workspace, use govnr
     info!("At workspace root or outside workspace, using govnr store");
     Ok("govnr".to_string())
+}
+
+/// Identify the active repository copy for the current directory.
+fn detect_current_repo(ctx: &RuntimeContext) -> Result<CurrentRepo> {
+    let cwd = env::current_dir()?;
+    let repo_root = git2::Repository::discover(&cwd)
+        .ok()
+        .and_then(|repo| repo.workdir().map(Path::to_path_buf))
+        .unwrap_or_else(|| cwd.clone());
+    let repo_root = repo_root.canonicalize().unwrap_or(repo_root);
+    let workspace = ctx
+        .workspace_root()
+        .canonicalize()
+        .unwrap_or_else(|_| ctx.workspace_root().to_path_buf());
+
+    let mut name = repo_root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let mut in_catalog = false;
+
+    if let Ok(catalog) = ctx.load_catalog() {
+        for (catalog_name, info) in &catalog.repos {
+            let catalog_path = resolve_repo_path(ctx, &info.path)
+                .canonicalize()
+                .unwrap_or_else(|_| resolve_repo_path(ctx, &info.path));
+            if repo_root == catalog_path || cwd.starts_with(&catalog_path) {
+                name = catalog_name.clone();
+                in_catalog = true;
+                break;
+            }
+        }
+    }
+
+    Ok(CurrentRepo {
+        name,
+        path: repo_root.display().to_string(),
+        workspace: workspace.display().to_string(),
+        in_catalog,
+        machine: get_local_machine_name(&ctx.config.machines),
+    })
+}
+
+fn resolve_repo_path(ctx: &RuntimeContext, path: &str) -> PathBuf {
+    let expanded = expand_path(PathBuf::from(path)).unwrap_or_else(|_| PathBuf::from(path));
+    if expanded.is_absolute() {
+        expanded
+    } else {
+        ctx.workspace_root().join(expanded)
+    }
 }
 
 /// Validate project name against catalog or allow special names
@@ -3507,11 +3792,15 @@ fn repos_clean(
                 if ctx.common.dry_run {
                     if !ctx.common.quiet {
                         let mib = freed_space / 1024 / 1024;
-                        eprintln!("dry-run (would remove debug: {} files, {} MiB)", removed_files, mib);
+                        eprintln!(
+                            "dry-run (would remove debug: {} files, {} MiB)",
+                            removed_files, mib
+                        );
                     }
                 } else {
-                    fs::remove_dir_all(&debug_dir)
-                        .with_context(|| format!("Failed to remove debug directory in {}", repo_name))?;
+                    fs::remove_dir_all(&debug_dir).with_context(|| {
+                        format!("Failed to remove debug directory in {}", repo_name)
+                    })?;
                     if !ctx.common.quiet {
                         let mib = freed_space / 1024 / 1024;
                         eprintln!("✓ Removed debug ({} files, {} MiB)", removed_files, mib);
@@ -3556,17 +3845,21 @@ fn repos_clean(
                         eprintln!("✓ {}", line.trim());
                     }
                     // Parse freed space
-                    if let Some(freed_str) = line.split_whitespace().find(|s| {
-                        s.ends_with("GiB") || s.ends_with("MiB") || s.ends_with("KiB")
-                    }) {
-                        let num_str = freed_str.trim_end_matches("GiB").trim_end_matches("MiB").trim_end_matches("KiB");
+                    if let Some(freed_str) = line
+                        .split_whitespace()
+                        .find(|s| s.ends_with("GiB") || s.ends_with("MiB") || s.ends_with("KiB"))
+                    {
+                        let num_str = freed_str
+                            .trim_end_matches("GiB")
+                            .trim_end_matches("MiB")
+                            .trim_end_matches("KiB");
                         if let Ok(num) = num_str.parse::<f64>() {
                             total_freed += if freed_str.ends_with("GiB") {
-                                (num * 1024.0 * 1024.0 * 1024.0) as u64  // GiB to bytes
+                                (num * 1024.0 * 1024.0 * 1024.0) as u64 // GiB to bytes
                             } else if freed_str.ends_with("MiB") {
-                                (num * 1024.0 * 1024.0) as u64  // MiB to bytes
+                                (num * 1024.0 * 1024.0) as u64 // MiB to bytes
                             } else {
-                                (num * 1024.0) as u64  // KiB to bytes
+                                (num * 1024.0) as u64 // KiB to bytes
                             };
                         }
                     }
@@ -5222,7 +5515,11 @@ fn generate_tools_index_json(tools: &[FoundTool]) -> Result<String> {
                 if s.starts_with("http") {
                     s.clone()
                 } else {
-                    format!("/toolz/{}/{}", t.tool.name, s.split('/').last().unwrap_or(s))
+                    format!(
+                        "/toolz/{}/{}",
+                        t.tool.name,
+                        s.split('/').last().unwrap_or(s)
+                    )
                 }
             });
             serde_json::json!({

@@ -16,6 +16,11 @@ byt catalog refresh      # Scan repos, generate CATALOG.json
 byt catalog show         # Display catalog
 byt catalog list         # List repo names
 
+# Current repo / active copy
+byt current              # Detect repo from current dir and compare across machines
+byt current mmry         # Show which machine likely has the active mmry copy
+byt current mmry --json  # Machine-readable cross-machine status
+
 # Governance
 byt lint                 # Check compliance across repos
 byt status               # Show repo status matrix
