@@ -1,0 +1,19 @@
+# byt's own release — dogfoods the reusable workflow (ADR-0021/0022).
+# On a v* tag, build + checksum + publish byt's artifacts via the builder image.
+# (Requires the image to exist first; see image.yml for the bootstrap.)
+#
+# Once the reusable workflow is promoted to byteowlz/.github, change the `uses:`
+# below to `byteowlz/.github/.github/workflows/release.yml@v1`.
+name: byt release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  release:
+    permissions:
+      contents: write
+      packages: read
+    uses: ./.github/workflows/release.yml
+    secrets: inherit
