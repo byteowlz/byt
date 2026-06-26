@@ -1,0 +1,43 @@
+# Reusable release workflow (ADR-0021/0022).
+#
+# CANONICAL HOME: byteowlz/.github/.github/workflows/release.yml
+# This copy lives in the byt repo so byt can dogfood it (see byt-release.yml) and
+# so it is reviewed alongside `byt release`. Promote it to byteowlz/.github, then
+# consumer repos call it with:
+#
+#   jobs:
+#     release:
+#       uses: byteowlz/.github/.github/workflows/release.yml@v1
+#       secrets: inherit
+#
+# The job runs inside the prebuilt builder image (byt + toolchain), so the only
+# step is `byt release run` (build all targets -> checksums.txt -> gh release).
+name: release
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag (defaults to the triggering git tag)
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  packages: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/byteowlz/byt:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: byt release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REF_NAME: ${{ inputs.tag || github.ref_name }}
+        run: byt release run

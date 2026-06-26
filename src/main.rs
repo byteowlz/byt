@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 
 const APP_NAME: &str = env!("CARGO_PKG_NAME");
 
+mod release;
+
 fn main() {
     if let Err(err) = try_main() {
         let _ = writeln!(io::stderr(), "{err:?}");
@@ -45,6 +47,7 @@ fn try_main() -> Result<()> {
         Command::Schema { command } => handle_schema(&ctx, command),
         Command::DesignSystem { command } => handle_design_system(&ctx, command),
         Command::Website { command } => handle_website(&ctx, command),
+        Command::Release { command } => release::handle_release(&ctx, command),
         Command::Completions { shell } => handle_completions(shell),
     }
 }
@@ -144,6 +147,11 @@ enum Command {
     Website {
         #[command(subcommand)]
         command: WebsiteCommand,
+    },
+    /// Build + publish spec-conformant release artifacts (ADR-0021)
+    Release {
+        #[command(subcommand)]
+        command: release::ReleaseCommand,
     },
     /// Generate shell completions
     Completions {
@@ -1821,9 +1829,10 @@ fn get_trx_open_count(path: &Path) -> Option<u32> {
         let content = String::from_utf8_lossy(&output.stdout);
         if let Ok(issues) = serde_json::from_str::<Vec<serde_json::Value>>(&content) {
             // Count only open issues
-            let open_count = issues.iter().filter(|i| {
-                i.get("status").and_then(|s| s.as_str()) == Some("open")
-            }).count();
+            let open_count = issues
+                .iter()
+                .filter(|i| i.get("status").and_then(|s| s.as_str()) == Some("open"))
+                .count();
             return Some(open_count as u32);
         }
     }
@@ -3358,20 +3367,26 @@ fn repos_compare(
             Ok(o) if o.status.success() => {
                 let stdout = String::from_utf8_lossy(&o.stdout).trim().to_string();
                 let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
-                
+
                 // Handle various response formats from remote byt
                 if stdout.is_empty() {
                     if !ctx.common.quiet {
                         eprintln!("failed: empty response");
                         if !stderr.is_empty() {
-                            eprintln!("         (stderr: {})", stderr.lines().next().unwrap_or("").trim());
+                            eprintln!(
+                                "         (stderr: {})",
+                                stderr.lines().next().unwrap_or("").trim()
+                            );
                         }
                     }
                 } else if stdout == "[]" || stdout.starts_with('[') {
                     // Remote byt returned an array (likely old version or catalog issue)
                     if !ctx.common.quiet {
                         eprintln!("failed: invalid format (received array, expected object)");
-                        eprintln!("         Remote byt may need update: run 'byt catalog refresh' on {}", machine.name);
+                        eprintln!(
+                            "         Remote byt may need update: run 'byt catalog refresh' on {}",
+                            machine.name
+                        );
                     }
                 } else {
                     match serde_json::from_str::<MachineStatus>(&stdout) {
@@ -3626,11 +3641,15 @@ fn repos_clean(
                 if ctx.common.dry_run {
                     if !ctx.common.quiet {
                         let mib = freed_space / 1024 / 1024;
-                        eprintln!("dry-run (would remove debug: {} files, {} MiB)", removed_files, mib);
+                        eprintln!(
+                            "dry-run (would remove debug: {} files, {} MiB)",
+                            removed_files, mib
+                        );
                     }
                 } else {
-                    fs::remove_dir_all(&debug_dir)
-                        .with_context(|| format!("Failed to remove debug directory in {}", repo_name))?;
+                    fs::remove_dir_all(&debug_dir).with_context(|| {
+                        format!("Failed to remove debug directory in {}", repo_name)
+                    })?;
                     if !ctx.common.quiet {
                         let mib = freed_space / 1024 / 1024;
                         eprintln!("✓ Removed debug ({} files, {} MiB)", removed_files, mib);
@@ -3675,17 +3694,21 @@ fn repos_clean(
                         eprintln!("✓ {}", line.trim());
                     }
                     // Parse freed space
-                    if let Some(freed_str) = line.split_whitespace().find(|s| {
-                        s.ends_with("GiB") || s.ends_with("MiB") || s.ends_with("KiB")
-                    }) {
-                        let num_str = freed_str.trim_end_matches("GiB").trim_end_matches("MiB").trim_end_matches("KiB");
+                    if let Some(freed_str) = line
+                        .split_whitespace()
+                        .find(|s| s.ends_with("GiB") || s.ends_with("MiB") || s.ends_with("KiB"))
+                    {
+                        let num_str = freed_str
+                            .trim_end_matches("GiB")
+                            .trim_end_matches("MiB")
+                            .trim_end_matches("KiB");
                         if let Ok(num) = num_str.parse::<f64>() {
                             total_freed += if freed_str.ends_with("GiB") {
-                                (num * 1024.0 * 1024.0 * 1024.0) as u64  // GiB to bytes
+                                (num * 1024.0 * 1024.0 * 1024.0) as u64 // GiB to bytes
                             } else if freed_str.ends_with("MiB") {
-                                (num * 1024.0 * 1024.0) as u64  // MiB to bytes
+                                (num * 1024.0 * 1024.0) as u64 // MiB to bytes
                             } else {
-                                (num * 1024.0) as u64  // KiB to bytes
+                                (num * 1024.0) as u64 // KiB to bytes
                             };
                         }
                     }
@@ -4848,11 +4871,9 @@ fn schema_list(ctx: &RuntimeContext) -> Result<()> {
 
 fn handle_design_system(ctx: &RuntimeContext, command: DesignSystemCommand) -> Result<()> {
     match command {
-        DesignSystemCommand::Sync {
-            repo,
-            r#ref,
-            build,
-        } => design_system_sync(ctx, repo, r#ref, build),
+        DesignSystemCommand::Sync { repo, r#ref, build } => {
+            design_system_sync(ctx, repo, r#ref, build)
+        }
         DesignSystemCommand::Status => design_system_status(ctx),
         DesignSystemCommand::List => design_system_list(ctx),
     }
@@ -4927,7 +4948,10 @@ fn design_system_sync(
                 ctx.config.design_system.manifest
             );
         } else {
-            println!("No matching design-system consumers for: {:?}", filter_repos);
+            println!(
+                "No matching design-system consumers for: {:?}",
+                filter_repos
+            );
         }
         return Ok(());
     }
@@ -4959,7 +4983,10 @@ fn design_system_sync_one(
     );
 
     if ctx.common.dry_run {
-        println!("  dry-run: would fetch and vendor into {}", consumer.dest.display());
+        println!(
+            "  dry-run: would fetch and vendor into {}",
+            consumer.dest.display()
+        );
         return Ok(());
     }
 
@@ -5036,7 +5063,12 @@ fn design_system_sync_one(
     fs::write(consumer.dest.join("VENDORED.md"), stamp)
         .with_context(|| format!("writing VENDORED.md in {}", consumer.dest.display()))?;
 
-    println!("  vendored {} ({}) — sha {}", git_ref, consumer.impl_dir, short_sha(&sha));
+    println!(
+        "  vendored {} ({}) — sha {}",
+        git_ref,
+        consumer.impl_dir,
+        short_sha(&sha)
+    );
 
     cleanup();
 
@@ -5126,7 +5158,10 @@ fn design_system_list(ctx: &RuntimeContext) -> Result<()> {
             None => format!("{} (not yet synced)", consumer.git_ref),
         };
         println!("  {} -> {}", consumer.repo, pinned);
-        println!("    source: {} (impls/{})", consumer.source, consumer.impl_dir);
+        println!(
+            "    source: {} (impls/{})",
+            consumer.source, consumer.impl_dir
+        );
         println!("    path:   {}", consumer.dest.display());
         println!();
     }
@@ -5785,7 +5820,11 @@ fn generate_tools_index_json(tools: &[FoundTool]) -> Result<String> {
                 if s.starts_with("http") {
                     s.clone()
                 } else {
-                    format!("/toolz/{}/{}", t.tool.name, s.split('/').last().unwrap_or(s))
+                    format!(
+                        "/toolz/{}/{}",
+                        t.tool.name,
+                        s.split('/').last().unwrap_or(s)
+                    )
                 }
             });
             serde_json::json!({
