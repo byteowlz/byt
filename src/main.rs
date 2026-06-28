@@ -745,15 +745,24 @@ fn default_ssh_port() -> u16 {
     22
 }
 
-/// Get the XDG state directory for byt
-fn get_state_dir() -> Result<PathBuf> {
-    if let Some(dir) = env::var_os("XDG_STATE_HOME").filter(|v| !v.is_empty()) {
-        return Ok(PathBuf::from(dir).join(APP_NAME));
+/// Resolve a base directory: an explicit XDG_* var wins on any OS; otherwise
+/// ~/<unix_rel> on unix (incl. macOS — deliberately NOT ~/Library for a CLI
+/// tool), or %win_var% on Windows. Zero-dependency (no `dirs` crate).
+fn base_dir(xdg_var: &str, unix_rel: &str, win_var: &str) -> Result<PathBuf> {
+    if let Some(dir) = env::var_os(xdg_var).filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(dir));
     }
+    let base = if cfg!(windows) {
+        env::var_os(win_var).map(PathBuf::from)
+    } else {
+        env::var_os("HOME").map(|h| PathBuf::from(h).join(unix_rel))
+    };
+    base.ok_or_else(|| anyhow!("unable to determine base directory ({xdg_var})"))
+}
 
-    dirs::home_dir()
-        .map(|home| home.join(".local").join("state").join(APP_NAME))
-        .ok_or_else(|| anyhow!("unable to determine state directory"))
+/// Get the state directory for byt.
+fn get_state_dir() -> Result<PathBuf> {
+    Ok(base_dir("XDG_STATE_HOME", ".local/state", "LOCALAPPDATA")?.join(APP_NAME))
 }
 
 /// Get the path to the machine identity state file
@@ -6078,18 +6087,7 @@ fn expand_path(path: PathBuf) -> Result<PathBuf> {
 }
 
 fn default_config_dir() -> Result<PathBuf> {
-    if let Some(dir) = env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
-        return Ok(PathBuf::from(dir).join(APP_NAME));
-    }
-
-    if let Some(mut dir) = dirs::config_dir() {
-        dir.push(APP_NAME);
-        return Ok(dir);
-    }
-
-    dirs::home_dir()
-        .map(|home| home.join(".config").join(APP_NAME))
-        .ok_or_else(|| anyhow!("unable to determine configuration directory"))
+    Ok(base_dir("XDG_CONFIG_HOME", ".config", "APPDATA")?.join(APP_NAME))
 }
 
 fn discover_workspace_root() -> Result<PathBuf> {
