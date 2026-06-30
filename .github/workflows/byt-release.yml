@@ -2,8 +2,8 @@
 # On a v* tag, build + checksum + publish byt's artifacts via the builder image.
 # (Requires the image to exist first; see image.yml for the bootstrap.)
 #
-# Once the reusable workflow is promoted to byteowlz/.github, change the `uses:`
-# below to `byteowlz/.github/.github/workflows/release.yml@v1`.
+# byt uses its own in-repo reusable workflow (./.github/workflows/release.yml);
+# other repos reference byteowlz/byt/.github/workflows/release.yml@<tag>.
 name: byt release
 
 on:
