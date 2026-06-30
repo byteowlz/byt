@@ -1,13 +1,11 @@
 # Reusable release workflow (ADR-0021/0022).
 #
-# CANONICAL HOME: byteowlz/.github/.github/workflows/release.yml
-# This copy lives in the byt repo so byt can dogfood it (see byt-release.yml) and
-# so it is reviewed alongside `byt release`. Promote it to byteowlz/.github, then
-# consumer repos call it with:
+# CANONICAL HOME: this file — byteowlz/byt/.github/workflows/release.yml.
+# byt is public, so any byteowlz repo (public or private) calls it directly:
 #
 #   jobs:
 #     release:
-#       uses: byteowlz/.github/.github/workflows/release.yml@v1
+#       uses: byteowlz/byt/.github/workflows/release.yml@v0.5.2
 #       secrets: inherit
 #
 # The job runs inside the prebuilt builder image (byt + toolchain), so the only
