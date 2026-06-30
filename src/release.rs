@@ -28,6 +28,10 @@ const DIST_DIR: &str = "dist/release";
 const CONFIG_FILE: &str = "byt.release.toml";
 const DEFAULT_EXTRA: &[&str] = &["LICENSE", "README.md"];
 const DEFAULT_TARGETS: &[&str] = &["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"];
+/// glibc floor for linux-gnu release artifacts (ADR-0021): built via
+/// `cargo-zigbuild --target <triple>.<floor>` so binaries run on older systems
+/// (RHEL8 / Ubuntu 18.04+). Dynamic-link only — host's patched glibc at runtime.
+const GLIBC_FLOOR: &str = "2.28";
 
 #[derive(Debug, clap::Subcommand)]
 pub enum ReleaseCommand {
@@ -297,14 +301,27 @@ fn copy_file(ctx: &RuntimeContext, src: &Path, dest: &Path) -> Result<()> {
 
 // ---- compile backends (the only language-specific step) -------------------
 
+/// The target passed to `cargo zigbuild`: linux-gnu targets get a glibc floor
+/// (`<triple>.<GLIBC_FLOOR>`) so the artifact runs on older systems; other
+/// targets are unchanged. The rust output dir + artifact name keep the plain
+/// triple (cargo-zigbuild strips the glibc suffix for cargo).
+fn zig_build_target(triple: &str) -> String {
+    if triple.ends_with("-linux-gnu") {
+        format!("{triple}.{GLIBC_FLOOR}")
+    } else {
+        triple.to_string()
+    }
+}
+
 fn compile_rust(ctx: &RuntimeContext, root: &Path, triple: &str) -> Result<()> {
-    // cargo-zigbuild gives reliable cross-compilation from a Linux host.
+    // cargo-zigbuild cross-compiles from a Linux host; linux-gnu gets a glibc
+    // floor (ADR-0021) so the binary runs on older targets.
     let mut cmd = Command::new("cargo");
     cmd.current_dir(root)
         .arg("zigbuild")
         .arg("--release")
         .arg("--target")
-        .arg(triple);
+        .arg(zig_build_target(triple));
     run(ctx, &mut cmd)
 }
 
@@ -531,6 +548,26 @@ mod tests {
         assert_eq!(
             staging_dirname("mmry", "0.11.0", "x86_64-unknown-linux-gnu"),
             "mmry-v0.11.0-x86_64-unknown-linux-gnu"
+        );
+    }
+
+    #[test]
+    fn zig_build_target_floors_linux_gnu_only() {
+        assert_eq!(
+            zig_build_target("x86_64-unknown-linux-gnu"),
+            "x86_64-unknown-linux-gnu.2.28"
+        );
+        assert_eq!(
+            zig_build_target("aarch64-unknown-linux-gnu"),
+            "aarch64-unknown-linux-gnu.2.28"
+        );
+        assert_eq!(
+            zig_build_target("aarch64-apple-darwin"),
+            "aarch64-apple-darwin"
+        );
+        assert_eq!(
+            zig_build_target("x86_64-unknown-linux-musl"),
+            "x86_64-unknown-linux-musl"
         );
     }
 
