@@ -8,8 +8,16 @@
 #       uses: byteowlz/byt/.github/workflows/release.yml@v0.5.2
 #       secrets: inherit
 #
-# The job runs inside the prebuilt builder image (byt + toolchain), so the only
-# step is `byt release run` (build all targets -> checksums.txt -> gh release).
+# The job runs inside the prebuilt builder image (byt + toolchain): mint a
+# short-lived GitHub App token for the Homebrew tap dispatch, then
+# `byt release run` (build all targets -> checksums.txt -> gh release ->
+# Homebrew dispatch + AUR push, per each repo's byt.release.toml).
+#
+# Auth (ADR-0021): Homebrew/Scoop publish via repository_dispatch authorized by
+# the byteowlz-release GitHub App (org secrets RELEASE_APP_ID +
+# RELEASE_APP_PRIVATE_KEY); AUR publishes inline over SSH (org secrets
+# AUR_SSH_PRIVATE_KEY + AUR_EMAIL). Repos with no [release.homebrew]/[release.aur]
+# simply skip those steps.
 name: release
 
 on:
@@ -34,8 +42,24 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
+      # Short-lived token for the Homebrew tap dispatch. continue-on-error so a
+      # repo without the App secrets (or that doesn't publish to Homebrew) still
+      # ships its GitHub artifacts; a repo that DOES publish will fail loudly at
+      # the dispatch step when the token is empty.
+      - name: Mint Homebrew tap token
+        id: tap-token
+        continue-on-error: true
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: byteowlz
+          repositories: homebrew-tap
       - name: byt release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REF_NAME: ${{ inputs.tag || github.ref_name }}
+          HOMEBREW_TAP_TOKEN: ${{ steps.tap-token.outputs.token }}
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          AUR_EMAIL: ${{ secrets.AUR_EMAIL }}
         run: byt release run

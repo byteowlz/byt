@@ -17,8 +17,9 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::RuntimeContext;
 
@@ -54,8 +55,15 @@ pub enum ReleaseCommand {
         /// Directory containing *.tar.gz + checksums.txt.
         path: PathBuf,
     },
-    /// Full pipeline: build all targets + checksums + publish.
+    /// Full pipeline: build all targets + checksums + publish + packages.
     Run {
+        /// Release tag (default: $GITHUB_REF_NAME or v{version}).
+        #[arg(long)]
+        tag: Option<String>,
+    },
+    /// Publish downstream packages (Homebrew dispatch + AUR) for a release that
+    /// already exists; reads shas from the local `dist/release/checksums.txt`.
+    Packages {
         /// Release tag (default: $GITHUB_REF_NAME or v{version}).
         #[arg(long)]
         tag: Option<String>,
@@ -95,7 +103,75 @@ struct ReleaseSection {
     /// Sign checksums.txt (not yet implemented).
     #[serde(default)]
     sign: bool,
+    /// Homebrew publishing (opt-in). Fires a `repository_dispatch` at the tap.
+    #[serde(default)]
+    homebrew: Option<Homebrew>,
+    /// AUR publishing (opt-in). Generates PKGBUILD + .SRCINFO and pushes to AUR.
+    #[serde(default)]
+    aur: Option<Aur>,
 }
+
+/// `[release.homebrew]` — publish by dispatching to the tap repo, which owns
+/// formula generation. byt only fires the event (with the App token).
+#[derive(Debug, Deserialize)]
+struct Homebrew {
+    /// Tap repo (`owner/name`).
+    #[serde(default = "default_tap")]
+    tap: String,
+    /// Formula name; defaults to the release `name`.
+    #[serde(default)]
+    formula: Option<String>,
+    /// `repository_dispatch` event type the tap's workflow listens for.
+    #[serde(default = "default_event_type")]
+    event_type: String,
+}
+
+/// `[release.aur]` — publish the `-bin` package to the AUR. byt generates a
+/// PKGBUILD + .SRCINFO for the current release artifacts and pushes over SSH;
+/// no Arch tooling (`makepkg`) is required since every field is known here.
+#[derive(Debug, Deserialize)]
+struct Aur {
+    /// AUR package name; defaults to `{name}-bin`.
+    #[serde(default)]
+    pkgname: Option<String>,
+    /// `pkgdesc` — required (there is no sensible default).
+    pkgdesc: String,
+    /// SPDX-ish license id for the `license=()` field.
+    #[serde(default = "default_license")]
+    license: String,
+    /// Upstream URL; defaults to `https://github.com/{GITHUB_REPOSITORY}`.
+    #[serde(default)]
+    url: Option<String>,
+    /// `provides=()`; defaults to `[name]`.
+    #[serde(default)]
+    provides: Vec<String>,
+    /// `conflicts=()`; defaults to `[name]`.
+    #[serde(default)]
+    conflicts: Vec<String>,
+    /// `# Maintainer:` line; defaults to a generic byteowlz maintainer.
+    #[serde(default = "default_maintainer")]
+    maintainer: String,
+}
+
+fn default_tap() -> String {
+    "byteowlz/homebrew-tap".to_string()
+}
+fn default_event_type() -> String {
+    "update-formula".to_string()
+}
+fn default_license() -> String {
+    "MIT".to_string()
+}
+fn default_maintainer() -> String {
+    "byteowlz <dev@byteowlz.com>".to_string()
+}
+
+/// (CARCH, target-triple) pairs byt publishes to the AUR. A source is emitted
+/// only when its artifact exists in `checksums.txt`.
+const AUR_ARCHES: &[(&str, &str)] = &[
+    ("x86_64", "x86_64-unknown-linux-gnu"),
+    ("aarch64", "aarch64-unknown-linux-gnu"),
+];
 
 impl ReleaseSection {
     fn targets(&self) -> Vec<String> {
@@ -498,6 +574,372 @@ fn verify(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+// ---- downstream packages (Homebrew + AUR) ---------------------------------
+
+/// One AUR arch source: CARCH + the triple whose artifact backs it + its sha256.
+struct AurArch {
+    carch: &'static str,
+    triple: &'static str,
+    sha: String,
+}
+
+/// The `owner/name` this release belongs to (Homebrew payload + AUR URLs).
+fn resolve_repo() -> Result<String> {
+    std::env::var("GITHUB_REPOSITORY")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .context("GITHUB_REPOSITORY not set (needed for Homebrew/AUR publishing)")
+}
+
+/// Parse `dist/release/checksums.txt` into `(filename, sha256)` pairs.
+fn read_checksums(dist: &Path) -> Result<Vec<(String, String)>> {
+    let path = dist.join("checksums.txt");
+    let text = fs::read_to_string(&path).with_context(|| {
+        format!(
+            "reading {} (run `byt release checksums` first)",
+            path.display()
+        )
+    })?;
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        if let (Some(sha), Some(name)) = (it.next(), it.next()) {
+            out.push((name.trim_start_matches('*').to_string(), sha.to_string()));
+        }
+    }
+    Ok(out)
+}
+
+/// Run a command feeding `input` on stdin (used for `gh api --input -`).
+fn run_stdin(ctx: &RuntimeContext, cmd: &mut Command, input: &str) -> Result<()> {
+    if ctx.common.dry_run {
+        println!("  [dry-run] {} <<< {input}", render(cmd));
+        return Ok(());
+    }
+    cmd.stdin(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("spawning `{}`", render(cmd)))?;
+    {
+        let mut stdin = child.stdin.take().context("capturing stdin")?;
+        stdin.write_all(input.as_bytes())?;
+    }
+    let status = child.wait()?;
+    if !status.success() {
+        bail!("command failed: `{}`", render(cmd));
+    }
+    Ok(())
+}
+
+/// Homebrew: fire a `repository_dispatch` at the tap; the tap owns formula
+/// generation. Authorized by the GitHub App token in `$HOMEBREW_TAP_TOKEN`
+/// (the default `GITHUB_TOKEN` cannot write to the tap repo).
+fn publish_homebrew(
+    ctx: &RuntimeContext,
+    hb: &Homebrew,
+    name: &str,
+    version: &str,
+    repo: &str,
+) -> Result<()> {
+    let formula = hb.formula.clone().unwrap_or_else(|| name.to_string());
+    let payload = serde_json::json!({
+        "event_type": hb.event_type,
+        "client_payload": { "formula": formula, "version": format!("v{version}"), "repo": repo },
+    });
+    let body = serde_json::to_string(&payload)?;
+
+    let mut cmd = Command::new("gh");
+    cmd.arg("api")
+        .arg("--method")
+        .arg("POST")
+        .arg(format!("/repos/{}/dispatches", hb.tap))
+        .arg("--input")
+        .arg("-");
+    match std::env::var("HOMEBREW_TAP_TOKEN") {
+        Ok(tok) if !tok.is_empty() => {
+            cmd.env("GH_TOKEN", tok);
+        }
+        _ if ctx.common.dry_run => {}
+        _ => bail!(
+            "HOMEBREW_TAP_TOKEN not set — the tap dispatch needs the release App token \
+             (the default GITHUB_TOKEN cannot write to {})",
+            hb.tap
+        ),
+    }
+    run_stdin(ctx, &mut cmd, &body)?;
+    println!("  dispatched {formula} formula update -> {}", hb.tap);
+    Ok(())
+}
+
+fn quoted_list(items: &[String]) -> String {
+    items
+        .iter()
+        .map(|s| format!("'{s}'"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Effective `provides`/`conflicts` (default to `[name]` when unset).
+fn aur_provides(name: &str, aur: &Aur) -> Vec<String> {
+    if aur.provides.is_empty() {
+        vec![name.to_string()]
+    } else {
+        aur.provides.clone()
+    }
+}
+fn aur_conflicts(name: &str, aur: &Aur) -> Vec<String> {
+    if aur.conflicts.is_empty() {
+        vec![name.to_string()]
+    } else {
+        aur.conflicts.clone()
+    }
+}
+
+/// Generate a `PKGBUILD` for the `-bin` package. Sources point at the GitHub
+/// release tarballs; `package()` installs from `*/bin/` to match byt's staging
+/// layout (`{name}-v{ver}-{triple}/bin/<exes>`).
+#[allow(clippy::too_many_arguments)]
+fn pkgbuild_body(
+    name: &str,
+    version: &str,
+    pkgname: &str,
+    aur: &Aur,
+    url: &str,
+    dl_base: &str,
+    arches: &[AurArch],
+    bins: &[String],
+) -> String {
+    use std::fmt::Write;
+    let arch_list = arches
+        .iter()
+        .map(|a| format!("'{}'", a.carch))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut s = String::new();
+    let _ = writeln!(s, "# Maintainer: {}", aur.maintainer);
+    let _ = writeln!(s, "pkgname={pkgname}");
+    let _ = writeln!(s, "pkgver={version}");
+    let _ = writeln!(s, "pkgrel=1");
+    let _ = writeln!(s, "pkgdesc=\"{}\"", aur.pkgdesc);
+    let _ = writeln!(s, "arch=({arch_list})");
+    let _ = writeln!(s, "url=\"{url}\"");
+    let _ = writeln!(s, "license=('{}')", aur.license);
+    let _ = writeln!(s, "provides=({})", quoted_list(&aur_provides(name, aur)));
+    let _ = writeln!(s, "conflicts=({})", quoted_list(&aur_conflicts(name, aur)));
+    for a in arches {
+        let fname = archive_filename(name, version, a.triple);
+        let _ = writeln!(
+            s,
+            "source_{c}=(\"{pkgname}-{version}-{c}.tar.gz::{dl_base}/{fname}\")",
+            c = a.carch
+        );
+        let _ = writeln!(s, "sha256sums_{}=('{}')", a.carch, a.sha);
+    }
+    let _ = writeln!(s, "\npackage() {{");
+    let _ = writeln!(s, "    cd \"$srcdir\"");
+    for bin in bins {
+        let _ = writeln!(
+            s,
+            "    install -Dm755 */bin/{bin} \"$pkgdir/usr/bin/{bin}\""
+        );
+    }
+    let _ = writeln!(s, "}}");
+    s
+}
+
+/// Generate `.SRCINFO` for the same package (deterministic — no `makepkg`).
+fn srcinfo_body(
+    name: &str,
+    version: &str,
+    pkgname: &str,
+    aur: &Aur,
+    url: &str,
+    dl_base: &str,
+    arches: &[AurArch],
+) -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    let _ = writeln!(s, "pkgbase = {pkgname}");
+    let _ = writeln!(s, "\tpkgdesc = {}", aur.pkgdesc);
+    let _ = writeln!(s, "\tpkgver = {version}");
+    let _ = writeln!(s, "\tpkgrel = 1");
+    let _ = writeln!(s, "\turl = {url}");
+    for a in arches {
+        let _ = writeln!(s, "\tarch = {}", a.carch);
+    }
+    let _ = writeln!(s, "\tlicense = {}", aur.license);
+    for p in aur_provides(name, aur) {
+        let _ = writeln!(s, "\tprovides = {p}");
+    }
+    for c in aur_conflicts(name, aur) {
+        let _ = writeln!(s, "\tconflicts = {c}");
+    }
+    for a in arches {
+        let fname = archive_filename(name, version, a.triple);
+        let _ = writeln!(
+            s,
+            "\tsource_{c} = {pkgname}-{version}-{c}.tar.gz::{dl_base}/{fname}",
+            c = a.carch
+        );
+        let _ = writeln!(s, "\tsha256sums_{} = {}", a.carch, a.sha);
+    }
+    let _ = writeln!(s, "\npkgname = {pkgname}");
+    s
+}
+
+fn ensure_trailing_newline(s: &str) -> String {
+    if s.ends_with('\n') {
+        s.to_string()
+    } else {
+        format!("{s}\n")
+    }
+}
+
+/// Run a git subcommand in `dir` with the AUR SSH command configured.
+fn git_in(ctx: &RuntimeContext, dir: &Path, args: &[&str], ssh_cmd: &str) -> Result<()> {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(dir).env("GIT_SSH_COMMAND", ssh_cmd);
+    cmd.args(args);
+    run(ctx, &mut cmd)
+}
+
+/// AUR: generate PKGBUILD + .SRCINFO for the release artifacts and push over
+/// SSH (key from `$AUR_SSH_PRIVATE_KEY`). Inline in the release run so a failed
+/// AUR publish fails the release (single log, synchronous — ADR-0021).
+fn publish_aur(
+    ctx: &RuntimeContext,
+    cfg: &ReleaseSection,
+    aur: &Aur,
+    version: &str,
+    repo: &str,
+    dist: &Path,
+) -> Result<()> {
+    let pkgname = aur
+        .pkgname
+        .clone()
+        .unwrap_or_else(|| format!("{}-bin", cfg.name));
+    let url = aur
+        .url
+        .clone()
+        .unwrap_or_else(|| format!("https://github.com/{repo}"));
+    let dl_base = format!("https://github.com/{repo}/releases/download/v{version}");
+
+    // Match each linux-gnu arch to its published sha256; skip arches not built.
+    let checks = read_checksums(dist).unwrap_or_default();
+    let mut arches = Vec::new();
+    for &(carch, triple) in AUR_ARCHES {
+        let fname = archive_filename(&cfg.name, version, triple);
+        if let Some((_, sha)) = checks.iter().find(|(n, _)| n == &fname) {
+            arches.push(AurArch {
+                carch,
+                triple,
+                sha: sha.clone(),
+            });
+        }
+    }
+    if arches.is_empty() && !ctx.common.dry_run {
+        bail!("no linux-gnu artifacts in checksums.txt to publish to AUR");
+    }
+
+    let bins = cfg.bins();
+    let pkgbuild = pkgbuild_body(
+        &cfg.name, version, &pkgname, aur, &url, &dl_base, &arches, &bins,
+    );
+    let srcinfo = srcinfo_body(&cfg.name, version, &pkgname, aur, &url, &dl_base, &arches);
+
+    if ctx.common.dry_run {
+        println!(
+            "  [dry-run] AUR {pkgname} v{version}:\n{pkgbuild}\n----- .SRCINFO -----\n{srcinfo}"
+        );
+        return Ok(());
+    }
+
+    let key = std::env::var("AUR_SSH_PRIVATE_KEY")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .context("AUR_SSH_PRIVATE_KEY not set (needed to push to AUR)")?;
+    let email = std::env::var("AUR_EMAIL").unwrap_or_else(|_| "dev@byteowlz.com".to_string());
+
+    let work = std::env::temp_dir().join(format!("byt-aur-{pkgname}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&work);
+    fs::create_dir_all(&work)?;
+    let keyfile = work.join("aur_key");
+    fs::write(&keyfile, ensure_trailing_newline(&key))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&keyfile, fs::Permissions::from_mode(0o600))?;
+    }
+    let known = work.join("known_hosts");
+    fs::write(&known, "")?;
+    let ssh_cmd = format!(
+        "ssh -i {} -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile={}",
+        keyfile.display(),
+        known.display()
+    );
+
+    let repo_dir = work.join("pkg");
+    let mut clone = Command::new("git");
+    clone
+        .arg("clone")
+        .arg(format!("ssh://aur@aur.archlinux.org/{pkgname}.git"))
+        .arg(&repo_dir)
+        .env("GIT_SSH_COMMAND", &ssh_cmd);
+    run(ctx, &mut clone)?;
+
+    fs::write(repo_dir.join("PKGBUILD"), &pkgbuild)?;
+    fs::write(repo_dir.join(".SRCINFO"), &srcinfo)?;
+
+    git_in(ctx, &repo_dir, &["add", "PKGBUILD", ".SRCINFO"], &ssh_cmd)?;
+    let clean = Command::new("git")
+        .current_dir(&repo_dir)
+        .args(["diff", "--cached", "--quiet"])
+        .status()?
+        .success();
+    if clean {
+        println!("  AUR: no changes for {pkgname} v{version}, skipping push");
+        let _ = fs::remove_dir_all(&work);
+        return Ok(());
+    }
+    git_in(
+        ctx,
+        &repo_dir,
+        &["config", "user.name", "byteowlz"],
+        &ssh_cmd,
+    )?;
+    git_in(ctx, &repo_dir, &["config", "user.email", &email], &ssh_cmd)?;
+    git_in(
+        ctx,
+        &repo_dir,
+        &["commit", "-m", &format!("Update to v{version}")],
+        &ssh_cmd,
+    )?;
+    git_in(ctx, &repo_dir, &["push"], &ssh_cmd)?;
+    println!("  published {pkgname} v{version} to AUR");
+    let _ = fs::remove_dir_all(&work);
+    Ok(())
+}
+
+/// Publish all configured downstream packages after the GitHub release exists.
+fn publish_packages(
+    ctx: &RuntimeContext,
+    cfg: &ReleaseSection,
+    version: &str,
+    dist: &Path,
+) -> Result<()> {
+    if cfg.homebrew.is_none() && cfg.aur.is_none() {
+        return Ok(());
+    }
+    let repo = resolve_repo()?;
+    if let Some(hb) = &cfg.homebrew {
+        publish_homebrew(ctx, hb, &cfg.name, version, &repo)?;
+    }
+    if let Some(aur) = &cfg.aur {
+        publish_aur(ctx, cfg, aur, version, &repo, dist)?;
+    }
+    Ok(())
+}
+
 // ---- dispatch -------------------------------------------------------------
 
 pub fn handle_release(ctx: &RuntimeContext, command: ReleaseCommand) -> Result<()> {
@@ -530,7 +972,13 @@ pub fn handle_release(ctx: &RuntimeContext, command: ReleaseCommand) -> Result<(
                 build_target(ctx, &cfg, &root, &version, &triple, &dist)?;
             }
             generate_checksums(ctx, &dist)?;
-            publish(ctx, &cfg, &version, tag.as_deref(), &dist)
+            publish(ctx, &cfg, &version, tag.as_deref(), &dist)?;
+            publish_packages(ctx, &cfg, &version, &dist)
+        }
+        ReleaseCommand::Packages { tag } => {
+            let cfg = load_config(&root)?;
+            let version = resolve_version(&cfg, tag.as_deref(), &root)?;
+            publish_packages(ctx, &cfg, &version, &dist)
         }
     }
 }
@@ -633,5 +1081,79 @@ mod tests {
         fs::write(dir.join("checksums.txt"), body).unwrap();
         verify(&dir).unwrap();
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn sample_aur() -> Aur {
+        Aur {
+            pkgname: Some("trx-bin".into()),
+            pkgdesc: "Minimal git-backed issue tracker".into(),
+            license: "MIT".into(),
+            url: None,
+            provides: vec!["trx".into()],
+            conflicts: vec!["trx".into(), "trx-git".into()],
+            maintainer: "byteowlz <dev@byteowlz.com>".into(),
+        }
+    }
+
+    #[test]
+    fn pkgbuild_matches_bin_layout_and_arches() {
+        let arches = vec![AurArch {
+            carch: "x86_64",
+            triple: "x86_64-unknown-linux-gnu",
+            sha: "deadbeef".into(),
+        }];
+        let body = pkgbuild_body(
+            "trx",
+            "0.6.3",
+            "trx-bin",
+            &sample_aur(),
+            "https://github.com/byteowlz/trx",
+            "https://github.com/byteowlz/trx/releases/download/v0.6.3",
+            &arches,
+            &["trx".into(), "trx-tui".into()],
+        );
+        assert!(body.contains("pkgname=trx-bin"));
+        assert!(body.contains("pkgver=0.6.3"));
+        assert!(body.contains("arch=('x86_64')"));
+        assert!(body.contains("conflicts=('trx' 'trx-git')"));
+        // source renames the download but points at the spec artifact name
+        assert!(body.contains(
+            "source_x86_64=(\"trx-bin-0.6.3-x86_64.tar.gz::https://github.com/byteowlz/trx/releases/download/v0.6.3/trx-v0.6.3-x86_64-unknown-linux-gnu.tar.gz\")"
+        ));
+        assert!(body.contains("sha256sums_x86_64=('deadbeef')"));
+        // installs from */bin to match byt's staging layout
+        assert!(body.contains("install -Dm755 */bin/trx \"$pkgdir/usr/bin/trx\""));
+        assert!(body.contains("install -Dm755 */bin/trx-tui \"$pkgdir/usr/bin/trx-tui\""));
+    }
+
+    #[test]
+    fn srcinfo_lists_each_arch_and_provide() {
+        let arches = vec![
+            AurArch {
+                carch: "x86_64",
+                triple: "x86_64-unknown-linux-gnu",
+                sha: "aa".into(),
+            },
+            AurArch {
+                carch: "aarch64",
+                triple: "aarch64-unknown-linux-gnu",
+                sha: "bb".into(),
+            },
+        ];
+        let body = srcinfo_body(
+            "trx",
+            "0.6.3",
+            "trx-bin",
+            &sample_aur(),
+            "https://github.com/byteowlz/trx",
+            "https://github.com/byteowlz/trx/releases/download/v0.6.3",
+            &arches,
+        );
+        assert!(body.starts_with("pkgbase = trx-bin\n"));
+        assert!(body.contains("\tarch = x86_64\n"));
+        assert!(body.contains("\tarch = aarch64\n"));
+        assert!(body.contains("\tprovides = trx\n"));
+        assert!(body.contains("\tsha256sums_aarch64 = bb\n"));
+        assert!(body.trim_end().ends_with("pkgname = trx-bin"));
     }
 }
