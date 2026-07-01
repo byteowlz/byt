@@ -41,6 +41,17 @@ pub enum ReleaseCommand {
         /// Build a single target triple instead of all configured ones.
         #[arg(long)]
         target: Option<String>,
+        /// Only build configured targets for this OS (`linux`/`macos`/`windows`).
+        /// Lets the hybrid CI split build linux in-container and macOS natively.
+        #[arg(long)]
+        os: Option<String>,
+    },
+    /// Print configured target triples (optionally filtered by `--os`), one per
+    /// line. Used by CI to decide whether a per-OS build job is needed.
+    Targets {
+        /// Filter to targets for this OS (`linux`/`macos`/`windows`).
+        #[arg(long)]
+        os: Option<String>,
     },
     /// Generate checksums.txt over the dist directory.
     Checksums,
@@ -205,6 +216,32 @@ fn archive_filename(name: &str, version: &str, triple: &str) -> String {
 
 fn staging_dirname(name: &str, version: &str, triple: &str) -> String {
     format!("{name}-v{version}-{triple}")
+}
+
+/// Coarse OS bucket for a target triple (for the hybrid CI's per-OS build jobs).
+fn os_of(triple: &str) -> &'static str {
+    if triple.contains("linux") {
+        "linux"
+    } else if triple.contains("apple") || triple.contains("darwin") {
+        "macos"
+    } else if triple.contains("windows") {
+        "windows"
+    } else {
+        "other"
+    }
+}
+
+/// Resolve which triples to build: an explicit `--target` wins; otherwise the
+/// configured targets, optionally filtered to one `--os`.
+fn select_targets(cfg: &ReleaseSection, target: Option<String>, os: Option<&str>) -> Vec<String> {
+    if let Some(t) = target {
+        return vec![t];
+    }
+    let all = cfg.targets();
+    match os {
+        Some(os) => all.into_iter().filter(|t| os_of(t) == os).collect(),
+        None => all,
+    }
 }
 
 /// Map a Rust target triple to the Go `GOOS`/`GOARCH` the Go backend needs.
@@ -390,14 +427,24 @@ fn zig_build_target(triple: &str) -> String {
 }
 
 fn compile_rust(ctx: &RuntimeContext, root: &Path, triple: &str) -> Result<()> {
-    // cargo-zigbuild cross-compiles from a Linux host; linux-gnu gets a glibc
-    // floor (ADR-0021) so the binary runs on older targets.
     let mut cmd = Command::new("cargo");
-    cmd.current_dir(root)
-        .arg("zigbuild")
-        .arg("--release")
-        .arg("--target")
-        .arg(zig_build_target(triple));
+    cmd.current_dir(root);
+    if triple.ends_with("-linux-gnu") {
+        // linux-gnu is built in the Linux container and needs the glibc floor
+        // (ADR-0021), so it goes through cargo-zigbuild.
+        cmd.arg("zigbuild")
+            .arg("--release")
+            .arg("--target")
+            .arg(zig_build_target(triple));
+    } else {
+        // Everything else (notably *-apple-darwin) is built natively on its own
+        // runner: plain cargo avoids zig's macOS-framework linking pitfalls and
+        // there is no glibc floor to apply.
+        cmd.arg("build")
+            .arg("--release")
+            .arg("--target")
+            .arg(triple);
+    }
     run(ctx, &mut cmd)
 }
 
@@ -946,15 +993,19 @@ pub fn handle_release(ctx: &RuntimeContext, command: ReleaseCommand) -> Result<(
     let root = std::env::current_dir().context("getting current directory")?;
     let dist = root.join(DIST_DIR);
     match command {
-        ReleaseCommand::Build { target } => {
+        ReleaseCommand::Build { target, os } => {
             let cfg = load_config(&root)?;
             let version = resolve_version(&cfg, None, &root)?;
-            let targets = match target {
-                Some(t) => vec![t],
-                None => cfg.targets(),
-            };
+            let targets = select_targets(&cfg, target, os.as_deref());
             for triple in targets {
                 build_target(ctx, &cfg, &root, &version, &triple, &dist)?;
+            }
+            Ok(())
+        }
+        ReleaseCommand::Targets { os } => {
+            let cfg = load_config(&root)?;
+            for triple in select_targets(&cfg, None, os.as_deref()) {
+                println!("{triple}");
             }
             Ok(())
         }
@@ -1081,6 +1132,43 @@ mod tests {
         fs::write(dir.join("checksums.txt"), body).unwrap();
         verify(&dir).unwrap();
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn os_of_and_select_targets_filter_by_os() {
+        assert_eq!(os_of("x86_64-unknown-linux-gnu"), "linux");
+        assert_eq!(os_of("aarch64-apple-darwin"), "macos");
+        assert_eq!(os_of("x86_64-pc-windows-msvc"), "windows");
+        let cfg = ReleaseSection {
+            name: "x".into(),
+            lang: Lang::Rust,
+            bins: vec![],
+            version: None,
+            targets: vec![
+                "x86_64-unknown-linux-gnu".into(),
+                "aarch64-unknown-linux-gnu".into(),
+                "aarch64-apple-darwin".into(),
+            ],
+            extra: vec![],
+            sign: false,
+            homebrew: None,
+            aur: None,
+        };
+        assert_eq!(
+            select_targets(&cfg, None, Some("linux")),
+            vec![
+                "x86_64-unknown-linux-gnu".to_string(),
+                "aarch64-unknown-linux-gnu".to_string()
+            ]
+        );
+        assert_eq!(
+            select_targets(&cfg, None, Some("macos")),
+            vec!["aarch64-apple-darwin".to_string()]
+        );
+        assert_eq!(
+            select_targets(&cfg, Some("custom".into()), Some("linux")),
+            vec!["custom".to_string()]
+        );
     }
 
     fn sample_aur() -> Aur {
