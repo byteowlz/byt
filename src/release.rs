@@ -328,16 +328,25 @@ fn load_config(root: &Path) -> Result<ReleaseSection> {
     Ok(cfg.release)
 }
 
-/// Resolve the release version: explicit `--tag` → `$GITHUB_REF_NAME` →
-/// `[release].version` → `Cargo.toml`. All forms are normalized without a `v`.
+/// Resolve the release version: explicit `--tag` → `$RELEASE_TAG` →
+/// `$GITHUB_REF_NAME` → `[release].version` → `Cargo.toml`. All forms are
+/// normalized without a leading `v`.
+///
+/// `RELEASE_TAG` is checked before `GITHUB_REF_NAME` because the latter is a
+/// reserved variable that GitHub Actions refuses to let a workflow override: on
+/// a `workflow_dispatch` run it is the *branch* (e.g. `master`), not the release
+/// tag, so relying on it silently mis-versions dispatched releases. CI sets the
+/// non-reserved `RELEASE_TAG` to the intended tag instead.
 fn resolve_version(cfg: &ReleaseSection, tag: Option<&str>, root: &Path) -> Result<String> {
     if let Some(tag) = tag {
         return Ok(strip_v(tag));
     }
-    if let Ok(reff) = std::env::var("GITHUB_REF_NAME")
-        && !reff.is_empty()
-    {
-        return Ok(strip_v(&reff));
+    for key in ["RELEASE_TAG", "GITHUB_REF_NAME"] {
+        if let Ok(reff) = std::env::var(key)
+            && !reff.is_empty()
+        {
+            return Ok(strip_v(&reff));
+        }
     }
     if let Some(version) = &cfg.version {
         return Ok(strip_v(version));
@@ -349,7 +358,7 @@ fn resolve_version(cfg: &ReleaseSection, tag: Option<&str>, root: &Path) -> Resu
             return Ok(version);
         }
     }
-    bail!("could not resolve version: pass --tag, set [release].version, or $GITHUB_REF_NAME")
+    bail!("could not resolve version: pass --tag, set [release].version, or $RELEASE_TAG")
 }
 
 // ---- command execution ----------------------------------------------------
@@ -943,6 +952,12 @@ fn publish_aur(
         .env("GIT_SSH_COMMAND", &ssh_cmd);
     run(ctx, &mut clone)?;
 
+    // AUR packages live on `master`. A fresh package clones as an empty repo
+    // (unborn HEAD) and even an existing one can land detached; pin a branch so
+    // the later `git push` has one to push. -B is a no-op on an already-correct
+    // checkout and creates/repoints master otherwise.
+    git_in(ctx, &repo_dir, &["checkout", "-B", "master"], &ssh_cmd)?;
+
     fs::write(repo_dir.join("PKGBUILD"), &pkgbuild)?;
     fs::write(repo_dir.join(".SRCINFO"), &srcinfo)?;
 
@@ -970,7 +985,7 @@ fn publish_aur(
         &["commit", "-m", &format!("Update to v{version}")],
         &ssh_cmd,
     )?;
-    git_in(ctx, &repo_dir, &["push"], &ssh_cmd)?;
+    git_in(ctx, &repo_dir, &["push", "origin", "HEAD:master"], &ssh_cmd)?;
     println!("  published {pkgname} v{version} to AUR");
     let _ = fs::remove_dir_all(&work);
     Ok(())
