@@ -131,6 +131,9 @@ jobs:
           AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
           AUR_EMAIL: ${{ secrets.AUR_EMAIL }}
         run: |
+          # The checkout is owned by a different UID than the container user;
+          # trust it so any git invocation (gh repo detection etc.) works.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           byt release checksums
           byt release publish
           byt release packages
