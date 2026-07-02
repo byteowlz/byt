@@ -78,9 +78,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-apple-darwin,aarch64-apple-darwin
-      - name: Install byt
-        # darwin builds natively (plain cargo), so no zig/zigbuild needed here.
-        run: cargo install --locked --git https://github.com/byteowlz/byt byt
+      - name: Install byt (prebuilt macOS binary)
+        # Download byt's own macOS release instead of compiling it every run.
+        # (The first byt darwin release bootstrapped via `cargo install`; from
+        # here on the mac job just fetches the prebuilt binary — near-instant.)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          case "$(uname -m)" in
+            arm64|aarch64) triple=aarch64-apple-darwin ;;
+            x86_64)        triple=x86_64-apple-darwin ;;
+            *) echo "unsupported macOS arch: $(uname -m)" >&2; exit 1 ;;
+          esac
+          gh release download --repo byteowlz/byt --pattern "byt-*-${triple}.tar.gz" --dir /tmp/byt-dl
+          tar -xzf /tmp/byt-dl/byt-*-"${triple}".tar.gz -C /tmp/byt-dl
+          sudo install -m755 /tmp/byt-dl/*/bin/byt /usr/local/bin/byt
+          byt --version
       - name: Build macOS targets
         env:
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
