@@ -102,6 +102,11 @@ struct ReleaseSection {
     /// Binaries to ship; defaults to `[name]` when empty.
     #[serde(default)]
     bins: Vec<String>,
+    /// Go only: per-binary main-package path override (`bin = "./path"`). When a
+    /// bin is absent here byt auto-detects `./cmd/{bin}` if that dir exists, else
+    /// the module root `.` (single-binary modules like sx). Ignored for Rust.
+    #[serde(default)]
+    go_main: std::collections::BTreeMap<String, String>,
     /// Version override; resolved from tag/Cargo.toml when absent.
     #[serde(default)]
     version: Option<String>,
@@ -472,6 +477,11 @@ fn compile_go(
 ) -> Result<()> {
     let (goos, goarch) = go_target(triple)?;
     for bin in cfg.bins() {
+        let pkg = go_main_package(
+            cfg.go_main.get(&bin),
+            root.join("cmd").join(&bin).is_dir(),
+            &bin,
+        );
         let mut cmd = Command::new("go");
         cmd.current_dir(root)
             .env("GOOS", goos)
@@ -480,11 +490,23 @@ fn compile_go(
             .arg("build")
             .arg("-o")
             .arg(bin_dir.join(&bin))
-            // convention: each shipped binary has a `./cmd/<bin>` main package.
-            .arg(format!("./cmd/{bin}"));
+            .arg(&pkg);
         run(ctx, &mut cmd)?;
     }
     Ok(())
+}
+
+/// Resolve a Go binary's main-package path: an explicit `go_main` override wins;
+/// otherwise `./cmd/{bin}` when that dir exists (multi-binary layout, e.g.
+/// scrpr), else the module root `.` (single-binary modules, e.g. sx).
+fn go_main_package(override_path: Option<&String>, cmd_dir_exists: bool, bin: &str) -> String {
+    if let Some(p) = override_path {
+        p.clone()
+    } else if cmd_dir_exists {
+        format!("./cmd/{bin}")
+    } else {
+        ".".to_string()
+    }
 }
 
 // ---- pipeline -------------------------------------------------------------
@@ -1173,6 +1195,17 @@ mod tests {
     }
 
     #[test]
+    fn go_main_package_prefers_override_then_cmd_then_root() {
+        let ov = "./tools/sx".to_string();
+        // explicit override always wins
+        assert_eq!(go_main_package(Some(&ov), true, "sx"), "./tools/sx");
+        // multi-binary layout: ./cmd/<bin> exists
+        assert_eq!(go_main_package(None, true, "scrpr"), "./cmd/scrpr");
+        // single-binary module (sx): main lives at the module root
+        assert_eq!(go_main_package(None, false, "sx"), ".");
+    }
+
+    #[test]
     fn checksums_body_is_sorted_and_formatted() {
         let body = checksums_body(&[
             ("b.tar.gz".into(), "22".into()),
@@ -1224,6 +1257,7 @@ mod tests {
             name: "x".into(),
             lang: Lang::Rust,
             bins: vec![],
+            go_main: std::collections::BTreeMap::new(),
             version: None,
             targets: vec![
                 "x86_64-unknown-linux-gnu".into(),
