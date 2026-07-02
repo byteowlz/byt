@@ -586,31 +586,53 @@ fn publish(
         );
     }
 
-    let mut cmd = Command::new("gh");
-    cmd.arg("release")
-        .arg("create")
-        .arg(&tag)
-        .arg("--title")
-        .arg(&tag)
-        .arg("--generate-notes");
-    // In CI, target the repo explicitly so `gh` does not have to detect it from
-    // the working-directory git checkout — which fails under container-job UID
-    // mismatches ("dubious ownership"). Locally, GITHUB_REPOSITORY is unset and
-    // gh falls back to the cwd repo as before.
-    if let Ok(repo) = std::env::var("GITHUB_REPOSITORY")
-        && !repo.is_empty()
-    {
-        cmd.arg("--repo").arg(repo);
-    }
+    // Assets: every .tar.gz in dist + checksums.txt.
+    let mut assets: Vec<PathBuf> = Vec::new();
     if dist.exists() {
         for entry in fs::read_dir(dist)? {
             let path = entry?.path();
             if path.extension().and_then(|e| e.to_str()) == Some("gz") {
-                cmd.arg(&path);
+                assets.push(path);
             }
         }
     }
-    cmd.arg(&checksums);
+    assets.push(checksums);
+
+    // In CI, target the repo explicitly so `gh` does not have to detect it from
+    // the working-directory git checkout — which fails under container-job UID
+    // mismatches ("dubious ownership"). Locally, GITHUB_REPOSITORY is unset and
+    // gh falls back to the cwd repo as before.
+    let repo_args: Vec<String> = std::env::var("GITHUB_REPOSITORY")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|r| vec!["--repo".to_string(), r])
+        .unwrap_or_default();
+
+    // Idempotent: if the release already exists (e.g. a re-run after a later
+    // step failed), update its assets instead of failing on `create`.
+    let exists = !ctx.common.dry_run && {
+        let mut check = Command::new("gh");
+        check.args(["release", "view", &tag]);
+        check.args(&repo_args);
+        check.stdout(Stdio::null()).stderr(Stdio::null());
+        check.status().map(|s| s.success()).unwrap_or(false)
+    };
+
+    let mut cmd = Command::new("gh");
+    if exists {
+        cmd.arg("release").arg("upload").arg(&tag);
+        cmd.args(&assets);
+        cmd.arg("--clobber");
+    } else {
+        cmd.arg("release")
+            .arg("create")
+            .arg(&tag)
+            .arg("--title")
+            .arg(&tag)
+            .arg("--generate-notes");
+        cmd.args(&assets);
+    }
+    cmd.args(&repo_args);
     run(ctx, &mut cmd)?;
     println!("  published {} {tag}", cfg.name);
     Ok(())
@@ -952,11 +974,27 @@ fn publish_aur(
         .env("GIT_SSH_COMMAND", &ssh_cmd);
     run(ctx, &mut clone)?;
 
-    // AUR packages live on `master`. A fresh package clones as an empty repo
-    // (unborn HEAD) and even an existing one can land detached; pin a branch so
-    // the later `git push` has one to push. -B is a no-op on an already-correct
-    // checkout and creates/repoints master otherwise.
-    git_in(ctx, &repo_dir, &["checkout", "-B", "master"], &ssh_cmd)?;
+    // AUR's remote HEAD is not a symbolic ref, so `git clone` lands on a
+    // detached HEAD. Base our branch explicitly on origin/master (the real tip)
+    // when the package already exists, so the push fast-forwards; for a brand-new
+    // package origin/master is absent and we start a fresh master.
+    let has_master = Command::new("git")
+        .current_dir(&repo_dir)
+        .args(["rev-parse", "--verify", "--quiet", "origin/master"])
+        .stdout(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if has_master {
+        git_in(
+            ctx,
+            &repo_dir,
+            &["checkout", "-B", "master", "origin/master"],
+            &ssh_cmd,
+        )?;
+    } else {
+        git_in(ctx, &repo_dir, &["checkout", "-B", "master"], &ssh_cmd)?;
+    }
 
     fs::write(repo_dir.join("PKGBUILD"), &pkgbuild)?;
     fs::write(repo_dir.join(".SRCINFO"), &srcinfo)?;
