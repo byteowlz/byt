@@ -4,5 +4,13 @@
 name = "byt"
 lang = "rust"
 bins = ["byt"]
-targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+# darwin targets so byt ships a macOS binary — the reusable workflow's macOS job
+# can then download it instead of `cargo install`-ing byt from source each run
+# (the first byt release with these targets bootstraps via cargo install once).
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
 # extra defaults to ["LICENSE", "README.md"]; sign defaults to false.
