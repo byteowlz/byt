@@ -159,6 +159,12 @@ struct Aur {
     /// `conflicts=()`; defaults to `[name]`.
     #[serde(default)]
     conflicts: Vec<String>,
+    /// `depends=()` runtime dependencies; omitted when empty.
+    #[serde(default)]
+    depends: Vec<String>,
+    /// `optdepends=()` optional dependencies (`'pkg: reason'`); omitted when empty.
+    #[serde(default)]
+    optdepends: Vec<String>,
     /// `# Maintainer:` line; defaults to a generic byteowlz maintainer.
     #[serde(default = "default_maintainer")]
     maintainer: String,
@@ -766,20 +772,15 @@ fn quoted_list(items: &[String]) -> String {
         .join(" ")
 }
 
-/// Effective `provides`/`conflicts` (default to `[name]` when unset).
-fn aur_provides(name: &str, aur: &Aur) -> Vec<String> {
-    if aur.provides.is_empty() {
-        vec![name.to_string()]
-    } else {
-        aur.provides.clone()
-    }
+/// Effective `provides`/`conflicts`. Empty means the field is omitted entirely
+/// — a bare bin package (pkgname == binary) declares neither, and forcing
+/// `provides=(foo)`/`conflicts=(foo)` on package `foo` is a self-reference
+/// namcap flags. `-bin` packages set these explicitly in `byt.release.toml`.
+fn aur_provides(_name: &str, aur: &Aur) -> Vec<String> {
+    aur.provides.clone()
 }
-fn aur_conflicts(name: &str, aur: &Aur) -> Vec<String> {
-    if aur.conflicts.is_empty() {
-        vec![name.to_string()]
-    } else {
-        aur.conflicts.clone()
-    }
+fn aur_conflicts(_name: &str, aur: &Aur) -> Vec<String> {
+    aur.conflicts.clone()
 }
 
 /// Generate a `PKGBUILD` for the `-bin` package. Sources point at the GitHub
@@ -811,8 +812,20 @@ fn pkgbuild_body(
     let _ = writeln!(s, "arch=({arch_list})");
     let _ = writeln!(s, "url=\"{url}\"");
     let _ = writeln!(s, "license=('{}')", aur.license);
-    let _ = writeln!(s, "provides=({})", quoted_list(&aur_provides(name, aur)));
-    let _ = writeln!(s, "conflicts=({})", quoted_list(&aur_conflicts(name, aur)));
+    let provides = aur_provides(name, aur);
+    if !provides.is_empty() {
+        let _ = writeln!(s, "provides=({})", quoted_list(&provides));
+    }
+    let conflicts = aur_conflicts(name, aur);
+    if !conflicts.is_empty() {
+        let _ = writeln!(s, "conflicts=({})", quoted_list(&conflicts));
+    }
+    if !aur.depends.is_empty() {
+        let _ = writeln!(s, "depends=({})", quoted_list(&aur.depends));
+    }
+    if !aur.optdepends.is_empty() {
+        let _ = writeln!(s, "optdepends=({})", quoted_list(&aur.optdepends));
+    }
     for a in arches {
         let fname = archive_filename(name, version, a.triple);
         let _ = writeln!(
@@ -860,6 +873,12 @@ fn srcinfo_body(
     }
     for c in aur_conflicts(name, aur) {
         let _ = writeln!(s, "\tconflicts = {c}");
+    }
+    for d in &aur.depends {
+        let _ = writeln!(s, "\tdepends = {d}");
+    }
+    for d in &aur.optdepends {
+        let _ = writeln!(s, "\toptdepends = {d}");
     }
     for a in arches {
         let fname = archive_filename(name, version, a.triple);
@@ -1241,6 +1260,8 @@ mod tests {
             url: None,
             provides: vec!["trx".into()],
             conflicts: vec!["trx".into(), "trx-git".into()],
+            depends: vec![],
+            optdepends: vec![],
             maintainer: "byteowlz <dev@byteowlz.com>".into(),
         }
     }
@@ -1274,6 +1295,44 @@ mod tests {
         // installs from */bin to match byt's staging layout
         assert!(body.contains("install -Dm755 */bin/trx \"$pkgdir/usr/bin/trx\""));
         assert!(body.contains("install -Dm755 */bin/trx-tui \"$pkgdir/usr/bin/trx-tui\""));
+        // no depends/optdepends emitted when the config leaves them empty
+        assert!(!body.contains("depends=("));
+        assert!(!body.contains("optdepends=("));
+    }
+
+    #[test]
+    fn pkgbuild_emits_depends_and_optdepends_when_set() {
+        let arches = vec![AurArch {
+            carch: "x86_64",
+            triple: "x86_64-unknown-linux-gnu",
+            sha: "deadbeef".into(),
+        }];
+        let mut aur = sample_aur();
+        aur.depends = vec!["typst".into()];
+        aur.optdepends = vec!["cuda: GPU acceleration".into()];
+        let body = pkgbuild_body(
+            "tmpltr",
+            "0.3.1",
+            "tmpltr-bin",
+            &aur,
+            "https://github.com/byteowlz/tmpltr",
+            "https://github.com/byteowlz/tmpltr/releases/download/v0.3.1",
+            &arches,
+            &["tmpltr".into()],
+        );
+        assert!(body.contains("depends=('typst')"));
+        assert!(body.contains("optdepends=('cuda: GPU acceleration')"));
+        let srcinfo = srcinfo_body(
+            "tmpltr",
+            "0.3.1",
+            "tmpltr-bin",
+            &aur,
+            "https://github.com/byteowlz/tmpltr",
+            "https://github.com/byteowlz/tmpltr/releases/download/v0.3.1",
+            &arches,
+        );
+        assert!(srcinfo.contains("\tdepends = typst"));
+        assert!(srcinfo.contains("\toptdepends = cuda: GPU acceleration"));
     }
 
     #[test]
