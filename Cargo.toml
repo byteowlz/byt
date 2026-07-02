@@ -1,6 +1,6 @@
 [package]
 name = "byt"
-version = "0.5.2"
+version = "0.5.3"
 edition = "2024"
 description = "Byteowlz meta-tool for cross-repo management, catalog generation, and governance"
 authors = ["Byteowlz"]
