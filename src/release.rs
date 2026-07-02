@@ -584,6 +584,15 @@ fn publish(
         .arg("--title")
         .arg(&tag)
         .arg("--generate-notes");
+    // In CI, target the repo explicitly so `gh` does not have to detect it from
+    // the working-directory git checkout — which fails under container-job UID
+    // mismatches ("dubious ownership"). Locally, GITHUB_REPOSITORY is unset and
+    // gh falls back to the cwd repo as before.
+    if let Ok(repo) = std::env::var("GITHUB_REPOSITORY")
+        && !repo.is_empty()
+    {
+        cmd.arg("--repo").arg(repo);
+    }
     if dist.exists() {
         for entry in fs::read_dir(dist)? {
             let path = entry?.path();
