@@ -244,13 +244,27 @@ fn os_of(triple: &str) -> &'static str {
 
 /// Resolve which triples to build: an explicit `--target` wins; otherwise the
 /// configured targets, optionally filtered to one `--os`.
+/// Which build host compiles `triple`. For Rust this is the target's own OS
+/// (darwin needs a macOS runner — zig can't safely link Apple frameworks). Go
+/// builds with `CGO_ENABLED=0`, so it cross-compiles *every* target from the
+/// linux container — no macOS runner is ever needed.
+fn build_host_os(cfg: &ReleaseSection, triple: &str) -> &'static str {
+    match cfg.lang {
+        Lang::Go => "linux",
+        _ => os_of(triple),
+    }
+}
+
 fn select_targets(cfg: &ReleaseSection, target: Option<String>, os: Option<&str>) -> Vec<String> {
     if let Some(t) = target {
         return vec![t];
     }
     let all = cfg.targets();
     match os {
-        Some(os) => all.into_iter().filter(|t| os_of(t) == os).collect(),
+        Some(os) => all
+            .into_iter()
+            .filter(|t| build_host_os(cfg, t) == os)
+            .collect(),
         None => all,
     }
 }
@@ -488,6 +502,10 @@ fn compile_go(
             .env("GOARCH", goarch)
             .env("CGO_ENABLED", "0")
             .arg("build")
+            // Release binaries don't need VCS stamping, and it fails inside the
+            // container: git refuses the checkout (owned by a different UID) with
+            // "error obtaining VCS status: exit status 128".
+            .arg("-buildvcs=false")
             .arg("-o")
             .arg(bin_dir.join(&bin))
             .arg(&pkg);
@@ -1284,6 +1302,22 @@ mod tests {
             select_targets(&cfg, Some("custom".into()), Some("linux")),
             vec!["custom".to_string()]
         );
+
+        // Go cross-compiles every target from the container: darwin routes to
+        // the linux build host, and the macOS runner is never requested.
+        let go_cfg = ReleaseSection {
+            lang: Lang::Go,
+            ..cfg
+        };
+        assert_eq!(
+            select_targets(&go_cfg, None, Some("linux")),
+            vec![
+                "x86_64-unknown-linux-gnu".to_string(),
+                "aarch64-unknown-linux-gnu".to_string(),
+                "aarch64-apple-darwin".to_string(),
+            ]
+        );
+        assert!(select_targets(&go_cfg, None, Some("macos")).is_empty());
     }
 
     fn sample_aur() -> Aur {
