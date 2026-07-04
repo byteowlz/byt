@@ -1025,13 +1025,29 @@ fn publish_aur(
     );
 
     let repo_dir = work.join("pkg");
+    let remote = format!("ssh://aur@aur.archlinux.org/{pkgname}.git");
     let mut clone = Command::new("git");
     clone
         .arg("clone")
-        .arg(format!("ssh://aur@aur.archlinux.org/{pkgname}.git"))
+        .arg(&remote)
         .arg(&repo_dir)
         .env("GIT_SSH_COMMAND", &ssh_cmd);
-    run(ctx, &mut clone)?;
+    if run(ctx, &mut clone).is_err() {
+        // A brand-new package can't be cloned: AUR only serves `upload-pack`
+        // (fetch) for a pkgbase that already exists — a new one is created by
+        // the first `push`. Start a fresh repo pointing at the AUR remote; the
+        // push below creates the package (with the pushing account as maintainer).
+        println!("  AUR: {pkgname} not found on AUR; creating it as a new package");
+        let _ = fs::remove_dir_all(&repo_dir);
+        fs::create_dir_all(&repo_dir)?;
+        git_in(ctx, &repo_dir, &["init"], &ssh_cmd)?;
+        git_in(
+            ctx,
+            &repo_dir,
+            &["remote", "add", "origin", &remote],
+            &ssh_cmd,
+        )?;
+    }
 
     // AUR's remote HEAD is not a symbolic ref, so `git clone` lands on a
     // detached HEAD. Base our branch explicitly on origin/master (the real tip)
