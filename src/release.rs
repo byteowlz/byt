@@ -107,6 +107,11 @@ struct ReleaseSection {
     /// the module root `.` (single-binary modules like sx). Ignored for Rust.
     #[serde(default)]
     go_main: std::collections::BTreeMap<String, String>,
+    /// Go only: the linker symbol to stamp the release version into via
+    /// `-ldflags "-X <var>=<version>"`, so `<tool> --version` reports it. Defaults
+    /// to `main.version` (the goreleaser convention sx/scrpr already use).
+    #[serde(default = "default_go_version_var")]
+    go_version_var: String,
     /// Version override; resolved from tag/Cargo.toml when absent.
     #[serde(default)]
     version: Option<String>,
@@ -186,6 +191,9 @@ fn default_license() -> String {
 }
 fn default_maintainer() -> String {
     "byteowlz <dev@byteowlz.com>".to_string()
+}
+fn default_go_version_var() -> String {
+    "main.version".to_string()
 }
 
 /// (CARCH, target-triple) pairs byt publishes to the AUR. A source is emitted
@@ -488,8 +496,13 @@ fn compile_go(
     root: &Path,
     bin_dir: &Path,
     triple: &str,
+    version: &str,
 ) -> Result<()> {
     let (goos, goarch) = go_target(triple)?;
+    // Stamp the version into the binary so `<tool> --version` reports it (Go has
+    // no Cargo-style version; without this it stays the source default, e.g.
+    // sx's `var version = "dev"`). `-s -w` also strips debug info.
+    let ldflags = format!("-s -w -X {}={version}", cfg.go_version_var);
     for bin in cfg.bins() {
         let pkg = go_main_package(
             cfg.go_main.get(&bin),
@@ -506,6 +519,8 @@ fn compile_go(
             // container: git refuses the checkout (owned by a different UID) with
             // "error obtaining VCS status: exit status 128".
             .arg("-buildvcs=false")
+            .arg("-ldflags")
+            .arg(&ldflags)
             .arg("-o")
             .arg(bin_dir.join(&bin))
             .arg(&pkg);
@@ -546,7 +561,7 @@ fn build_target(
     // 1. compile (delegated to the language backend)
     match cfg.lang {
         Lang::Rust => compile_rust(ctx, root, triple)?,
-        Lang::Go => compile_go(ctx, cfg, root, &bin_dir, triple)?,
+        Lang::Go => compile_go(ctx, cfg, root, &bin_dir, triple, version)?,
     }
 
     // 2. stage binaries into bin/ (Go already built straight into bin_dir)
@@ -1292,6 +1307,7 @@ mod tests {
             lang: Lang::Rust,
             bins: vec![],
             go_main: std::collections::BTreeMap::new(),
+            go_version_var: "main.version".into(),
             version: None,
             targets: vec![
                 "x86_64-unknown-linux-gnu".into(),
