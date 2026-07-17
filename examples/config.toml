@@ -1,4 +1,4 @@
-"$schema" = "https://raw.githubusercontent.com/byteowlz/schemas/refs/heads/main/byt/byt.config.schema.json"
+#:schema https://raw.githubusercontent.com/byteowlz/schemas/refs/heads/main/byt/byt.config.schema.json
 
 # byt configuration
 # Place at ~/.config/byt/config.toml
