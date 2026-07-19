@@ -102,6 +102,16 @@ struct ReleaseSection {
     /// Binaries to ship; defaults to `[name]` when empty.
     #[serde(default)]
     bins: Vec<String>,
+    /// Go only: per-binary main-package path override (`bin = "./path"`). When a
+    /// bin is absent here byt auto-detects `./cmd/{bin}` if that dir exists, else
+    /// the module root `.` (single-binary modules like sx). Ignored for Rust.
+    #[serde(default)]
+    go_main: std::collections::BTreeMap<String, String>,
+    /// Go only: the linker symbol to stamp the release version into via
+    /// `-ldflags "-X <var>=<version>"`, so `<tool> --version` reports it. Defaults
+    /// to `main.version` (the goreleaser convention sx/scrpr already use).
+    #[serde(default = "default_go_version_var")]
+    go_version_var: String,
     /// Version override; resolved from tag/Cargo.toml when absent.
     #[serde(default)]
     version: Option<String>,
@@ -159,6 +169,12 @@ struct Aur {
     /// `conflicts=()`; defaults to `[name]`.
     #[serde(default)]
     conflicts: Vec<String>,
+    /// `depends=()` runtime dependencies; omitted when empty.
+    #[serde(default)]
+    depends: Vec<String>,
+    /// `optdepends=()` optional dependencies (`'pkg: reason'`); omitted when empty.
+    #[serde(default)]
+    optdepends: Vec<String>,
     /// `# Maintainer:` line; defaults to a generic byteowlz maintainer.
     #[serde(default = "default_maintainer")]
     maintainer: String,
@@ -175,6 +191,9 @@ fn default_license() -> String {
 }
 fn default_maintainer() -> String {
     "byteowlz <dev@byteowlz.com>".to_string()
+}
+fn default_go_version_var() -> String {
+    "main.version".to_string()
 }
 
 /// (CARCH, target-triple) pairs byt publishes to the AUR. A source is emitted
@@ -233,13 +252,27 @@ fn os_of(triple: &str) -> &'static str {
 
 /// Resolve which triples to build: an explicit `--target` wins; otherwise the
 /// configured targets, optionally filtered to one `--os`.
+/// Which build host compiles `triple`. For Rust this is the target's own OS
+/// (darwin needs a macOS runner — zig can't safely link Apple frameworks). Go
+/// builds with `CGO_ENABLED=0`, so it cross-compiles *every* target from the
+/// linux container — no macOS runner is ever needed.
+fn build_host_os(cfg: &ReleaseSection, triple: &str) -> &'static str {
+    match cfg.lang {
+        Lang::Go => "linux",
+        _ => os_of(triple),
+    }
+}
+
 fn select_targets(cfg: &ReleaseSection, target: Option<String>, os: Option<&str>) -> Vec<String> {
     if let Some(t) = target {
         return vec![t];
     }
     let all = cfg.targets();
     match os {
-        Some(os) => all.into_iter().filter(|t| os_of(t) == os).collect(),
+        Some(os) => all
+            .into_iter()
+            .filter(|t| build_host_os(cfg, t) == os)
+            .collect(),
         None => all,
     }
 }
@@ -328,16 +361,25 @@ fn load_config(root: &Path) -> Result<ReleaseSection> {
     Ok(cfg.release)
 }
 
-/// Resolve the release version: explicit `--tag` → `$GITHUB_REF_NAME` →
-/// `[release].version` → `Cargo.toml`. All forms are normalized without a `v`.
+/// Resolve the release version: explicit `--tag` → `$RELEASE_TAG` →
+/// `$GITHUB_REF_NAME` → `[release].version` → `Cargo.toml`. All forms are
+/// normalized without a leading `v`.
+///
+/// `RELEASE_TAG` is checked before `GITHUB_REF_NAME` because the latter is a
+/// reserved variable that GitHub Actions refuses to let a workflow override: on
+/// a `workflow_dispatch` run it is the *branch* (e.g. `master`), not the release
+/// tag, so relying on it silently mis-versions dispatched releases. CI sets the
+/// non-reserved `RELEASE_TAG` to the intended tag instead.
 fn resolve_version(cfg: &ReleaseSection, tag: Option<&str>, root: &Path) -> Result<String> {
     if let Some(tag) = tag {
         return Ok(strip_v(tag));
     }
-    if let Ok(reff) = std::env::var("GITHUB_REF_NAME")
-        && !reff.is_empty()
-    {
-        return Ok(strip_v(&reff));
+    for key in ["RELEASE_TAG", "GITHUB_REF_NAME"] {
+        if let Ok(reff) = std::env::var(key)
+            && !reff.is_empty()
+        {
+            return Ok(strip_v(&reff));
+        }
     }
     if let Some(version) = &cfg.version {
         return Ok(strip_v(version));
@@ -349,7 +391,7 @@ fn resolve_version(cfg: &ReleaseSection, tag: Option<&str>, root: &Path) -> Resu
             return Ok(version);
         }
     }
-    bail!("could not resolve version: pass --tag, set [release].version, or $GITHUB_REF_NAME")
+    bail!("could not resolve version: pass --tag, set [release].version, or $RELEASE_TAG")
 }
 
 // ---- command execution ----------------------------------------------------
@@ -454,22 +496,50 @@ fn compile_go(
     root: &Path,
     bin_dir: &Path,
     triple: &str,
+    version: &str,
 ) -> Result<()> {
     let (goos, goarch) = go_target(triple)?;
+    // Stamp the version into the binary so `<tool> --version` reports it (Go has
+    // no Cargo-style version; without this it stays the source default, e.g.
+    // sx's `var version = "dev"`). `-s -w` also strips debug info.
+    let ldflags = format!("-s -w -X {}={version}", cfg.go_version_var);
     for bin in cfg.bins() {
+        let pkg = go_main_package(
+            cfg.go_main.get(&bin),
+            root.join("cmd").join(&bin).is_dir(),
+            &bin,
+        );
         let mut cmd = Command::new("go");
         cmd.current_dir(root)
             .env("GOOS", goos)
             .env("GOARCH", goarch)
             .env("CGO_ENABLED", "0")
             .arg("build")
+            // Release binaries don't need VCS stamping, and it fails inside the
+            // container: git refuses the checkout (owned by a different UID) with
+            // "error obtaining VCS status: exit status 128".
+            .arg("-buildvcs=false")
+            .arg("-ldflags")
+            .arg(&ldflags)
             .arg("-o")
             .arg(bin_dir.join(&bin))
-            // convention: each shipped binary has a `./cmd/<bin>` main package.
-            .arg(format!("./cmd/{bin}"));
+            .arg(&pkg);
         run(ctx, &mut cmd)?;
     }
     Ok(())
+}
+
+/// Resolve a Go binary's main-package path: an explicit `go_main` override wins;
+/// otherwise `./cmd/{bin}` when that dir exists (multi-binary layout, e.g.
+/// scrpr), else the module root `.` (single-binary modules, e.g. sx).
+fn go_main_package(override_path: Option<&String>, cmd_dir_exists: bool, bin: &str) -> String {
+    if let Some(p) = override_path {
+        p.clone()
+    } else if cmd_dir_exists {
+        format!("./cmd/{bin}")
+    } else {
+        ".".to_string()
+    }
 }
 
 // ---- pipeline -------------------------------------------------------------
@@ -491,7 +561,7 @@ fn build_target(
     // 1. compile (delegated to the language backend)
     match cfg.lang {
         Lang::Rust => compile_rust(ctx, root, triple)?,
-        Lang::Go => compile_go(ctx, cfg, root, &bin_dir, triple)?,
+        Lang::Go => compile_go(ctx, cfg, root, &bin_dir, triple, version)?,
     }
 
     // 2. stage binaries into bin/ (Go already built straight into bin_dir)
@@ -577,22 +647,53 @@ fn publish(
         );
     }
 
-    let mut cmd = Command::new("gh");
-    cmd.arg("release")
-        .arg("create")
-        .arg(&tag)
-        .arg("--title")
-        .arg(&tag)
-        .arg("--generate-notes");
+    // Assets: every .tar.gz in dist + checksums.txt.
+    let mut assets: Vec<PathBuf> = Vec::new();
     if dist.exists() {
         for entry in fs::read_dir(dist)? {
             let path = entry?.path();
             if path.extension().and_then(|e| e.to_str()) == Some("gz") {
-                cmd.arg(&path);
+                assets.push(path);
             }
         }
     }
-    cmd.arg(&checksums);
+    assets.push(checksums);
+
+    // In CI, target the repo explicitly so `gh` does not have to detect it from
+    // the working-directory git checkout — which fails under container-job UID
+    // mismatches ("dubious ownership"). Locally, GITHUB_REPOSITORY is unset and
+    // gh falls back to the cwd repo as before.
+    let repo_args: Vec<String> = std::env::var("GITHUB_REPOSITORY")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|r| vec!["--repo".to_string(), r])
+        .unwrap_or_default();
+
+    // Idempotent: if the release already exists (e.g. a re-run after a later
+    // step failed), update its assets instead of failing on `create`.
+    let exists = !ctx.common.dry_run && {
+        let mut check = Command::new("gh");
+        check.args(["release", "view", &tag]);
+        check.args(&repo_args);
+        check.stdout(Stdio::null()).stderr(Stdio::null());
+        check.status().map(|s| s.success()).unwrap_or(false)
+    };
+
+    let mut cmd = Command::new("gh");
+    if exists {
+        cmd.arg("release").arg("upload").arg(&tag);
+        cmd.args(&assets);
+        cmd.arg("--clobber");
+    } else {
+        cmd.arg("release")
+            .arg("create")
+            .arg(&tag)
+            .arg("--title")
+            .arg(&tag)
+            .arg("--generate-notes");
+        cmd.args(&assets);
+    }
+    cmd.args(&repo_args);
     run(ctx, &mut cmd)?;
     println!("  published {} {tag}", cfg.name);
     Ok(())
@@ -726,20 +827,15 @@ fn quoted_list(items: &[String]) -> String {
         .join(" ")
 }
 
-/// Effective `provides`/`conflicts` (default to `[name]` when unset).
-fn aur_provides(name: &str, aur: &Aur) -> Vec<String> {
-    if aur.provides.is_empty() {
-        vec![name.to_string()]
-    } else {
-        aur.provides.clone()
-    }
+/// Effective `provides`/`conflicts`. Empty means the field is omitted entirely
+/// — a bare bin package (pkgname == binary) declares neither, and forcing
+/// `provides=(foo)`/`conflicts=(foo)` on package `foo` is a self-reference
+/// namcap flags. `-bin` packages set these explicitly in `byt.release.toml`.
+fn aur_provides(_name: &str, aur: &Aur) -> Vec<String> {
+    aur.provides.clone()
 }
-fn aur_conflicts(name: &str, aur: &Aur) -> Vec<String> {
-    if aur.conflicts.is_empty() {
-        vec![name.to_string()]
-    } else {
-        aur.conflicts.clone()
-    }
+fn aur_conflicts(_name: &str, aur: &Aur) -> Vec<String> {
+    aur.conflicts.clone()
 }
 
 /// Generate a `PKGBUILD` for the `-bin` package. Sources point at the GitHub
@@ -771,8 +867,20 @@ fn pkgbuild_body(
     let _ = writeln!(s, "arch=({arch_list})");
     let _ = writeln!(s, "url=\"{url}\"");
     let _ = writeln!(s, "license=('{}')", aur.license);
-    let _ = writeln!(s, "provides=({})", quoted_list(&aur_provides(name, aur)));
-    let _ = writeln!(s, "conflicts=({})", quoted_list(&aur_conflicts(name, aur)));
+    let provides = aur_provides(name, aur);
+    if !provides.is_empty() {
+        let _ = writeln!(s, "provides=({})", quoted_list(&provides));
+    }
+    let conflicts = aur_conflicts(name, aur);
+    if !conflicts.is_empty() {
+        let _ = writeln!(s, "conflicts=({})", quoted_list(&conflicts));
+    }
+    if !aur.depends.is_empty() {
+        let _ = writeln!(s, "depends=({})", quoted_list(&aur.depends));
+    }
+    if !aur.optdepends.is_empty() {
+        let _ = writeln!(s, "optdepends=({})", quoted_list(&aur.optdepends));
+    }
     for a in arches {
         let fname = archive_filename(name, version, a.triple);
         let _ = writeln!(
@@ -820,6 +928,12 @@ fn srcinfo_body(
     }
     for c in aur_conflicts(name, aur) {
         let _ = writeln!(s, "\tconflicts = {c}");
+    }
+    for d in &aur.depends {
+        let _ = writeln!(s, "\tdepends = {d}");
+    }
+    for d in &aur.optdepends {
+        let _ = writeln!(s, "\toptdepends = {d}");
     }
     for a in arches {
         let fname = archive_filename(name, version, a.triple);
@@ -926,13 +1040,51 @@ fn publish_aur(
     );
 
     let repo_dir = work.join("pkg");
+    let remote = format!("ssh://aur@aur.archlinux.org/{pkgname}.git");
     let mut clone = Command::new("git");
     clone
         .arg("clone")
-        .arg(format!("ssh://aur@aur.archlinux.org/{pkgname}.git"))
+        .arg(&remote)
         .arg(&repo_dir)
         .env("GIT_SSH_COMMAND", &ssh_cmd);
-    run(ctx, &mut clone)?;
+    if run(ctx, &mut clone).is_err() {
+        // A brand-new package can't be cloned: AUR only serves `upload-pack`
+        // (fetch) for a pkgbase that already exists — a new one is created by
+        // the first `push`. Start a fresh repo pointing at the AUR remote; the
+        // push below creates the package (with the pushing account as maintainer).
+        println!("  AUR: {pkgname} not found on AUR; creating it as a new package");
+        let _ = fs::remove_dir_all(&repo_dir);
+        fs::create_dir_all(&repo_dir)?;
+        git_in(ctx, &repo_dir, &["init"], &ssh_cmd)?;
+        git_in(
+            ctx,
+            &repo_dir,
+            &["remote", "add", "origin", &remote],
+            &ssh_cmd,
+        )?;
+    }
+
+    // AUR's remote HEAD is not a symbolic ref, so `git clone` lands on a
+    // detached HEAD. Base our branch explicitly on origin/master (the real tip)
+    // when the package already exists, so the push fast-forwards; for a brand-new
+    // package origin/master is absent and we start a fresh master.
+    let has_master = Command::new("git")
+        .current_dir(&repo_dir)
+        .args(["rev-parse", "--verify", "--quiet", "origin/master"])
+        .stdout(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if has_master {
+        git_in(
+            ctx,
+            &repo_dir,
+            &["checkout", "-B", "master", "origin/master"],
+            &ssh_cmd,
+        )?;
+    } else {
+        git_in(ctx, &repo_dir, &["checkout", "-B", "master"], &ssh_cmd)?;
+    }
 
     fs::write(repo_dir.join("PKGBUILD"), &pkgbuild)?;
     fs::write(repo_dir.join(".SRCINFO"), &srcinfo)?;
@@ -961,7 +1113,7 @@ fn publish_aur(
         &["commit", "-m", &format!("Update to v{version}")],
         &ssh_cmd,
     )?;
-    git_in(ctx, &repo_dir, &["push"], &ssh_cmd)?;
+    git_in(ctx, &repo_dir, &["push", "origin", "HEAD:master"], &ssh_cmd)?;
     println!("  published {pkgname} v{version} to AUR");
     let _ = fs::remove_dir_all(&work);
     Ok(())
@@ -1092,6 +1244,17 @@ mod tests {
     }
 
     #[test]
+    fn go_main_package_prefers_override_then_cmd_then_root() {
+        let ov = "./tools/sx".to_string();
+        // explicit override always wins
+        assert_eq!(go_main_package(Some(&ov), true, "sx"), "./tools/sx");
+        // multi-binary layout: ./cmd/<bin> exists
+        assert_eq!(go_main_package(None, true, "scrpr"), "./cmd/scrpr");
+        // single-binary module (sx): main lives at the module root
+        assert_eq!(go_main_package(None, false, "sx"), ".");
+    }
+
+    #[test]
     fn checksums_body_is_sorted_and_formatted() {
         let body = checksums_body(&[
             ("b.tar.gz".into(), "22".into()),
@@ -1143,6 +1306,8 @@ mod tests {
             name: "x".into(),
             lang: Lang::Rust,
             bins: vec![],
+            go_main: std::collections::BTreeMap::new(),
+            go_version_var: "main.version".into(),
             version: None,
             targets: vec![
                 "x86_64-unknown-linux-gnu".into(),
@@ -1169,6 +1334,22 @@ mod tests {
             select_targets(&cfg, Some("custom".into()), Some("linux")),
             vec!["custom".to_string()]
         );
+
+        // Go cross-compiles every target from the container: darwin routes to
+        // the linux build host, and the macOS runner is never requested.
+        let go_cfg = ReleaseSection {
+            lang: Lang::Go,
+            ..cfg
+        };
+        assert_eq!(
+            select_targets(&go_cfg, None, Some("linux")),
+            vec![
+                "x86_64-unknown-linux-gnu".to_string(),
+                "aarch64-unknown-linux-gnu".to_string(),
+                "aarch64-apple-darwin".to_string(),
+            ]
+        );
+        assert!(select_targets(&go_cfg, None, Some("macos")).is_empty());
     }
 
     fn sample_aur() -> Aur {
@@ -1179,6 +1360,8 @@ mod tests {
             url: None,
             provides: vec!["trx".into()],
             conflicts: vec!["trx".into(), "trx-git".into()],
+            depends: vec![],
+            optdepends: vec![],
             maintainer: "byteowlz <dev@byteowlz.com>".into(),
         }
     }
@@ -1212,6 +1395,44 @@ mod tests {
         // installs from */bin to match byt's staging layout
         assert!(body.contains("install -Dm755 */bin/trx \"$pkgdir/usr/bin/trx\""));
         assert!(body.contains("install -Dm755 */bin/trx-tui \"$pkgdir/usr/bin/trx-tui\""));
+        // no depends/optdepends emitted when the config leaves them empty
+        assert!(!body.contains("depends=("));
+        assert!(!body.contains("optdepends=("));
+    }
+
+    #[test]
+    fn pkgbuild_emits_depends_and_optdepends_when_set() {
+        let arches = vec![AurArch {
+            carch: "x86_64",
+            triple: "x86_64-unknown-linux-gnu",
+            sha: "deadbeef".into(),
+        }];
+        let mut aur = sample_aur();
+        aur.depends = vec!["typst".into()];
+        aur.optdepends = vec!["cuda: GPU acceleration".into()];
+        let body = pkgbuild_body(
+            "tmpltr",
+            "0.3.1",
+            "tmpltr-bin",
+            &aur,
+            "https://github.com/byteowlz/tmpltr",
+            "https://github.com/byteowlz/tmpltr/releases/download/v0.3.1",
+            &arches,
+            &["tmpltr".into()],
+        );
+        assert!(body.contains("depends=('typst')"));
+        assert!(body.contains("optdepends=('cuda: GPU acceleration')"));
+        let srcinfo = srcinfo_body(
+            "tmpltr",
+            "0.3.1",
+            "tmpltr-bin",
+            &aur,
+            "https://github.com/byteowlz/tmpltr",
+            "https://github.com/byteowlz/tmpltr/releases/download/v0.3.1",
+            &arches,
+        );
+        assert!(srcinfo.contains("\tdepends = typst"));
+        assert!(srcinfo.contains("\toptdepends = cuda: GPU acceleration"));
     }
 
     #[test]
