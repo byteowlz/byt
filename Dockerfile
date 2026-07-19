@@ -20,9 +20,11 @@ FROM rust:1.90-bookworm
 ARG ZIG_VERSION=0.13.0
 ARG GO_VERSION=1.23.4
 
-# OS deps + GitHub CLI (for `byt release publish` -> `gh release create`)
+# OS deps + GitHub CLI (for `byt release publish` -> `gh release create`).
+# protobuf-compiler: `protoc` runs on the build host for prost/tonic codegen
+# (arch-independent), needed by apps like mmry; not a cross-linked target lib.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl git tar xz-utils \
+    && apt-get install -y --no-install-recommends ca-certificates curl git tar xz-utils protobuf-compiler \
     && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
         -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
