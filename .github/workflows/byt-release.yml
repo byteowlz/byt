@@ -1,0 +1,19 @@
+# byt's own release — dogfoods the reusable workflow (ADR-0021/0022).
+# On a v* tag, build + checksum + publish byt's artifacts via the builder image.
+# (Requires the image to exist first; see image.yml for the bootstrap.)
+#
+# byt uses its own in-repo reusable workflow (./.github/workflows/release.yml);
+# other repos reference byteowlz/byt/.github/workflows/release.yml@<tag>.
+name: byt release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  release:
+    permissions:
+      contents: write
+      packages: read
+    uses: ./.github/workflows/release.yml
+    secrets: inherit

@@ -1,0 +1,136 @@
+# Reusable release workflow (ADR-0021/0022).
+#
+# CANONICAL HOME: this file — byteowlz/byt/.github/workflows/release.yml.
+# byt is public, so any byteowlz repo (public or private) calls it directly:
+#
+#   jobs:
+#     release:
+#       uses: byteowlz/byt/.github/workflows/release.yml@v0.5.2
+#       secrets: inherit
+#
+# Hybrid build so the artifact matrix is complete without an Apple SDK in the
+# public image (ADR-0021):
+#   - build-linux  : linux-gnu targets in the byt container (glibc floor)
+#   - build-macos  : *-apple-darwin built NATIVELY on a macOS runner (only when
+#                    the repo configures darwin targets)
+#   - publish      : combine artifacts -> checksums.txt -> gh release ->
+#                    Homebrew dispatch + AUR push (per each repo's byt.release.toml)
+#
+# Auth: Homebrew/Scoop publish via repository_dispatch authorized by the
+# byteowlz-release GitHub App (org secrets RELEASE_APP_ID + RELEASE_APP_PRIVATE_KEY);
+# AUR publishes inline over SSH (org secrets AUR_SSH_PRIVATE_KEY + AUR_EMAIL).
+# Repos with no [release.homebrew]/[release.aur] simply skip those steps.
+name: release
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag (defaults to the triggering git tag)
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  packages: read
+
+jobs:
+  # Decide whether the (expensive) macOS runner is needed for this repo.
+  setup:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/byteowlz/byt:latest
+    outputs:
+      macos: ${{ steps.detect.outputs.macos }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: detect
+        run: |
+          if [ -n "$(byt release targets --os macos)" ]; then
+            echo "macos=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "macos=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-linux:
+    needs: setup
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/byteowlz/byt:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build linux targets
+        env:
+          GITHUB_REF_NAME: ${{ inputs.tag || github.ref_name }}
+        run: byt release build --os linux
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-linux
+          path: dist/release/*.tar.gz
+          if-no-files-found: error
+
+  build-macos:
+    needs: setup
+    if: needs.setup.outputs.macos == 'true'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+      - name: Install byt
+        # darwin builds natively (plain cargo), so no zig/zigbuild needed here.
+        run: cargo install --locked --git https://github.com/byteowlz/byt byt
+      - name: Build macOS targets
+        env:
+          GITHUB_REF_NAME: ${{ inputs.tag || github.ref_name }}
+        run: byt release build --os macos
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-macos
+          path: dist/release/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: [build-linux, build-macos]
+    # Proceed when linux built and macOS either built or was legitimately skipped
+    # (repo has no darwin targets); a macOS *failure* must block publish.
+    if: >-
+      always()
+      && needs.build-linux.result == 'success'
+      && (needs.build-macos.result == 'success' || needs.build-macos.result == 'skipped')
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/byteowlz/byt:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Collect build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/release
+          pattern: dist-*
+          merge-multiple: true
+      # Short-lived token for the Homebrew tap dispatch. continue-on-error so a
+      # repo without the App secrets (or that doesn't publish to Homebrew) still
+      # ships its GitHub artifacts; a repo that DOES publish fails loudly at the
+      # dispatch step when the token is empty.
+      - name: Mint Homebrew tap token
+        id: tap-token
+        continue-on-error: true
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: byteowlz
+          repositories: homebrew-tap
+      - name: Checksums + GitHub release + downstream packages
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REF_NAME: ${{ inputs.tag || github.ref_name }}
+          HOMEBREW_TAP_TOKEN: ${{ steps.tap-token.outputs.token }}
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          AUR_EMAIL: ${{ secrets.AUR_EMAIL }}
+        run: |
+          byt release checksums
+          byt release publish
+          byt release packages

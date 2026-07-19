@@ -1,0 +1,8 @@
+# Release config consumed by `byt release` (ADR-0021). This is byt's own config
+# and the worked example for every byteowlz repo.
+[release]
+name = "byt"
+lang = "rust"
+bins = ["byt"]
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+# extra defaults to ["LICENSE", "README.md"]; sign defaults to false.

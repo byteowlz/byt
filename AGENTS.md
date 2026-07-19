@@ -23,6 +23,30 @@
 | `byt sync status`      | Show memory sync state                                   |
 | `byt sync push`        | Export memories to .sync/memories/                       |
 | `byt sync pull`        | Import memories from .sync/memories/                     |
+| `byt design-system sync`   | Vendor design-system src into consumer repos (distribute-down) |
+| `byt design-system status` | Show vendored drift vs the source repo's latest tag      |
+| `byt design-system list`   | List consuming repos and their pinned refs               |
+
+## Design-System Vendoring
+
+`byt design-system` distributes the design-system source DOWN into consumer repos
+without going through npm (same shape as `templates`). A consumer opts in with a
+`design-system.toml` manifest at its repo root:
+
+```toml
+source = "byteowlz/design-system"          # central repo (org/name); optional, has default
+ref    = "v0.1.0"                          # pinned tag or sha (reproducible)
+impl   = "shadcn-ts"                        # which impls/<impl> dir to pull; optional
+path   = "frontend/vendor/design-system"   # where the snapshot lands in the consumer
+# build_cmd = "bun run build"              # optional; run with --build
+```
+
+`sync` shallow-fetches the pinned ref (no history clone), copies `impls/<impl>/`
+into `path` (overwriting), and writes a load-bearing `path/VENDORED.md` stamp
+(source/ref/resolved-sha/date/byt-version/fingerprint). `status` compares each
+consumer against the source repo's latest tag and the stamped fingerprint,
+reporting up-to-date / behind / diverged (local edits). Global defaults live in
+`[design_system]` in the byt config.
 
 ## Architecture
 

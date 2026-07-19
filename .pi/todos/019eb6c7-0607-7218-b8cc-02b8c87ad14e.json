@@ -1,0 +1,29 @@
+{
+  "todos": [
+    {
+      "id": "t1",
+      "content": "Read issue byt-wwag details",
+      "status": "completed",
+      "priority": "high"
+    },
+    {
+      "id": "t2",
+      "content": "Implement byt current feature",
+      "status": "completed",
+      "priority": "high"
+    },
+    {
+      "id": "t3",
+      "content": "Run checks/tests",
+      "status": "completed",
+      "priority": "medium"
+    },
+    {
+      "id": "t4",
+      "content": "Close trx issue",
+      "status": "completed",
+      "priority": "high"
+    }
+  ],
+  "updated_at": "2026-06-11T13:04:49.432Z"
+}

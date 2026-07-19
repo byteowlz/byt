@@ -29,6 +29,8 @@ Temporary Items
 # Rust
 # Generated files
 /target/
+# byt release staging/output
+/dist/
 **/*.rs.bk
 # Cargo.lock for libraries (uncomment if this is a library)
 # Cargo.lock
