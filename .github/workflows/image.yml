@@ -1,0 +1,38 @@
+# Build + push the ghcr.io/byteowlz/byt release-builder image (ADR-0022).
+#
+# This is the bootstrap: it compiles byt from source inside the Dockerfile, so it
+# has no dependency on a pre-existing byt. Run it once (workflow_dispatch) to make
+# the image exist; thereafter every repo's release workflow `container:`s it.
+name: byt image
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - src/**
+      - Cargo.toml
+      - Cargo.lock
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/byteowlz/byt:latest
+            ghcr.io/byteowlz/byt:${{ github.sha }}

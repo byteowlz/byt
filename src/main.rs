@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 
 const APP_NAME: &str = env!("CARGO_PKG_NAME");
 
+mod release;
+
 fn main() {
     if let Err(err) = try_main() {
         let _ = writeln!(io::stderr(), "{err:?}");
@@ -32,6 +34,7 @@ fn try_main() -> Result<()> {
 
     match cli.command {
         Command::Catalog { command } => handle_catalog(&ctx, command),
+        Command::Current { repo, machines } => handle_current(&ctx, repo, machines),
         Command::Lint(cmd) => handle_lint(&ctx, cmd),
         Command::Status(cmd) => handle_status(&ctx, cmd),
         Command::Ready => handle_ready(&ctx),
@@ -43,7 +46,9 @@ fn try_main() -> Result<()> {
         Command::Secrets { command } => handle_secrets(&ctx, command),
         Command::New(cmd) => handle_new(&ctx, cmd),
         Command::Schema { command } => handle_schema(&ctx, command),
+        Command::DesignSystem { command } => handle_design_system(&ctx, command),
         Command::Website { command } => handle_website(&ctx, command),
+        Command::Release { command } => release::handle_release(&ctx, command),
         Command::Completions { shell } => handle_completions(shell),
     }
 }
@@ -94,6 +99,14 @@ enum Command {
         #[command(subcommand)]
         command: CatalogCommand,
     },
+    /// Identify the active/latest repository copy across machines
+    Current {
+        /// Repository name (default: detect from current directory)
+        repo: Option<String>,
+        /// Only check specific machines (default: all configured)
+        #[arg(long, short = 'm')]
+        machines: Vec<String>,
+    },
     /// Check governance compliance across repos
     Lint(LintCommand),
     /// Show status of all repositories
@@ -134,10 +147,20 @@ enum Command {
         #[command(subcommand)]
         command: SchemaCommand,
     },
+    /// Vendor the design-system into consumer repos (distribute-down)
+    DesignSystem {
+        #[command(subcommand)]
+        command: DesignSystemCommand,
+    },
     /// Manage byteowlz.com website (sync tool pages from repos)
     Website {
         #[command(subcommand)]
         command: WebsiteCommand,
+    },
+    /// Build + publish spec-conformant release artifacts (ADR-0021)
+    Release {
+        #[command(subcommand)]
+        command: release::ReleaseCommand,
     },
     /// Generate shell completions
     Completions {
@@ -396,6 +419,26 @@ enum SchemaCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum DesignSystemCommand {
+    /// Vendor the design-system source into configured consumer repos
+    Sync {
+        /// Only sync specific consumer repos (repeatable); default: all configured
+        #[arg(long)]
+        repo: Vec<String>,
+        /// Override the pinned ref (tag or sha) for this sync
+        #[arg(long)]
+        r#ref: Option<String>,
+        /// Run the consumer's build after syncing (e.g. `bun run build`)
+        #[arg(long)]
+        build: bool,
+    },
+    /// Show drift of each consumer vs the source repo's latest tag
+    Status,
+    /// List consuming repos and their pinned refs
+    List,
+}
+
+#[derive(Debug, Subcommand)]
 enum WebsiteCommand {
     /// Sync tool.toml files to website repository
     Sync {
@@ -473,6 +516,15 @@ struct RepoAvailability {
     present_on: Vec<String>,
     /// Which machines are missing this repo
     missing_on: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CurrentRepo {
+    name: String,
+    path: String,
+    workspace: String,
+    in_catalog: bool,
+    machine: String,
 }
 
 // ============================================================================
@@ -660,6 +712,8 @@ struct AppConfig {
     templates: TemplatesConfig,
     /// Schema settings
     schemas: SchemaConfig,
+    /// Design-system distribute-down settings
+    design_system: DesignSystemConfig,
     /// Website settings
     website: WebsiteConfig,
     /// Memory sync settings
@@ -709,15 +763,24 @@ fn default_ssh_port() -> u16 {
     22
 }
 
-/// Get the XDG state directory for byt
-fn get_state_dir() -> Result<PathBuf> {
-    if let Some(dir) = env::var_os("XDG_STATE_HOME").filter(|v| !v.is_empty()) {
-        return Ok(PathBuf::from(dir).join(APP_NAME));
+/// Resolve a base directory: an explicit XDG_* var wins on any OS; otherwise
+/// ~/<unix_rel> on unix (incl. macOS — deliberately NOT ~/Library for a CLI
+/// tool), or %win_var% on Windows. Zero-dependency (no `dirs` crate).
+fn base_dir(xdg_var: &str, unix_rel: &str, win_var: &str) -> Result<PathBuf> {
+    if let Some(dir) = env::var_os(xdg_var).filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(dir));
     }
+    let base = if cfg!(windows) {
+        env::var_os(win_var).map(PathBuf::from)
+    } else {
+        env::var_os("HOME").map(|h| PathBuf::from(h).join(unix_rel))
+    };
+    base.ok_or_else(|| anyhow!("unable to determine base directory ({xdg_var})"))
+}
 
-    dirs::home_dir()
-        .map(|home| home.join(".local").join("state").join(APP_NAME))
-        .ok_or_else(|| anyhow!("unable to determine state directory"))
+/// Get the state directory for byt.
+fn get_state_dir() -> Result<PathBuf> {
+    Ok(base_dir("XDG_STATE_HOME", ".local/state", "LOCALAPPDATA")?.join(APP_NAME))
 }
 
 /// Get the path to the machine identity state file
@@ -958,6 +1021,73 @@ impl Default for SchemaConfig {
     }
 }
 
+/// Global defaults for the design-system distribute-down command.
+///
+/// Per-consumer settings live in a `design-system.toml` manifest at the root of
+/// each consuming repo. The fields here provide defaults a manifest may omit
+/// (source/impl/ref) plus the manifest filename byt scans for. Mirrors the
+/// `TemplatesConfig`/`SchemaConfig` precedent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct DesignSystemConfig {
+    /// Default source repo (github org/name) when a consumer manifest omits it
+    source: String,
+    /// Default impl directory to pull from `impls/<impl>` when omitted
+    impl_dir: String,
+    /// Default ref (tag or sha) when a consumer manifest omits it
+    default_ref: String,
+    /// Manifest filename to look for at the root of each consumer repo
+    manifest: String,
+}
+
+impl Default for DesignSystemConfig {
+    fn default() -> Self {
+        Self {
+            source: "byteowlz/design-system".to_string(),
+            impl_dir: "shadcn-ts".to_string(),
+            default_ref: "main".to_string(),
+            manifest: "design-system.toml".to_string(),
+        }
+    }
+}
+
+/// Per-consumer manifest, parsed from `design-system.toml` at a repo root.
+/// `source`/`impl`/`ref` fall back to `DesignSystemConfig` defaults when absent.
+#[derive(Debug, Clone, Deserialize, Default)]
+struct DesignSystemManifest {
+    /// Central source repo (github org/name)
+    #[serde(default)]
+    source: Option<String>,
+    /// Pinned ref (tag or sha) — reproducible
+    #[serde(default, rename = "ref")]
+    git_ref: Option<String>,
+    /// Which impl dir under `impls/` to pull
+    #[serde(default, rename = "impl")]
+    impl_dir: Option<String>,
+    /// Where the vendored snapshot lands within the consumer repo
+    path: String,
+    /// Optional build command to run after sync (overrides `--build` default)
+    #[serde(default)]
+    build_cmd: Option<String>,
+}
+
+/// A resolved design-system consumer (manifest + global defaults applied).
+#[derive(Debug, Clone)]
+struct DesignSystemConsumer {
+    /// Consumer repo name (catalog key)
+    repo: String,
+    /// Resolved source repo (github org/name)
+    source: String,
+    /// Resolved ref (tag or sha)
+    git_ref: String,
+    /// Resolved impl dir
+    impl_dir: String,
+    /// Absolute path where the vendored snapshot lands
+    dest: PathBuf,
+    /// Optional build command from the manifest
+    build_cmd: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 struct WebsiteConfig {
@@ -1043,6 +1173,7 @@ impl Default for AppConfig {
             release: ReleaseConfig::default(),
             templates: TemplatesConfig::default(),
             schemas: SchemaConfig::default(),
+            design_system: DesignSystemConfig::default(),
             website: WebsiteConfig::default(),
             sync: SyncConfig::default(),
             machines: Vec::new(),
@@ -1061,6 +1192,221 @@ fn handle_catalog(ctx: &RuntimeContext, command: CatalogCommand) -> Result<()> {
         CatalogCommand::List => list_repos(ctx),
         CatalogCommand::Machines { command } => handle_catalog_machines(ctx, command),
     }
+}
+
+fn handle_current(
+    ctx: &RuntimeContext,
+    explicit_repo: Option<String>,
+    explicit_machines: Vec<String>,
+) -> Result<()> {
+    let repo_name = match explicit_repo {
+        Some(repo) => repo,
+        None => detect_current_repo(ctx)?.name,
+    };
+
+    let statuses = collect_repo_status_across_machines(ctx, &repo_name, explicit_machines)?;
+
+    if ctx.common.json {
+        println!("{}", serde_json::to_string_pretty(&statuses)?);
+        return Ok(());
+    }
+
+    print_current_recommendation(&repo_name, &statuses);
+    Ok(())
+}
+
+fn collect_repo_status_across_machines(
+    ctx: &RuntimeContext,
+    repo_name: &str,
+    explicit_machines: Vec<String>,
+) -> Result<Vec<(String, String, RepoStatusInfo)>> {
+    use std::process::Command as ShellCommand;
+
+    let local_name = get_local_machine_name_interactive(&ctx.config.machines)?;
+    let workspace = ctx.workspace_root();
+    let mut statuses = Vec::new();
+
+    statuses.push((
+        local_name.clone(),
+        workspace.join(repo_name).display().to_string(),
+        get_repo_status(&workspace.join(repo_name), repo_name),
+    ));
+
+    let remote_machines: Vec<&Machine> = if !explicit_machines.is_empty() {
+        ctx.config
+            .machines
+            .iter()
+            .filter(|m| explicit_machines.contains(&m.name) && !is_local_machine(m, &local_name))
+            .collect()
+    } else {
+        ctx.config
+            .machines
+            .iter()
+            .filter(|m| !is_local_machine(m, &local_name))
+            .collect()
+    };
+
+    for machine in remote_machines {
+        if !ctx.common.quiet {
+            eprint!("Querying {}... ", machine.name);
+        }
+
+        let workspace_path = machine.workspace.as_deref().unwrap_or("~/byteowlz");
+        let repo_path = format!("{}/{}", workspace_path.trim_end_matches('/'), repo_name);
+        let remote_cmd = format!(
+            "cd {} && ($HOME/.cargo/bin/byt repos status --json 2>/dev/null || byt repos status --json)",
+            workspace_path
+        );
+
+        let port_str = machine.port.to_string();
+        let ssh_host = machine.ssh_host();
+        let mut ssh_args: Vec<&str> = vec!["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"];
+        if machine.port != 22 {
+            ssh_args.extend(["-p", &port_str]);
+        }
+        if let Some(ref identity) = machine.identity_file {
+            ssh_args.extend(["-i", identity]);
+        }
+        ssh_args.push(ssh_host);
+        ssh_args.push(&remote_cmd);
+
+        match ShellCommand::new("ssh").args(&ssh_args).output() {
+            Ok(o) if o.status.success() => {
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                match serde_json::from_str::<MachineStatus>(&stdout) {
+                    Ok(machine_status) => {
+                        if let Some(repo_status) = machine_status
+                            .repos
+                            .into_iter()
+                            .find(|repo| repo.name == repo_name)
+                        {
+                            statuses.push((machine.name.clone(), repo_path, repo_status));
+                        } else {
+                            statuses.push((
+                                machine.name.clone(),
+                                repo_path,
+                                get_missing_repo_status(repo_name),
+                            ));
+                        }
+                        if !ctx.common.quiet {
+                            eprintln!("OK");
+                        }
+                    }
+                    Err(e) => {
+                        if !ctx.common.quiet {
+                            eprintln!("parse error: {}", e);
+                        }
+                    }
+                }
+            }
+            Ok(o) => {
+                if !ctx.common.quiet {
+                    let stderr = String::from_utf8_lossy(&o.stderr);
+                    eprintln!(
+                        "failed: {}",
+                        stderr.lines().next().unwrap_or("unknown error")
+                    );
+                }
+            }
+            Err(e) => {
+                if !ctx.common.quiet {
+                    eprintln!("error: {}", e);
+                }
+            }
+        }
+    }
+
+    Ok(statuses)
+}
+
+fn get_missing_repo_status(repo_name: &str) -> RepoStatusInfo {
+    RepoStatusInfo {
+        name: repo_name.to_string(),
+        exists: false,
+        head_commit: None,
+        head_date: None,
+        branch: None,
+        uncommitted: 0,
+        ahead: 0,
+        behind: 0,
+    }
+}
+
+fn print_current_recommendation(repo_name: &str, statuses: &[(String, String, RepoStatusInfo)]) {
+    let existing: Vec<_> = statuses
+        .iter()
+        .filter(|(_, _, status)| status.exists)
+        .collect();
+    let dirty: Vec<_> = existing
+        .iter()
+        .filter(|(_, _, status)| status.uncommitted > 0)
+        .copied()
+        .collect();
+    let ahead: Vec<_> = existing
+        .iter()
+        .filter(|(_, _, status)| status.ahead > 0)
+        .copied()
+        .collect();
+
+    let recommendation = if dirty.len() > 1 {
+        format!("{}: CONFLICT (dirty on multiple machines)", repo_name)
+    } else if let Some((machine, _, _)) = dirty.first() {
+        format!("{}: use {}", repo_name, machine)
+    } else if ahead.len() > 1 {
+        format!(
+            "{}: CONFLICT (unpushed commits on multiple machines)",
+            repo_name
+        )
+    } else if let Some((machine, _, _)) = ahead.first() {
+        format!("{}: use {}", repo_name, machine)
+    } else if all_existing_same_head(&existing) {
+        format!("{}: synced", repo_name)
+    } else if let Some((machine, _, _)) = newest_by_date(&existing) {
+        format!("{}: likely latest on {}", repo_name, machine)
+    } else {
+        format!("{}: not found", repo_name)
+    };
+
+    println!("{}", recommendation);
+    println!();
+
+    for (machine, path, status) in statuses {
+        if !status.exists {
+            println!("{:<10} {:<35} -", machine, path);
+            continue;
+        }
+
+        let branch = status.branch.as_deref().unwrap_or("?");
+        let head = status.head_commit.as_deref().unwrap_or("?");
+        let dirty = if status.uncommitted > 0 {
+            format!("dirty:{}", status.uncommitted)
+        } else {
+            "clean".to_string()
+        };
+        let sync = format!("ahead:{} behind:{}", status.ahead, status.behind);
+        println!(
+            "{:<10} {:<35} {:<12} {:<8} {:<10} {}",
+            machine, path, branch, head, dirty, sync
+        );
+    }
+}
+
+fn all_existing_same_head(existing: &[&(String, String, RepoStatusInfo)]) -> bool {
+    let heads: Vec<&str> = existing
+        .iter()
+        .filter_map(|(_, _, status)| status.head_commit.as_deref())
+        .collect();
+    !heads.is_empty() && heads.windows(2).all(|w| w[0] == w[1])
+}
+
+fn newest_by_date<'a>(
+    existing: &'a [&'a (String, String, RepoStatusInfo)],
+) -> Option<&'a (String, String, RepoStatusInfo)> {
+    existing
+        .iter()
+        .filter(|(_, _, status)| status.head_date.is_some())
+        .max_by_key(|(_, _, status)| status.head_date.as_deref())
+        .copied()
 }
 
 fn refresh_catalog(ctx: &RuntimeContext, full: bool) -> Result<()> {
@@ -1725,9 +2071,10 @@ fn get_trx_open_count(path: &Path) -> Option<u32> {
         let content = String::from_utf8_lossy(&output.stdout);
         if let Ok(issues) = serde_json::from_str::<Vec<serde_json::Value>>(&content) {
             // Count only open issues
-            let open_count = issues.iter().filter(|i| {
-                i.get("status").and_then(|s| s.as_str()) == Some("open")
-            }).count();
+            let open_count = issues
+                .iter()
+                .filter(|i| i.get("status").and_then(|s| s.as_str()) == Some("open"))
+                .count();
             return Some(open_count as u32);
         }
     }
@@ -2080,6 +2427,57 @@ fn detect_current_project(ctx: &RuntimeContext) -> Result<String> {
     // If at workspace root or outside workspace, use govnr
     info!("At workspace root or outside workspace, using govnr store");
     Ok("govnr".to_string())
+}
+
+/// Identify the active repository copy for the current directory.
+fn detect_current_repo(ctx: &RuntimeContext) -> Result<CurrentRepo> {
+    let cwd = env::current_dir()?;
+    let repo_root = git2::Repository::discover(&cwd)
+        .ok()
+        .and_then(|repo| repo.workdir().map(Path::to_path_buf))
+        .unwrap_or_else(|| cwd.clone());
+    let repo_root = repo_root.canonicalize().unwrap_or(repo_root);
+    let workspace = ctx
+        .workspace_root()
+        .canonicalize()
+        .unwrap_or_else(|_| ctx.workspace_root().to_path_buf());
+
+    let mut name = repo_root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let mut in_catalog = false;
+
+    if let Ok(catalog) = ctx.load_catalog() {
+        for (catalog_name, info) in &catalog.repos {
+            let catalog_path = resolve_repo_path(ctx, &info.path)
+                .canonicalize()
+                .unwrap_or_else(|_| resolve_repo_path(ctx, &info.path));
+            if repo_root == catalog_path || cwd.starts_with(&catalog_path) {
+                name = catalog_name.clone();
+                in_catalog = true;
+                break;
+            }
+        }
+    }
+
+    Ok(CurrentRepo {
+        name,
+        path: repo_root.display().to_string(),
+        workspace: workspace.display().to_string(),
+        in_catalog,
+        machine: get_local_machine_name(&ctx.config.machines),
+    })
+}
+
+fn resolve_repo_path(ctx: &RuntimeContext, path: &str) -> PathBuf {
+    let expanded = expand_path(PathBuf::from(path)).unwrap_or_else(|_| PathBuf::from(path));
+    if expanded.is_absolute() {
+        expanded
+    } else {
+        ctx.workspace_root().join(expanded)
+    }
 }
 
 /// Validate project name against catalog or allow special names
@@ -3262,20 +3660,26 @@ fn repos_compare(
             Ok(o) if o.status.success() => {
                 let stdout = String::from_utf8_lossy(&o.stdout).trim().to_string();
                 let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
-                
+
                 // Handle various response formats from remote byt
                 if stdout.is_empty() {
                     if !ctx.common.quiet {
                         eprintln!("failed: empty response");
                         if !stderr.is_empty() {
-                            eprintln!("         (stderr: {})", stderr.lines().next().unwrap_or("").trim());
+                            eprintln!(
+                                "         (stderr: {})",
+                                stderr.lines().next().unwrap_or("").trim()
+                            );
                         }
                     }
                 } else if stdout == "[]" || stdout.starts_with('[') {
                     // Remote byt returned an array (likely old version or catalog issue)
                     if !ctx.common.quiet {
                         eprintln!("failed: invalid format (received array, expected object)");
-                        eprintln!("         Remote byt may need update: run 'byt catalog refresh' on {}", machine.name);
+                        eprintln!(
+                            "         Remote byt may need update: run 'byt catalog refresh' on {}",
+                            machine.name
+                        );
                     }
                 } else {
                     match serde_json::from_str::<MachineStatus>(&stdout) {
@@ -3530,11 +3934,15 @@ fn repos_clean(
                 if ctx.common.dry_run {
                     if !ctx.common.quiet {
                         let mib = freed_space / 1024 / 1024;
-                        eprintln!("dry-run (would remove debug: {} files, {} MiB)", removed_files, mib);
+                        eprintln!(
+                            "dry-run (would remove debug: {} files, {} MiB)",
+                            removed_files, mib
+                        );
                     }
                 } else {
-                    fs::remove_dir_all(&debug_dir)
-                        .with_context(|| format!("Failed to remove debug directory in {}", repo_name))?;
+                    fs::remove_dir_all(&debug_dir).with_context(|| {
+                        format!("Failed to remove debug directory in {}", repo_name)
+                    })?;
                     if !ctx.common.quiet {
                         let mib = freed_space / 1024 / 1024;
                         eprintln!("✓ Removed debug ({} files, {} MiB)", removed_files, mib);
@@ -3579,17 +3987,21 @@ fn repos_clean(
                         eprintln!("✓ {}", line.trim());
                     }
                     // Parse freed space
-                    if let Some(freed_str) = line.split_whitespace().find(|s| {
-                        s.ends_with("GiB") || s.ends_with("MiB") || s.ends_with("KiB")
-                    }) {
-                        let num_str = freed_str.trim_end_matches("GiB").trim_end_matches("MiB").trim_end_matches("KiB");
+                    if let Some(freed_str) = line
+                        .split_whitespace()
+                        .find(|s| s.ends_with("GiB") || s.ends_with("MiB") || s.ends_with("KiB"))
+                    {
+                        let num_str = freed_str
+                            .trim_end_matches("GiB")
+                            .trim_end_matches("MiB")
+                            .trim_end_matches("KiB");
                         if let Ok(num) = num_str.parse::<f64>() {
                             total_freed += if freed_str.ends_with("GiB") {
-                                (num * 1024.0 * 1024.0 * 1024.0) as u64  // GiB to bytes
+                                (num * 1024.0 * 1024.0 * 1024.0) as u64 // GiB to bytes
                             } else if freed_str.ends_with("MiB") {
-                                (num * 1024.0 * 1024.0) as u64  // MiB to bytes
+                                (num * 1024.0 * 1024.0) as u64 // MiB to bytes
                             } else {
-                                (num * 1024.0) as u64  // KiB to bytes
+                                (num * 1024.0) as u64 // KiB to bytes
                             };
                         }
                     }
@@ -4281,6 +4693,11 @@ fn normalize_git_url(source: &str) -> String {
         return source.to_string();
     }
 
+    // Local filesystem path (absolute, home, or explicitly relative) — pass through.
+    if source.starts_with('/') || source.starts_with('.') || source.starts_with('~') {
+        return source.to_string();
+    }
+
     // Platform-specific shorthand
     if let Some(path) = source.strip_prefix("gitlab:") {
         return format!("https://gitlab.com/{}", path);
@@ -4739,6 +5156,457 @@ fn schema_list(ctx: &RuntimeContext) -> Result<()> {
     }
 
     Ok(())
+}
+
+// ============================================================================
+// Design-System Distribute-Down
+// ============================================================================
+
+fn handle_design_system(ctx: &RuntimeContext, command: DesignSystemCommand) -> Result<()> {
+    match command {
+        DesignSystemCommand::Sync { repo, r#ref, build } => {
+            design_system_sync(ctx, repo, r#ref, build)
+        }
+        DesignSystemCommand::Status => design_system_status(ctx),
+        DesignSystemCommand::List => design_system_list(ctx),
+    }
+}
+
+/// Scan the catalog for repos carrying a design-system manifest and resolve each
+/// against the global defaults. Mirrors `find_schemas`.
+fn find_design_system_consumers(ctx: &RuntimeContext) -> Result<Vec<DesignSystemConsumer>> {
+    let workspace = ctx.workspace_root();
+    let cfg = &ctx.config.design_system;
+    let catalog = ctx.load_catalog()?;
+
+    let mut consumers = Vec::new();
+
+    let mut repo_names: Vec<&String> = catalog.repos.keys().collect();
+    repo_names.sort();
+
+    for repo_name in repo_names {
+        let repo_info = &catalog.repos[repo_name];
+        let repo_path = workspace.join(&repo_info.path);
+        let manifest_path = repo_path.join(&cfg.manifest);
+        if !manifest_path.exists() {
+            continue;
+        }
+
+        let content = fs::read_to_string(&manifest_path)
+            .with_context(|| format!("reading {}", manifest_path.display()))?;
+        let manifest: DesignSystemManifest = toml::from_str(&content)
+            .with_context(|| format!("parsing {}", manifest_path.display()))?;
+
+        let dest_rel = PathBuf::from(&manifest.path);
+        let dest = if dest_rel.is_absolute() {
+            dest_rel
+        } else {
+            repo_path.join(dest_rel)
+        };
+
+        consumers.push(DesignSystemConsumer {
+            repo: repo_name.clone(),
+            source: manifest.source.unwrap_or_else(|| cfg.source.clone()),
+            git_ref: manifest.git_ref.unwrap_or_else(|| cfg.default_ref.clone()),
+            impl_dir: manifest.impl_dir.unwrap_or_else(|| cfg.impl_dir.clone()),
+            dest,
+            build_cmd: manifest.build_cmd,
+        });
+    }
+
+    Ok(consumers)
+}
+
+fn design_system_sync(
+    ctx: &RuntimeContext,
+    filter_repos: Vec<String>,
+    ref_override: Option<String>,
+    build: bool,
+) -> Result<()> {
+    let consumers = find_design_system_consumers(ctx)?;
+
+    let consumers: Vec<_> = if filter_repos.is_empty() {
+        consumers
+    } else {
+        consumers
+            .into_iter()
+            .filter(|c| filter_repos.contains(&c.repo))
+            .collect()
+    };
+
+    if consumers.is_empty() {
+        if filter_repos.is_empty() {
+            println!(
+                "No design-system consumers found. Add a '{}' manifest to a repo.",
+                ctx.config.design_system.manifest
+            );
+        } else {
+            println!(
+                "No matching design-system consumers for: {:?}",
+                filter_repos
+            );
+        }
+        return Ok(());
+    }
+
+    for consumer in &consumers {
+        let git_ref = ref_override.as_deref().unwrap_or(&consumer.git_ref);
+        design_system_sync_one(ctx, consumer, git_ref, build)?;
+    }
+
+    Ok(())
+}
+
+fn design_system_sync_one(
+    ctx: &RuntimeContext,
+    consumer: &DesignSystemConsumer,
+    git_ref: &str,
+    build: bool,
+) -> Result<()> {
+    use std::process::Command;
+
+    let url = normalize_git_url(&consumer.source);
+    println!(
+        "[{}] {} @ {} (impls/{}) -> {}",
+        consumer.repo,
+        consumer.source,
+        git_ref,
+        consumer.impl_dir,
+        consumer.dest.display()
+    );
+
+    if ctx.common.dry_run {
+        println!(
+            "  dry-run: would fetch and vendor into {}",
+            consumer.dest.display()
+        );
+        return Ok(());
+    }
+
+    // Shallow fetch the pinned ref without cloning history. Works for tags,
+    // branches, and (GitHub allows) full SHAs.
+    let temp_dir =
+        std::env::temp_dir().join(format!("byt-ds-{}-{}", consumer.repo, std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir)?;
+
+    let run_git = |args: &[&str]| -> Result<std::process::Output> {
+        Command::new("git")
+            .args(args)
+            .current_dir(&temp_dir)
+            .output()
+            .context("running git")
+    };
+
+    let cleanup = || {
+        let _ = fs::remove_dir_all(&temp_dir);
+    };
+
+    macro_rules! git_or_bail {
+        ($args:expr, $what:expr) => {{
+            let out = run_git($args)?;
+            if !out.status.success() {
+                cleanup();
+                return Err(anyhow!(
+                    "{} failed for {}: {}",
+                    $what,
+                    consumer.repo,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
+            }
+            out
+        }};
+    }
+
+    git_or_bail!(&["init", "-q"], "git init");
+    git_or_bail!(&["remote", "add", "origin", &url], "git remote add");
+    git_or_bail!(
+        &["fetch", "-q", "--depth", "1", "origin", git_ref],
+        "git fetch"
+    );
+    git_or_bail!(&["checkout", "-q", "FETCH_HEAD"], "git checkout");
+
+    let sha_out = git_or_bail!(&["rev-parse", "HEAD"], "git rev-parse");
+    let sha = String::from_utf8_lossy(&sha_out.stdout).trim().to_string();
+
+    let impl_src = temp_dir.join("impls").join(&consumer.impl_dir);
+    if !impl_src.is_dir() {
+        cleanup();
+        return Err(anyhow!(
+            "impls/{} not found in {} @ {}",
+            consumer.impl_dir,
+            consumer.source,
+            git_ref
+        ));
+    }
+
+    // Overwrite the destination wholesale.
+    if consumer.dest.exists() {
+        fs::remove_dir_all(&consumer.dest)
+            .with_context(|| format!("clearing {}", consumer.dest.display()))?;
+    }
+    if let Some(parent) = consumer.dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    copy_dir_filtered(&impl_src, &consumer.dest, &[".git".to_string()])?;
+
+    // Stamp the vendored copy so its origin is self-documenting and queryable.
+    let fingerprint = tree_fingerprint(&consumer.dest)?;
+    let stamp = render_vendored_stamp(consumer, git_ref, &sha, &fingerprint);
+    fs::write(consumer.dest.join("VENDORED.md"), stamp)
+        .with_context(|| format!("writing VENDORED.md in {}", consumer.dest.display()))?;
+
+    println!(
+        "  vendored {} ({}) — sha {}",
+        git_ref,
+        consumer.impl_dir,
+        short_sha(&sha)
+    );
+
+    cleanup();
+
+    if build {
+        let cmd = consumer
+            .build_cmd
+            .clone()
+            .unwrap_or_else(|| "bun run build".to_string());
+        println!("  building: {}", cmd);
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .current_dir(&consumer.dest)
+            .status()
+            .context("running build command")?;
+        if !status.success() {
+            return Err(anyhow!("build failed for {}", consumer.repo));
+        }
+    }
+
+    Ok(())
+}
+
+fn design_system_status(ctx: &RuntimeContext) -> Result<()> {
+    let consumers = find_design_system_consumers(ctx)?;
+
+    if consumers.is_empty() {
+        println!("No design-system consumers found.");
+        return Ok(());
+    }
+
+    println!("Design-system consumers:\n");
+    for consumer in &consumers {
+        let stamp = read_vendored_stamp(&consumer.dest);
+
+        // Resolve the source's latest tag (sha + name).
+        let latest = source_latest_tag(&normalize_git_url(&consumer.source));
+
+        let state = match (&stamp, &latest) {
+            (None, _) => "not vendored".to_string(),
+            (Some(s), Ok(Some((latest_tag, latest_sha)))) => {
+                let current = tree_fingerprint(&consumer.dest).ok();
+                let edited = match (&current, &s.fingerprint) {
+                    (Some(c), Some(f)) => c != f,
+                    _ => false,
+                };
+                if edited {
+                    format!("diverged (local edits since sync; pinned {})", s.git_ref)
+                } else if s.sha == *latest_sha {
+                    format!("up-to-date ({})", latest_tag)
+                } else {
+                    format!("behind (pinned {} -> latest {})", s.git_ref, latest_tag)
+                }
+            }
+            (Some(s), Ok(None)) => format!("vendored {} (no tags upstream)", s.git_ref),
+            (Some(s), Err(_)) => format!("vendored {} (upstream unreachable)", s.git_ref),
+        };
+
+        println!("  {} [{}]", consumer.repo, state);
+        println!("    source: {} ({})", consumer.source, consumer.impl_dir);
+        println!("    path:   {}", consumer.dest.display());
+        if let Some(s) = &stamp {
+            println!("    pinned: {} @ {}", s.git_ref, short_sha(&s.sha));
+        }
+        println!();
+    }
+
+    Ok(())
+}
+
+fn design_system_list(ctx: &RuntimeContext) -> Result<()> {
+    let consumers = find_design_system_consumers(ctx)?;
+
+    if consumers.is_empty() {
+        println!(
+            "No design-system consumers found. Add a '{}' manifest to a repo.",
+            ctx.config.design_system.manifest
+        );
+        return Ok(());
+    }
+
+    println!("Design-system consumers:\n");
+    for consumer in &consumers {
+        let stamp = read_vendored_stamp(&consumer.dest);
+        let pinned = match &stamp {
+            Some(s) => format!("{} @ {}", s.git_ref, short_sha(&s.sha)),
+            None => format!("{} (not yet synced)", consumer.git_ref),
+        };
+        println!("  {} -> {}", consumer.repo, pinned);
+        println!(
+            "    source: {} (impls/{})",
+            consumer.source, consumer.impl_dir
+        );
+        println!("    path:   {}", consumer.dest.display());
+        println!();
+    }
+
+    Ok(())
+}
+
+/// Parsed `VENDORED.md` stamp fields.
+struct VendoredStamp {
+    git_ref: String,
+    sha: String,
+    fingerprint: Option<String>,
+}
+
+fn render_vendored_stamp(
+    consumer: &DesignSystemConsumer,
+    git_ref: &str,
+    sha: &str,
+    fingerprint: &str,
+) -> String {
+    let now = Utc::now().to_rfc3339();
+    format!(
+        "# VENDORED — do not edit by hand\n\n\
+         This directory is a vendored snapshot distributed by `byt design-system sync`.\n\
+         Edit the source repo, then re-run sync — local edits here are reported as drift.\n\n\
+         - source: {}\n\
+         - impl: {}\n\
+         - ref: {}\n\
+         - sha: {}\n\
+         - synced: {}\n\
+         - byt: {}\n\
+         - fingerprint: {}\n\n\
+         To update: `byt design-system sync --repo {}`\n",
+        normalize_git_url(&consumer.source),
+        consumer.impl_dir,
+        git_ref,
+        sha,
+        now,
+        env!("CARGO_PKG_VERSION"),
+        fingerprint,
+        consumer.repo,
+    )
+}
+
+fn read_vendored_stamp(dest: &Path) -> Option<VendoredStamp> {
+    let content = fs::read_to_string(dest.join("VENDORED.md")).ok()?;
+    let mut git_ref = None;
+    let mut sha = None;
+    let mut fingerprint = None;
+    for line in content.lines() {
+        let line = line.trim_start_matches('-').trim();
+        if let Some(v) = line.strip_prefix("ref:") {
+            git_ref = Some(v.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("sha:") {
+            sha = Some(v.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("fingerprint:") {
+            fingerprint = Some(v.trim().to_string());
+        }
+    }
+    Some(VendoredStamp {
+        git_ref: git_ref?,
+        sha: sha?,
+        fingerprint,
+    })
+}
+
+fn short_sha(sha: &str) -> String {
+    sha.chars().take(12).collect()
+}
+
+/// Query the source repo for its highest semver-ish tag via `git ls-remote`.
+/// Returns Ok(None) when the repo has no tags. Avoids cloning.
+fn source_latest_tag(url: &str) -> Result<Option<(String, String)>> {
+    use std::process::Command;
+
+    let out = Command::new("git")
+        .args(["ls-remote", "--tags", "--refs", url])
+        .output()
+        .context("running git ls-remote")?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "git ls-remote failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut best: Option<(Vec<u64>, String, String)> = None;
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        let sha = match parts.next() {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        let tag = match parts.next().and_then(|r| r.strip_prefix("refs/tags/")) {
+            Some(t) => t.to_string(),
+            None => continue,
+        };
+        let version = parse_version(&tag);
+        let better = match &best {
+            None => true,
+            Some((bv, _, _)) => version > *bv,
+        };
+        if better {
+            best = Some((version, tag, sha));
+        }
+    }
+
+    Ok(best.map(|(_, tag, sha)| (tag, sha)))
+}
+
+/// Parse a tag like `v1.2.3` into comparable numeric components. Non-numeric
+/// parts sort as 0, so this degrades gracefully for odd tags.
+fn parse_version(tag: &str) -> Vec<u64> {
+    tag.trim_start_matches(['v', 'V'])
+        .split(['.', '-', '+'])
+        .map(|p| p.parse::<u64>().unwrap_or(0))
+        .collect()
+}
+
+/// Stable FNV-1a fingerprint over a directory's files (sorted relative path +
+/// contents), excluding VENDORED.md so the stamp doesn't perturb its own hash.
+/// Used to detect local edits to a vendored snapshot.
+fn tree_fingerprint(dir: &Path) -> Result<String> {
+    let mut files: Vec<PathBuf> = Vec::new();
+    for entry in walkdir::WalkDir::new(dir).sort_by_file_name() {
+        let entry = entry?;
+        if entry.file_type().is_file() {
+            files.push(entry.path().to_path_buf());
+        }
+    }
+    files.sort();
+
+    let mut hash: u64 = 0xcbf29ce484222325;
+    let fnv = |hash: &mut u64, bytes: &[u8]| {
+        for b in bytes {
+            *hash ^= *b as u64;
+            *hash = hash.wrapping_mul(0x100000001b3);
+        }
+    };
+
+    for file in files {
+        let rel = file.strip_prefix(dir).unwrap_or(&file);
+        if rel.as_os_str() == "VENDORED.md" {
+            continue;
+        }
+        fnv(&mut hash, rel.to_string_lossy().as_bytes());
+        let bytes = fs::read(&file)?;
+        fnv(&mut hash, &bytes);
+    }
+
+    Ok(format!("{:016x}", hash))
 }
 
 // ============================================================================
@@ -5245,7 +6113,11 @@ fn generate_tools_index_json(tools: &[FoundTool]) -> Result<String> {
                 if s.starts_with("http") {
                     s.clone()
                 } else {
-                    format!("/toolz/{}/{}", t.tool.name, s.split('/').last().unwrap_or(s))
+                    format!(
+                        "/toolz/{}/{}",
+                        t.tool.name,
+                        s.split('/').last().unwrap_or(s)
+                    )
                 }
             });
             serde_json::json!({
@@ -5499,18 +6371,7 @@ fn expand_path(path: PathBuf) -> Result<PathBuf> {
 }
 
 fn default_config_dir() -> Result<PathBuf> {
-    if let Some(dir) = env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
-        return Ok(PathBuf::from(dir).join(APP_NAME));
-    }
-
-    if let Some(mut dir) = dirs::config_dir() {
-        dir.push(APP_NAME);
-        return Ok(dir);
-    }
-
-    dirs::home_dir()
-        .map(|home| home.join(".config").join(APP_NAME))
-        .ok_or_else(|| anyhow!("unable to determine configuration directory"))
+    Ok(base_dir("XDG_CONFIG_HOME", ".config", "APPDATA")?.join(APP_NAME))
 }
 
 fn discover_workspace_root() -> Result<PathBuf> {
@@ -5596,6 +6457,45 @@ mod tests {
     fn test_normalize_git_url_ssh_protocol() {
         let url = "ssh://git@github.com/user/repo";
         assert_eq!(normalize_git_url(url), url);
+    }
+
+    #[test]
+    fn test_normalize_git_url_local_path() {
+        // Absolute, relative, and home paths pass through untouched.
+        assert_eq!(normalize_git_url("/tmp/source/repo"), "/tmp/source/repo");
+        assert_eq!(normalize_git_url("./local/repo"), "./local/repo");
+        assert_eq!(normalize_git_url("~/src/repo"), "~/src/repo");
+    }
+
+    #[test]
+    fn test_parse_version_orders_correctly() {
+        assert!(parse_version("v0.2.0") > parse_version("v0.1.0"));
+        assert!(parse_version("v1.0.0") > parse_version("v0.9.9"));
+        assert!(parse_version("v0.10.0") > parse_version("v0.9.0"));
+        // leading 'v' optional and non-numeric components degrade to 0
+        assert_eq!(parse_version("0.1.0"), parse_version("v0.1.0"));
+    }
+
+    #[test]
+    fn test_design_system_manifest_parsing() {
+        let toml_str = r#"
+            source = "byteowlz/design-system"
+            ref    = "v0.1.0"
+            impl   = "shadcn-ts"
+            path   = "frontend/vendor/design-system"
+        "#;
+        let m: DesignSystemManifest = toml::from_str(toml_str).unwrap();
+        assert_eq!(m.source.as_deref(), Some("byteowlz/design-system"));
+        assert_eq!(m.git_ref.as_deref(), Some("v0.1.0"));
+        assert_eq!(m.impl_dir.as_deref(), Some("shadcn-ts"));
+        assert_eq!(m.path, "frontend/vendor/design-system");
+        assert!(m.build_cmd.is_none());
+
+        // Minimal manifest: only `path` is required; the rest fall back to defaults.
+        let minimal: DesignSystemManifest = toml::from_str("path = \"vendor/ds\"").unwrap();
+        assert_eq!(minimal.path, "vendor/ds");
+        assert!(minimal.source.is_none());
+        assert!(minimal.git_ref.is_none());
     }
 
     #[test]
