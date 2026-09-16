@@ -25,6 +25,11 @@ byt current mmry --json  # Machine-readable cross-machine status
 byt lint                 # Check compliance across repos
 byt status               # Show repo status matrix
 
+# Shared git hooks (byteowlz/githooks, always-current)
+byt hooks install        # Pull latest hooks into machine cache + wire core.hooksPath
+byt hooks status         # Show wired hooks path, hook files, gitleaks
+byt hooks update         # Force-refresh hooks cache (no repo rewiring)
+
 # Issue tracking
 byt ready                # Govnr-level ready work
 
