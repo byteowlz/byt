@@ -11,7 +11,7 @@ use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use config::{Config, Environment, File, FileFormat};
 use env_logger::fmt::WriteStyle;
-use log::{LevelFilter, debug, info};
+use log::{LevelFilter, debug, info, warn};
 use serde::{Deserialize, Serialize};
 
 const APP_NAME: &str = env!("CARGO_PKG_NAME");
@@ -47,6 +47,7 @@ fn try_main() -> Result<()> {
         Command::New(cmd) => handle_new(&ctx, cmd),
         Command::Schema { command } => handle_schema(&ctx, command),
         Command::DesignSystem { command } => handle_design_system(&ctx, command),
+        Command::Hooks { command } => handle_hooks(&ctx, command),
         Command::Website { command } => handle_website(&ctx, command),
         Command::Release { command } => release::handle_release(&ctx, command),
         Command::Completions { shell } => handle_completions(shell),
@@ -151,6 +152,11 @@ enum Command {
     DesignSystem {
         #[command(subcommand)]
         command: DesignSystemCommand,
+    },
+    /// Install shared git hooks from byteowlz/githooks (always-current)
+    Hooks {
+        #[command(subcommand)]
+        command: HooksCommand,
     },
     /// Manage byteowlz.com website (sync tool pages from repos)
     Website {
@@ -439,6 +445,25 @@ enum DesignSystemCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum HooksCommand {
+    /// Install shared hooks into a repo: pull latest from the source into the
+    /// machine cache and wire `core.hooksPath` to it (per-repo, machine-local)
+    Install {
+        /// Target repository directory (default: current directory)
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+    /// Show the wired hooks path, installed hook files, and gitleaks availability
+    Status {
+        /// Target repository directory (default: current directory)
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+    /// Force-refresh the machine hooks cache without (re)wiring a repository
+    Update,
+}
+
+#[derive(Debug, Subcommand)]
 enum WebsiteCommand {
     /// Sync tool.toml files to website repository
     Sync {
@@ -714,6 +739,8 @@ struct AppConfig {
     schemas: SchemaConfig,
     /// Design-system distribute-down settings
     design_system: DesignSystemConfig,
+    /// Shared git hooks (byteowlz/githooks) install settings
+    hooks: HooksConfig,
     /// Website settings
     website: WebsiteConfig,
     /// Memory sync settings
@@ -1051,6 +1078,22 @@ impl Default for DesignSystemConfig {
     }
 }
 
+/// Optional overrides for the shared git-hook source. `[:env BYT_HOOKS_SOURCE]`
+/// (or `BYT_HOOKS_SOURCE` env var directly) wins over this; default is
+/// `byteowlz/githooks`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HooksConfig {
+    /// Source repo (github org/name, URL, or local path) for shared hooks
+    #[serde(default)]
+    source: Option<String>,
+}
+
+impl Default for HooksConfig {
+    fn default() -> Self {
+        Self { source: None }
+    }
+}
+
 /// Per-consumer manifest, parsed from `design-system.toml` at a repo root.
 /// `source`/`impl`/`ref` fall back to `DesignSystemConfig` defaults when absent.
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -1174,6 +1217,7 @@ impl Default for AppConfig {
             templates: TemplatesConfig::default(),
             schemas: SchemaConfig::default(),
             design_system: DesignSystemConfig::default(),
+            hooks: HooksConfig::default(),
             website: WebsiteConfig::default(),
             sync: SyncConfig::default(),
             machines: Vec::new(),
@@ -4392,11 +4436,13 @@ fn handle_new(ctx: &RuntimeContext, cmd: NewCommand) -> Result<()> {
             .output();
     }
 
-    // Initialize trx if not already present
+    // Initialize trx if not already present, with a short issue-ID prefix
+    // derived from the repo name (e.g. "byteowlz-push" -> "bypush")
     if !project_dir.join(".trx").exists() {
         println!("Initializing trx...");
+        let prefix = short_prefix(&cmd.name);
         let _ = Command::new("trx")
-            .args(["init"])
+            .args(["init", "--prefix", &prefix])
             .current_dir(&project_dir)
             .output();
     }
@@ -4454,6 +4500,35 @@ fn handle_new(ctx: &RuntimeContext, cmd: NewCommand) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Max length for a derived trx issue-ID prefix.
+const MAX_TRX_PREFIX_LEN: usize = 6;
+
+/// Derive a short trx issue-ID prefix from a repo name: lowercase,
+/// keep the leading character, drop vowels, strip separators,
+/// truncate to [`MAX_TRX_PREFIX_LEN`].
+///
+/// Examples: "byt" -> "byt", "byteowlz-push" -> "bytwlz",
+/// "comfyui-workflows" -> "cmfywr", "dgrmr" -> "dgrmr".
+fn short_prefix(name: &str) -> String {
+    let mut out = String::with_capacity(MAX_TRX_PREFIX_LEN);
+    for (i, ch) in name.chars().enumerate() {
+        if !ch.is_ascii_alphanumeric() {
+            continue;
+        }
+        let lower = ch.to_ascii_lowercase();
+        if i == 0 || !matches!(lower, 'a' | 'e' | 'i' | 'o' | 'u') {
+            out.push(lower);
+            if out.len() >= MAX_TRX_PREFIX_LEN {
+                break;
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push_str("trx");
+    }
+    out
 }
 
 /// Scaffold a project from a git repository
@@ -4855,21 +4930,30 @@ fn rename_template_dirs(project_dir: &Path, template: &str, project_name: &str) 
     if template == "rust-workspace" {
         let crates_dir = project_dir.join("crates");
         if crates_dir.exists() {
+            // The template names crates `{{project_name}}-core` etc. and
+            // references them as `{{project_name}}_core` in source; the earlier
+            // `{{project_name}}` content replacement already rewrote every
+            // dash/underscore reference in files. Here we only rename the
+            // on-disk crate dirs (dir names aren't touched by replace_in_files).
+            // Fall back to legacy `rust-*` dir names from older snapshots.
+            // `byteowlz-tui-kit` is a real vendored crate and is left as-is.
             for entry in fs::read_dir(&crates_dir)? {
                 let entry = entry?;
+                if !entry.file_type()?.is_dir() {
+                    continue;
+                }
                 let old_name = entry.file_name().to_string_lossy().to_string();
-                if old_name.starts_with("rust-") {
-                    let new_name = old_name.replace("rust-", &format!("{}-", project_name));
-                    let new_path = crates_dir.join(&new_name);
-                    fs::rename(entry.path(), &new_path)?;
+                let new_name = if old_name.contains("{{project_name}}") {
+                    old_name.replace("{{project_name}}", project_name)
+                } else if old_name.starts_with("rust-") {
+                    old_name.replacen("rust-", &format!("{project_name}-"), 1)
+                } else {
+                    continue
+                };
+                if new_name != old_name {
+                    fs::rename(entry.path(), crates_dir.join(&new_name))?;
                 }
             }
-            // Update Cargo.toml references
-            replace_in_files(project_dir, "rust-cli", &format!("{}-cli", project_name))?;
-            replace_in_files(project_dir, "rust-core", &format!("{}-core", project_name))?;
-            replace_in_files(project_dir, "rust-api", &format!("{}-api", project_name))?;
-            replace_in_files(project_dir, "rust-mcp", &format!("{}-mcp", project_name))?;
-            replace_in_files(project_dir, "rust-tui", &format!("{}-tui", project_name))?;
         }
     }
 
@@ -5170,6 +5254,284 @@ fn handle_design_system(ctx: &RuntimeContext, command: DesignSystemCommand) -> R
         DesignSystemCommand::Status => design_system_status(ctx),
         DesignSystemCommand::List => design_system_list(ctx),
     }
+}
+
+fn handle_hooks(ctx: &RuntimeContext, command: HooksCommand) -> Result<()> {
+    match command {
+        HooksCommand::Install { repo } => hooks_install(ctx, repo.as_deref()),
+        HooksCommand::Status { repo } => hooks_status(ctx, repo.as_deref()),
+        HooksCommand::Update => hooks_update(ctx),
+    }
+}
+
+/// Resolve the active hook source. Precedence: `BYT_HOOKS_SOURCE` env var,
+/// then config `hooks.source`, then the canonical `byteowlz/githooks`.
+fn hooks_source(ctx: &RuntimeContext) -> String {
+    if let Some(s) = env::var("BYT_HOOKS_SOURCE").ok().filter(|s| !s.is_empty()) {
+        return s;
+    }
+    if let Some(s) = ctx
+        .config
+        .hooks
+        .source
+        .clone()
+        .filter(|s| !s.is_empty())
+    {
+        return s;
+    }
+    "byteowlz/githooks".to_string()
+}
+
+/// Machine cache dir: `<XDG_CACHE_HOME or ~/.cache>/byteowlz/hooks`. This
+/// directory is itself a git clone of the hooks source; `<cache>/hooks` holds
+/// the actual hook files we wire to.
+fn hooks_cache_dir() -> Result<PathBuf> {
+    Ok(base_dir("XDG_CACHE_HOME", ".cache", "LOCALAPPDATA")?.join("byteowlz").join("hooks"))
+}
+
+/// Run `git` in `dir`, returning stdout on success.
+fn git_ok(dir: &Path, args: &[&str]) -> Result<String> {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .with_context(|| format!("running git {:?} in {}", args, dir.display()))?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Run `git` in `dir`, returning the raw output on success (no stdout trim).
+fn git_ok_output(dir: &Path, args: &[&str]) -> Result<std::process::Output> {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .with_context(|| format!("running git {:?} in {}", args, dir.display()))?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(out)
+}
+
+/// Resolve the target repo root from `--repo` (or cwd). Errors clearly if the
+/// given directory is not inside a git work tree.
+fn hooks_target_dir(repo: Option<&Path>) -> Result<PathBuf> {
+    let dir = match repo {
+        Some(p) => expand_path(p.to_path_buf())?,
+        None => env::current_dir()?,
+    };
+    let top = git_ok(&dir, &["rev-parse", "--show-toplevel"]).with_context(|| {
+        format!(
+            "{} is not inside a git repository",
+            dir.display()
+        )
+    })?;
+    Ok(PathBuf::from(top))
+}
+
+/// Ensure the machine cache holds a current clone of the hooks source. On first
+/// run it clones; otherwise it does an always-pull. Non-fragile: if the source
+/// is unreachable but a cache exists, it keeps the last-known copy and warns
+/// rather than failing. Returns the cache dir and whether it was refreshed.
+fn ensure_hooks_cache(ctx: &RuntimeContext) -> Result<(PathBuf, bool)> {
+    let cache_dir = hooks_cache_dir()?;
+    let source = hooks_source(ctx);
+
+    if cache_dir.join(".git").exists() {
+        // Ignore exec-bit tracking so our chmod never dirties the clone and
+        // never blocks `git pull --ff-only`.
+        let _ = git_ok(&cache_dir, &["config", "core.fileMode", "false"]);
+        // Already cached -> always-pull (may fail gracefully).
+        let refreshed = if ctx.common.dry_run {
+            println!(
+                "  dry-run: would `git pull` the hooks cache in {}",
+                cache_dir.display()
+            );
+            false
+        } else {
+            match git_ok_output(&cache_dir, &["pull", "-q", "--ff-only"]) {
+                Ok(_) => true,
+                Err(e) => {
+                    warn!(
+                        "could not update hooks cache from {source} ({e}); keeping the last-known copy"
+                    );
+                    false
+                }
+            }
+        };
+        make_hooks_executable(&cache_dir);
+        Ok((cache_dir.clone(), refreshed))
+    } else {
+        // No cache -> clone; failure here is fatal (nothing to fall back to).
+        let url = normalize_git_url(&source);
+        if ctx.common.dry_run {
+            println!(
+                "  dry-run: would clone {url} into {}",
+                cache_dir.display()
+            );
+            return Ok((cache_dir.clone(), false));
+        }
+        if let Some(parent) = cache_dir.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let url_c = url.clone();
+        let cache_c = cache_dir.clone();
+        git_ok_output(
+            cache_dir.parent().unwrap_or(Path::new(".")),
+            &["clone", "-q", &url_c, "hooks"],
+        )
+        .with_context(|| {
+            format!(
+                "no hooks cache and could not fetch {source}: make the source reachable or set BYT_HOOKS_SOURCE"
+            )
+        })?;
+        // Make sure the hook scripts are runnable even if the repo stores them
+        // non-exec, without letting the mode change dirty the clone.
+        let _ = git_ok(&cache_c, &["config", "core.fileMode", "false"]);
+        make_hooks_executable(&cache_c);
+        Ok((cache_dir, true))
+    }
+}
+
+/// Make the hook files executable on disk while keeping the clone's git view
+/// clean (relies on `core.fileMode false` being set on the cache clone).
+fn make_hooks_executable(cache_dir: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for name in ["pre-commit", "pre-push", "schema-guard"] {
+            let f = cache_dir.join("hooks").join(name);
+            let _ = fs::set_permissions(&f, PermissionsExt::from_mode(0o755));
+        }
+    }
+}
+
+/// List the non-directory files under a hooks dir (sorted).
+fn list_hook_files(hooks_dir: &Path) -> Vec<String> {
+    let mut names = Vec::new();
+    if let Ok(rd) = fs::read_dir(hooks_dir) {
+        for e in rd.flatten() {
+            let path = e.path();
+            if path.is_dir() {
+                continue;
+            }
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names.sort();
+    names
+}
+
+/// Is the gitleaks secret-scan binary available on PATH?
+fn gitleaks_available() -> bool {
+    which::which("gitleaks").is_ok()
+}
+
+fn hooks_install(ctx: &RuntimeContext, repo: Option<&Path>) -> Result<()> {
+    let target = hooks_target_dir(repo)?;
+    println!("Installing shared hooks for {}", target.display());
+
+    let (cache_dir, _refreshed) = ensure_hooks_cache(ctx)?;
+    let hooks_dir = cache_dir.join("hooks");
+    let files = list_hook_files(&hooks_dir);
+
+    let path_str = hooks_dir
+        .to_str()
+        .ok_or_else(|| anyhow!("hooks path is not UTF-8"))?;
+    if ctx.common.dry_run {
+        println!("  dry-run: would set core.hooksPath={path_str}");
+    } else {
+        git_ok(&target, &["config", "core.hooksPath", path_str])?;
+    }
+
+    println!("Wired core.hooksPath -> {}", hooks_dir.display());
+    if files.is_empty() {
+        println!("  (no hook files present in cache)");
+    } else {
+        println!("  hook files: {}", files.join(", "));
+    }
+    let gl = gitleaks_available();
+    println!(
+        "  gitleaks (secret scanner): {}",
+        if gl { "present" } else { "missing (optional; hooks still run)" }
+    );
+    println!(
+        "  The hooks will run on the next commit/push in this repo."
+    );
+    Ok(())
+}
+
+fn hooks_update(ctx: &RuntimeContext) -> Result<()> {
+    println!("Refreshing shared hooks cache...");
+    let (cache_dir, refreshed) = ensure_hooks_cache(ctx)?;
+    if refreshed {
+        println!("Hooks cache updated: {}", cache_dir.display());
+    } else {
+        println!("Hooks cache unchanged (kept last-known copy): {}", cache_dir.display());
+    }
+    let files = list_hook_files(&cache_dir.join("hooks"));
+    println!("  hook files: {}", files.join(", "));
+    let gl = gitleaks_available();
+    println!(
+        "  gitleaks (secret scanner): {}",
+        if gl { "present" } else { "missing (optional)" }
+    );
+    Ok(())
+}
+
+fn hooks_status(_ctx: &RuntimeContext, repo: Option<&Path>) -> Result<()> {
+    let target = hooks_target_dir(repo)?;
+    println!("Repo: {}", target.display());
+
+    let cfg = match git_ok(&target, &["config", "--get", "core.hooksPath"]) {
+        Ok(v) if !v.is_empty() => Some(v),
+        _ => None,
+    };
+    match &cfg {
+        Some(p) => {
+            println!("core.hooksPath: {p}");
+            let resolved = if Path::new(p).is_absolute() {
+                PathBuf::from(p)
+            } else {
+                target.join(p)
+            };
+            let files = list_hook_files(&resolved);
+            if files.is_empty() {
+                println!("  (no hook files found at that path)");
+            } else {
+                println!("  hook files present: {}", files.join(", "));
+            }
+            let expect = hooks_cache_dir().unwrap_or_default().join("hooks");
+            if resolved == expect {
+                println!("  wired to byteowlz machine cache (always-current)");
+            } else {
+                println!("  wired to a non-byt path (not managed by `byt hooks`)");
+            }
+        }
+        None => {
+            println!("core.hooksPath: (not set)");
+            println!("  This repo's hooks are not wired. Run `byt hooks install`.");
+        }
+    }
+
+    let gl = gitleaks_available();
+    println!(
+        "gitleaks (secret scanner): {}",
+        if gl { "present" } else { "missing (optional)" }
+    );
+    Ok(())
 }
 
 /// Scan the catalog for repos carrying a design-system manifest and resolve each
@@ -6436,6 +6798,37 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
+    fn test_hooks_cache_dir_suffix() {
+        // The cache dir always ends in byteowlz/hooks under the base cache.
+        let dir = hooks_cache_dir().unwrap();
+        assert_eq!(dir.file_name().unwrap(), "hooks");
+        assert_eq!(dir.parent().unwrap().file_name().unwrap(), "byteowlz");
+    }
+
+    #[test]
+    fn test_list_hook_files_sorts_and_skips_dirs() {
+        let temp = std::env::temp_dir().join("byt-test-hooks-list");
+        let _ = fs::remove_dir_all(&temp);
+        fs::create_dir_all(temp.join("sub")).unwrap();
+        fs::write(temp.join("pre-commit"), "x").unwrap();
+        fs::write(temp.join("schema-guard"), "x").unwrap();
+        fs::write(temp.join("pre-push"), "x").unwrap();
+        fs::write(temp.join("sub/nested"), "x").unwrap();
+
+        let files = list_hook_files(&temp);
+        assert_eq!(files, vec!["pre-commit", "pre-push", "schema-guard"]);
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_list_hook_files_missing_dir_is_empty() {
+        let missing = std::env::temp_dir().join("byt-test-hooks-missing");
+        let _ = fs::remove_dir_all(&missing);
+        assert!(list_hook_files(&missing).is_empty());
+    }
+
+    #[test]
     fn test_normalize_git_url_full_https() {
         let url = "https://github.com/user/repo";
         assert_eq!(normalize_git_url(url), url);
@@ -6716,6 +7109,22 @@ mod tests {
     // -------------------------------------------------------------------------
     // NewCommand argument tests
     // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_short_prefix() {
+        assert_eq!(short_prefix("byt"), "byt");
+        assert_eq!(short_prefix("dgrmr"), "dgrmr");
+        assert_eq!(short_prefix("byteowlz-push"), "bytwlz");
+        assert_eq!(short_prefix("comfyui-workflows"), "cmfywr");
+        // Leading vowel is kept for recognizability
+        assert_eq!(short_prefix("orchestrator"), "orchst");
+        // Separators are stripped
+        assert_eq!(short_prefix("my_cool.app"), "myclpp");
+        // Long names truncate at the max length
+        assert_eq!(short_prefix("a-very-long-repository-name"), "avryln");
+        // Fallback when nothing usable survives
+        assert_eq!(short_prefix("---"), "trx");
+    }
 
     #[test]
     fn test_new_command_default_template() {
