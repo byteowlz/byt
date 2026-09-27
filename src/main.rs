@@ -4948,7 +4948,7 @@ fn rename_template_dirs(project_dir: &Path, template: &str, project_name: &str) 
                 } else if old_name.starts_with("rust-") {
                     old_name.replacen("rust-", &format!("{project_name}-"), 1)
                 } else {
-                    continue
+                    continue;
                 };
                 if new_name != old_name {
                     fs::rename(entry.path(), crates_dir.join(&new_name))?;
@@ -5270,13 +5270,7 @@ fn hooks_source(ctx: &RuntimeContext) -> String {
     if let Some(s) = env::var("BYT_HOOKS_SOURCE").ok().filter(|s| !s.is_empty()) {
         return s;
     }
-    if let Some(s) = ctx
-        .config
-        .hooks
-        .source
-        .clone()
-        .filter(|s| !s.is_empty())
-    {
+    if let Some(s) = ctx.config.hooks.source.clone().filter(|s| !s.is_empty()) {
         return s;
     }
     "byteowlz/githooks".to_string()
@@ -5286,7 +5280,9 @@ fn hooks_source(ctx: &RuntimeContext) -> String {
 /// directory is itself a git clone of the hooks source; `<cache>/hooks` holds
 /// the actual hook files we wire to.
 fn hooks_cache_dir() -> Result<PathBuf> {
-    Ok(base_dir("XDG_CACHE_HOME", ".cache", "LOCALAPPDATA")?.join("byteowlz").join("hooks"))
+    Ok(base_dir("XDG_CACHE_HOME", ".cache", "LOCALAPPDATA")?
+        .join("byteowlz")
+        .join("hooks"))
 }
 
 /// Run `git` in `dir`, returning stdout on success.
@@ -5330,12 +5326,8 @@ fn hooks_target_dir(repo: Option<&Path>) -> Result<PathBuf> {
         Some(p) => expand_path(p.to_path_buf())?,
         None => env::current_dir()?,
     };
-    let top = git_ok(&dir, &["rev-parse", "--show-toplevel"]).with_context(|| {
-        format!(
-            "{} is not inside a git repository",
-            dir.display()
-        )
-    })?;
+    let top = git_ok(&dir, &["rev-parse", "--show-toplevel"])
+        .with_context(|| format!("{} is not inside a git repository", dir.display()))?;
     Ok(PathBuf::from(top))
 }
 
@@ -5375,10 +5367,7 @@ fn ensure_hooks_cache(ctx: &RuntimeContext) -> Result<(PathBuf, bool)> {
         // No cache -> clone; failure here is fatal (nothing to fall back to).
         let url = normalize_git_url(&source);
         if ctx.common.dry_run {
-            println!(
-                "  dry-run: would clone {url} into {}",
-                cache_dir.display()
-            );
+            println!("  dry-run: would clone {url} into {}", cache_dir.display());
             return Ok((cache_dir.clone(), false));
         }
         if let Some(parent) = cache_dir.parent() {
@@ -5465,11 +5454,13 @@ fn hooks_install(ctx: &RuntimeContext, repo: Option<&Path>) -> Result<()> {
     let gl = gitleaks_available();
     println!(
         "  gitleaks (secret scanner): {}",
-        if gl { "present" } else { "missing (optional; hooks still run)" }
+        if gl {
+            "present"
+        } else {
+            "missing (optional; hooks still run)"
+        }
     );
-    println!(
-        "  The hooks will run on the next commit/push in this repo."
-    );
+    println!("  The hooks will run on the next commit/push in this repo.");
     Ok(())
 }
 
@@ -5479,7 +5470,10 @@ fn hooks_update(ctx: &RuntimeContext) -> Result<()> {
     if refreshed {
         println!("Hooks cache updated: {}", cache_dir.display());
     } else {
-        println!("Hooks cache unchanged (kept last-known copy): {}", cache_dir.display());
+        println!(
+            "Hooks cache unchanged (kept last-known copy): {}",
+            cache_dir.display()
+        );
     }
     let files = list_hook_files(&cache_dir.join("hooks"));
     println!("  hook files: {}", files.join(", "));
