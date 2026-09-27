@@ -33,10 +33,30 @@ byt hooks update         # Force-refresh hooks cache (no repo rewiring)
 # Issue tracking
 byt ready                # Govnr-level ready work
 
+# Releases (ADR-0021/0022; see .github/workflows/release.yml)
+byt release build --os linux   # Build configured linux targets
+byt release targets            # Print configured target triples
+byt release checksums          # Write dist/release/checksums.txt
+
 # Knowledge
 byt memory search "q"    # Search memories (via mmry)
 byt memory add "content" # Add memory
 ```
+
+## Release builder
+
+`ghcr.io/byteowlz/byt` (built from this repo's `Dockerfile`) is the shared
+builder image: every byteowlz repo's release workflow runs `byt release` inside
+it. Linux-gnu targets go through `cargo zigbuild` with a glibc 2.28 floor.
+
+Rust apps that link **system native libraries** (e.g. trnscrb's speakrs
+diarization backend -> `openblas-system`) are supported: the image carries
+`pkg-config` + `libopenblas-dev` for its native arch and, via Debian multiarch,
+for arm64. `byt release` exports per-target env so the zig linker and pkg-config
+resolve the *target's* library (`/usr/lib/<multiarch>-linux-gnu`), since zig cc
+searches only its own sysroot. The built binary keeps the glibc floor and gains
+a **runtime dependency** on the deployment host's library (`libopenblas.so.0`) —
+apps must document that dependency (AUR `depends`, README requirements).
 
 ## Integration
 
