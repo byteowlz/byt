@@ -6,6 +6,17 @@
 # `byt release`. Built from source once (the bootstrap); thereafter byt's own
 # releases self-host on the previous image.
 #
+# System native libraries: pkg-config + libopenblas-dev / libssl-dev (native
+# and arm64 multiarch) let Rust targets that link system libraries build here —
+# e.g. trnscrb's speakrs diarization backend (`openblas-system`) and its
+# hf-hub/native-tls model downloads (`openssl-sys`). zig cc only searches its
+# own sysroot (and substitutes its libc++ for -lstdc++, which cannot satisfy
+# GNU-ABI C++ archives like statically-linked ONNX Runtime), so `byt release`
+# points the linker, the C include path, pkg-config and the C++ runtime at the
+# deployment-shaped libraries (src/release.rs); linked binaries then carry
+# runtime dependencies on the deployment host's libraries (the app's release
+# config must document them, e.g. AUR `depends`).
+#
 # rust must be >= 1.88 (let-chains used in src/release.rs) and edition 2024 (>=1.85).
 
 # ---- stage 1: build byt from source ----
@@ -23,8 +34,13 @@ ARG GO_VERSION=1.23.4
 # OS deps + GitHub CLI (for `byt release publish` -> `gh release create`).
 # protobuf-compiler: `protoc` runs on the build host for prost/tonic codegen
 # (arch-independent), needed by apps like mmry; not a cross-linked target lib.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl git tar xz-utils protobuf-compiler \
+# pkg-config + the dev libraries (native amd64 + arm64 multiarch): system
+# native libs for Rust release targets (see header comment) — OpenBLAS
+# (trnscrb speakrs diarization) and OpenSSL (hf-hub/native-tls downloads).
+# The arm64 copies serve the aarch64-unknown-linux-gnu cross build.
+RUN dpkg --add-architecture arm64 \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl git tar xz-utils protobuf-compiler pkg-config libopenblas-dev libssl-dev libopenblas-dev:arm64 libssl-dev:arm64 libstdc++6:arm64 \
     && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
         -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \

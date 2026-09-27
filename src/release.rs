@@ -118,6 +118,17 @@ struct ReleaseSection {
     /// Target triples; defaults to linux x86_64 + aarch64.
     #[serde(default)]
     targets: Vec<String>,
+    /// Extra RUSTFLAGS appended for linux-gnu targets, e.g. linkage that zig cc
+    /// needs help with (`-Clink-arg=-l:libstdc++.so.6` for statically-linked
+    /// GNU-ABI C++ deps like ONNX Runtime). Keep them in the repo so releases
+    /// are repeatable — CI never sets flags by hand.
+    #[serde(default)]
+    linux_gnu_rustflags: Vec<String>,
+    /// glibc floor for linux-gnu targets; defaults to the ADR-0021 2.28. Raise
+    /// it when a statically linked native dependency (e.g. ONNX Runtime)
+    /// references newer glibc symbols — the floor must cover the whole link.
+    #[serde(default)]
+    glibc_floor: Option<String>,
     /// Extra files copied to the staging root; defaults to LICENSE + README.md.
     #[serde(default)]
     extra: Vec<String>,
@@ -331,13 +342,15 @@ fn strip_v(s: &str) -> String {
     s.trim_start_matches('v').to_string()
 }
 
-/// Extract the first `version = "x"` under `[package]` from a Cargo.toml body.
+/// Extract the first `version = "x"` under a `[package]` or
+/// `[workspace.package]` table from a Cargo.toml body (single-crate packages
+/// and workspace roots both resolve).
 fn parse_cargo_version(text: &str) -> Option<String> {
     let mut in_pkg = false;
     for line in text.lines() {
         let line = line.trim();
         if line.starts_with('[') {
-            in_pkg = line == "[package]";
+            in_pkg = line == "[package]" || line == "[workspace.package]";
             continue;
         }
         if in_pkg
@@ -460,24 +473,125 @@ fn copy_file(ctx: &RuntimeContext, src: &Path, dest: &Path) -> Result<()> {
 /// (`<triple>.<GLIBC_FLOOR>`) so the artifact runs on older systems; other
 /// targets are unchanged. The rust output dir + artifact name keep the plain
 /// triple (cargo-zigbuild strips the glibc suffix for cargo).
-fn zig_build_target(triple: &str) -> String {
+fn zig_build_target(triple: &str, floor: &str) -> String {
     if triple.ends_with("-linux-gnu") {
-        format!("{triple}.{GLIBC_FLOOR}")
+        format!("{triple}.{floor}")
     } else {
         triple.to_string()
     }
 }
 
-fn compile_rust(ctx: &RuntimeContext, root: &Path, triple: &str) -> Result<()> {
+/// Effective glibc floor for linux-gnu targets: the repo's `[release]
+/// .glibc_floor` when set (statically linked deps can force newer glibc), else
+/// the ADR-0021 default.
+fn resolve_glibc_floor(cfg: &ReleaseSection) -> String {
+    match &cfg.glibc_floor {
+        Some(f) if !f.trim().is_empty() => f.trim().to_string(),
+        _ => GLIBC_FLOOR.to_string(),
+    }
+}
+
+/// Debian multiarch directory name for a linux-gnu target in the byt release
+/// matrix (`/usr/lib/<multiarch>/...`); None for arches the builder image does
+/// not carry libraries for.
+fn debian_multiarch(triple: &str) -> Option<&'static str> {
+    if !triple.ends_with("-linux-gnu") {
+        return None;
+    }
+    if triple.starts_with("x86_64") {
+        Some("x86_64-linux-gnu")
+    } else if triple.starts_with("aarch64") {
+        Some("aarch64-linux-gnu")
+    } else {
+        None
+    }
+}
+
+/// Per-target environment for system native libraries (OpenBLAS, OpenSSL, etc.)
+/// on linux-gnu targets. zig cc — the cargo-zigbuild linker/compiler —
+/// searches only its own sysroot, so a build script that emits a bare
+/// `cargo:rustc-link-lib` without a search path (what openblas-src's `system`
+/// feature does when its pkg-config probe fails) can never link, and C header
+/// probes (openssl-sys's version check) miss Debian's multiarch headers. On a
+/// cross build, a pkg-config probe would otherwise return the *host* library.
+///
+/// - `CARGO_TARGET_<TRIPLE>_RUSTFLAGS` (cargo's uppercase convention) adds the
+///   target's Debian multiarch lib dir as a native link search path (honored
+///   by cargo itself; overrides any same-named variable in the environment).
+/// - `CFLAGS_<triple>` / `CXXFLAGS_<triple>` (the cc crate's lowercase
+///   convention) add the multiarch include dir so cc-crate probes and C
+///   builds see the target's headers.
+/// - Cross builds (target arch != host arch) point pkg-config at the target
+///   sysroot and allow the cross probe, so `pkg-config openblas` resolves the
+///   target-arch `.pc` + library (installed via Debian multiarch in the
+///   builder image).
+/// - `extra` (`[release].linux_gnu_rustflags`) is appended to the RUSTFLAGS so
+///   a repo can opt into linkage zig cc cannot express, e.g.
+///   `-Clink-arg=-l:libstdc++.so.6` to link the host GNU libstdc++ for
+///   statically-linked GNU-ABI C++ deps (ONNX Runtime) — zig otherwise
+///   substitutes its own libc++, whose inline namespace cannot satisfy
+///   `std::__cxx11` symbols. (Single-token `-Clink-arg=...` form: cargo
+///   splits the env on spaces and rustc rejects bare `-l:` tokens.)
+fn system_lib_env(triple: &str, host_arch: &str, extra: &[String]) -> Vec<(String, String)> {
+    if !triple.ends_with("-linux-gnu") {
+        return Vec::new();
+    }
+    let Some(multiarch) = debian_multiarch(triple) else {
+        return Vec::new();
+    };
+    let underscored = triple.replace('-', "_");
+    let mut rustflags = format!("-L native=/usr/lib/{multiarch}");
+    for flag in extra {
+        rustflags.push(' ');
+        rustflags.push_str(flag);
+    }
+    let mut env = vec![
+        (
+            format!("CARGO_TARGET_{}_RUSTFLAGS", underscored.to_uppercase()),
+            rustflags,
+        ),
+        (
+            format!("CFLAGS_{underscored}"),
+            format!("-I/usr/include/{multiarch}"),
+        ),
+        (
+            format!("CXXFLAGS_{underscored}"),
+            format!("-I/usr/include/{multiarch}"),
+        ),
+    ];
+    let target_arch = triple.split('-').next().unwrap_or_default();
+    if target_arch != host_arch {
+        env.push(("PKG_CONFIG_ALLOW_CROSS".to_string(), "1".to_string()));
+        env.push((
+            "PKG_CONFIG_LIBDIR".to_string(),
+            format!("/usr/lib/{multiarch}/pkgconfig:/usr/share/pkgconfig"),
+        ));
+    }
+    env
+}
+
+fn compile_rust(
+    ctx: &RuntimeContext,
+    cfg: &ReleaseSection,
+    root: &Path,
+    triple: &str,
+) -> Result<()> {
     let mut cmd = Command::new("cargo");
     cmd.current_dir(root);
     if triple.ends_with("-linux-gnu") {
         // linux-gnu is built in the Linux container and needs the glibc floor
-        // (ADR-0021), so it goes through cargo-zigbuild.
+        // (ADR-0021), so it goes through cargo-zigbuild. System native
+        // libraries (OpenBLAS etc.) live in Debian multiarch dirs that zig cc
+        // does not search — export the per-target linker/pkg-config env so
+        // `system`-feature build scripts link the right library.
+        for (key, value) in system_lib_env(triple, std::env::consts::ARCH, &cfg.linux_gnu_rustflags)
+        {
+            cmd.env(key, value);
+        }
         cmd.arg("zigbuild")
             .arg("--release")
             .arg("--target")
-            .arg(zig_build_target(triple));
+            .arg(zig_build_target(triple, &resolve_glibc_floor(cfg)));
     } else {
         // Everything else (notably *-apple-darwin) is built natively on its own
         // runner: plain cargo avoids zig's macOS-framework linking pitfalls and
@@ -560,7 +674,7 @@ fn build_target(
 
     // 1. compile (delegated to the language backend)
     match cfg.lang {
-        Lang::Rust => compile_rust(ctx, root, triple)?,
+        Lang::Rust => compile_rust(ctx, cfg, root, triple)?,
         Lang::Go => compile_go(ctx, cfg, root, &bin_dir, triple, version)?,
     }
 
@@ -1205,21 +1319,122 @@ mod tests {
     #[test]
     fn zig_build_target_floors_linux_gnu_only() {
         assert_eq!(
-            zig_build_target("x86_64-unknown-linux-gnu"),
+            zig_build_target("x86_64-unknown-linux-gnu", "2.28"),
             "x86_64-unknown-linux-gnu.2.28"
         );
         assert_eq!(
-            zig_build_target("aarch64-unknown-linux-gnu"),
-            "aarch64-unknown-linux-gnu.2.28"
+            zig_build_target("aarch64-unknown-linux-gnu", "2.38"),
+            "aarch64-unknown-linux-gnu.2.38"
         );
         assert_eq!(
-            zig_build_target("aarch64-apple-darwin"),
+            zig_build_target("aarch64-apple-darwin", "2.28"),
             "aarch64-apple-darwin"
         );
         assert_eq!(
-            zig_build_target("x86_64-unknown-linux-musl"),
+            zig_build_target("x86_64-unknown-linux-musl", "2.28"),
             "x86_64-unknown-linux-musl"
         );
+    }
+
+    #[test]
+    fn glibc_floor_resolves_default_then_override() {
+        let mut cfg = test_release_section();
+        assert_eq!(resolve_glibc_floor(&cfg), "2.28");
+        cfg.glibc_floor = Some("2.38".into());
+        assert_eq!(resolve_glibc_floor(&cfg), "2.38");
+        cfg.glibc_floor = Some("  ".into());
+        assert_eq!(resolve_glibc_floor(&cfg), "2.28");
+    }
+
+    #[test]
+    fn debian_multiarch_maps_release_arches() {
+        assert_eq!(
+            debian_multiarch("x86_64-unknown-linux-gnu"),
+            Some("x86_64-linux-gnu")
+        );
+        assert_eq!(
+            debian_multiarch("aarch64-unknown-linux-gnu"),
+            Some("aarch64-linux-gnu")
+        );
+        assert_eq!(debian_multiarch("riscv64gc-unknown-linux-gnu"), None);
+        assert_eq!(debian_multiarch("x86_64-apple-darwin"), None);
+    }
+
+    #[test]
+    fn system_lib_env_adds_multiarch_link_path_for_linux_gnu() {
+        // native arch: link search path + multiarch include dir for C probes;
+        // pkg-config needs no override (its default search path already
+        // includes the host multiarch dirs); no extra flags by default
+        assert_eq!(
+            system_lib_env("x86_64-unknown-linux-gnu", "x86_64", &[]),
+            vec![
+                (
+                    "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS".to_string(),
+                    "-L native=/usr/lib/x86_64-linux-gnu".to_string()
+                ),
+                (
+                    "CFLAGS_x86_64_unknown_linux_gnu".to_string(),
+                    "-I/usr/include/x86_64-linux-gnu".to_string()
+                ),
+                (
+                    "CXXFLAGS_x86_64_unknown_linux_gnu".to_string(),
+                    "-I/usr/include/x86_64-linux-gnu".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn system_lib_env_points_pkg_config_at_target_sysroot_on_cross() {
+        let env = system_lib_env("aarch64-unknown-linux-gnu", "x86_64", &[]);
+        assert_eq!(
+            env,
+            vec![
+                (
+                    "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS".to_string(),
+                    "-L native=/usr/lib/aarch64-linux-gnu".to_string()
+                ),
+                (
+                    "CFLAGS_aarch64_unknown_linux_gnu".to_string(),
+                    "-I/usr/include/aarch64-linux-gnu".to_string()
+                ),
+                (
+                    "CXXFLAGS_aarch64_unknown_linux_gnu".to_string(),
+                    "-I/usr/include/aarch64-linux-gnu".to_string()
+                ),
+                ("PKG_CONFIG_ALLOW_CROSS".to_string(), "1".to_string()),
+                (
+                    "PKG_CONFIG_LIBDIR".to_string(),
+                    "/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig".to_string()
+                ),
+            ]
+        );
+        // no cross overrides when the target matches the host arch
+        let native = system_lib_env("aarch64-unknown-linux-gnu", "aarch64", &[]);
+        assert_eq!(native.len(), 3);
+    }
+
+    #[test]
+    fn system_lib_env_appends_configured_rustflags() {
+        // repo-configured linux-gnu flags land on the same RUSTFLAGS value
+        // (e.g. trnscrb's GNU libstdc++ for statically-linked ONNX Runtime);
+        // single-token -Clink-arg form survives cargo's whitespace splitting
+        let env = system_lib_env(
+            "x86_64-unknown-linux-gnu",
+            "x86_64",
+            &["-Clink-arg=-l:libstdc++.so.6".to_string()],
+        );
+        assert_eq!(
+            env[0].1,
+            "-L native=/usr/lib/x86_64-linux-gnu -Clink-arg=-l:libstdc++.so.6"
+        );
+    }
+
+    #[test]
+    fn system_lib_env_leaves_other_targets_untouched() {
+        assert!(system_lib_env("x86_64-apple-darwin", "x86_64", &[]).is_empty());
+        assert!(system_lib_env("x86_64-unknown-linux-musl", "x86_64", &[]).is_empty());
+        assert!(system_lib_env("riscv64gc-unknown-linux-gnu", "x86_64", &[]).is_empty());
     }
 
     #[test]
@@ -1281,6 +1496,9 @@ mod tests {
             parse_cargo_version("[dependencies]\nversion = \"9\"\n"),
             None
         );
+        // workspace roots resolve too (e.g. trnscrb)
+        let ws = "[workspace]\nresolver = \"2\"\n\n[workspace.package]\nversion = \"0.1.0\"\n";
+        assert_eq!(parse_cargo_version(ws).as_deref(), Some("0.1.0"));
     }
 
     #[test]
@@ -1297,12 +1515,9 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn os_of_and_select_targets_filter_by_os() {
-        assert_eq!(os_of("x86_64-unknown-linux-gnu"), "linux");
-        assert_eq!(os_of("aarch64-apple-darwin"), "macos");
-        assert_eq!(os_of("x86_64-pc-windows-msvc"), "windows");
-        let cfg = ReleaseSection {
+    /// Default Rust release config for tests.
+    fn test_release_section() -> ReleaseSection {
+        ReleaseSection {
             name: "x".into(),
             lang: Lang::Rust,
             bins: vec![],
@@ -1314,11 +1529,21 @@ mod tests {
                 "aarch64-unknown-linux-gnu".into(),
                 "aarch64-apple-darwin".into(),
             ],
+            linux_gnu_rustflags: vec![],
+            glibc_floor: None,
             extra: vec![],
             sign: false,
             homebrew: None,
             aur: None,
-        };
+        }
+    }
+
+    #[test]
+    fn os_of_and_select_targets_filter_by_os() {
+        assert_eq!(os_of("x86_64-unknown-linux-gnu"), "linux");
+        assert_eq!(os_of("aarch64-apple-darwin"), "macos");
+        assert_eq!(os_of("x86_64-pc-windows-msvc"), "windows");
+        let cfg = test_release_section();
         assert_eq!(
             select_targets(&cfg, None, Some("linux")),
             vec![
