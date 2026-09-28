@@ -4396,7 +4396,7 @@ fn handle_new(ctx: &RuntimeContext, cmd: NewCommand) -> Result<()> {
     if !project_dir.join(".trx").exists() {
         println!("Initializing trx...");
         let _ = Command::new("trx")
-            .args(["init"])
+            .args(["init", "--prefix", &cmd.name])
             .current_dir(&project_dir)
             .output();
     }
@@ -4864,12 +4864,26 @@ fn rename_template_dirs(project_dir: &Path, template: &str, project_name: &str) 
                     fs::rename(entry.path(), &new_path)?;
                 }
             }
-            // Update Cargo.toml references
+            // Update Cargo.toml references and crate imports (hyphenated crate
+            // names, underscored lib imports, and workspace/app naming)
             replace_in_files(project_dir, "rust-cli", &format!("{}-cli", project_name))?;
             replace_in_files(project_dir, "rust-core", &format!("{}-core", project_name))?;
             replace_in_files(project_dir, "rust-api", &format!("{}-api", project_name))?;
             replace_in_files(project_dir, "rust-mcp", &format!("{}-mcp", project_name))?;
             replace_in_files(project_dir, "rust-tui", &format!("{}-tui", project_name))?;
+            replace_in_files(project_dir, "rust_core", &format!("{}_core", project_name))?;
+            replace_in_files(project_dir, "rust-workspace", project_name)?;
+            replace_in_files(
+                project_dir,
+                "RUST_WORKSPACE",
+                &project_name.to_uppercase().replace('-', "_"),
+            )?;
+            // The scaffolding scripts have served their purpose and must not
+            // ship with stale template placeholders in a generated project.
+            let scripts_dir = project_dir.join("scripts");
+            if scripts_dir.exists() {
+                fs::remove_dir_all(&scripts_dir)?;
+            }
         }
     }
 
@@ -6710,6 +6724,68 @@ mod tests {
         );
 
         // Cleanup
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    // -------------------------------------------------------------------------
+    // Rename template dirs tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_rename_template_dirs_rust_workspace() {
+        let temp = std::env::temp_dir().join("byt-test-rename-rust-workspace");
+        let _ = fs::remove_dir_all(&temp);
+        let crates = temp.join("crates");
+        fs::create_dir_all(crates.join("rust-core").join("src")).unwrap();
+        fs::create_dir_all(crates.join("rust-cli").join("src")).unwrap();
+        fs::create_dir_all(temp.join("scripts")).unwrap();
+
+        fs::write(
+            crates.join("rust-core").join("src").join("lib.rs"),
+            "pub const APP_NAME: &str = \"rust-workspace\";\n",
+        )
+        .unwrap();
+        fs::write(
+            crates.join("rust-cli").join("src").join("main.rs"),
+            "use rust_core::AppConfig;\nuse rust_core::APP_NAME;\n",
+        )
+        .unwrap();
+        fs::write(
+            temp.join("Cargo.toml"),
+            "repository = \"https://github.com/byteowlz/rust-workspace\"\n[workspace.dependencies]\nrust-core = { path = \"crates/rust-core\" }\n",
+        )
+        .unwrap();
+        fs::write(temp.join("README.md"), "Override with RUST_WORKSPACE__LOGGING__LEVEL\n").unwrap();
+        fs::write(temp.join("scripts").join("new-cli.sh"), "old_prefix = 'rust-'").unwrap();
+
+        rename_template_dirs(&temp, "rust-workspace", "drftr").unwrap();
+
+        // Crate directories renamed
+        assert!(!crates.join("rust-core").exists());
+        assert!(!crates.join("rust-cli").exists());
+        assert!(crates.join("drftr-core").exists());
+        assert!(crates.join("drftr-cli").exists());
+
+        // Underscored lib imports renamed so the workspace compiles
+        let main_rs = fs::read_to_string(crates.join("drftr-cli").join("src").join("main.rs")).unwrap();
+        assert!(main_rs.contains("use drftr_core::AppConfig;"));
+        assert!(!main_rs.contains("rust_core"));
+
+        // APP_NAME and repository URL renamed
+        let lib_rs = fs::read_to_string(crates.join("drftr-core").join("src").join("lib.rs")).unwrap();
+        assert!(lib_rs.contains("APP_NAME: &str = \"drftr\""));
+        let cargo_toml = fs::read_to_string(temp.join("Cargo.toml")).unwrap();
+        assert!(cargo_toml.contains("github.com/byteowlz/drftr"));
+        assert!(cargo_toml.contains("drftr-core = { path = \"crates/drftr-core\" }"));
+
+        // Env prefix renamed
+        let readme = fs::read_to_string(temp.join("README.md")).unwrap();
+        assert!(readme.contains("DRFTR__LOGGING__LEVEL"));
+        assert!(!readme.contains("RUST_WORKSPACE"));
+
+        // Scaffolding scripts removed from generated project
+        assert!(!temp.join("scripts").exists());
+
         let _ = fs::remove_dir_all(&temp);
     }
 
