@@ -26,6 +26,33 @@
 | `byt design-system sync`   | Vendor design-system src into consumer repos (distribute-down) |
 | `byt design-system status` | Show vendored drift vs the source repo's latest tag      |
 | `byt design-system list`   | List consuming repos and their pinned refs               |
+| `byt hooks install`        | Install shared git hooks: pull byteowlz/githooks into cache + wire core.hooksPath |
+| `byt hooks status`         | Show wired hooks path, hook files, gitleaks availability |
+| `byt hooks update`         | Force-refresh the hooks cache without rewiring a repo    |
+
+## Shared Git Hooks
+
+`byt hooks` installs the shared byteowlz git hooks from `byteowlz/githooks`
+(canonical, always-current) rather than a vendored/committed copy. This is the
+ONLINE path; templates carry a committed `.githooks/` as an OFFLINE fallback.
+
+- `byt hooks install [--repo <dir>]` (default cwd): ensures the machine cache
+  (`<XDG_CACHE_HOME or ~/.cache>/byteowlz/hooks`, itself a git clone of the
+  source — clones on first run, `git pull` after, so it never drifts), then
+  sets `core.hooksPath <cache>/hooks` in the target repo. Reports installed
+  hook files and whether the optional `gitleaks` scanner is present.
+- `byt hooks status [--repo <dir>]`: shows `core.hooksPath`, hook files present,
+  and gitleaks availability.
+- `byt hooks update`: force-refreshes the cache without rewiring a repo.
+- Non-fragile: if the source is unreachable but a cache exists it keeps the
+  last-known copy and warns; with no cache and unreachable source it errors
+  clearly; a missing gitleaks binary never blocks the hooks.
+- Source override: `BYT_HOOKS_SOURCE` env var or `[hooks] source` in config
+  (for forks/offline). A per-repo `core.hooksPath` is machine-local, so it
+  resolves correctly on any machine.
+
+If hooks are missing or a `*.schema.json` is malformed, the pre-commit guard
+will BLOCK the commit — fix the schema or bypass with `--no-verify`.
 
 ## Design-System Vendoring
 
