@@ -20,6 +20,12 @@
 # byteowlz-release GitHub App (org secrets RELEASE_APP_ID + RELEASE_APP_PRIVATE_KEY);
 # AUR publishes inline over SSH (org secrets AUR_SSH_PRIVATE_KEY + AUR_EMAIL).
 # Repos with no [release.homebrew]/[release.aur] simply skip those steps.
+#
+# Image/version match: every job `container:`s ghcr.io/byteowlz/byt:latest.
+# image.yml republishes `latest` (tagged with the commit sha) from this repo's
+# main on every Dockerfile/src/Cargo.* change, so `latest` at release time is
+# exactly the builder that main last validated — verify by comparing the image
+# digest against the sha tag when reproducing a build.
 name: release
 
 on:
