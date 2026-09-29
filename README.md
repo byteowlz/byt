@@ -58,6 +58,11 @@ searches only its own sysroot. The built binary keeps the glibc floor and gains
 a **runtime dependency** on the deployment host's library (`libopenblas.so.0`) —
 apps must document that dependency (AUR `depends`, README requirements).
 
+Mac targets build natively on the runner chosen by the reusable workflow's
+`macos_runner` input. Callers may opt in to build-time Homebrew formulae with
+`macos_brew_deps` (space-separated names, e.g. `openblas`). The archive does
+not bundle their dylibs; apps must document runtime dependencies separately.
+
 ## Integration
 
 byt integrates with:

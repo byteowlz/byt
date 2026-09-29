@@ -35,6 +35,16 @@ on:
         description: Release tag (defaults to the triggering git tag)
         required: false
         type: string
+      macos_runner:
+        description: macOS runner label for native builds (e.g. macos-15 for Apple Silicon)
+        required: false
+        type: string
+        default: macos-latest
+      macos_brew_deps:
+        description: Space-separated Homebrew formulae needed at macOS build time
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: write
@@ -78,9 +88,23 @@ jobs:
   build-macos:
     needs: setup
     if: needs.setup.outputs.macos == 'true'
-    runs-on: macos-latest
+    runs-on: ${{ inputs.macos_runner }}
     steps:
       - uses: actions/checkout@v4
+      - name: Install macOS native build dependencies
+        if: inputs.macos_brew_deps != ''
+        env:
+          MACOS_BREW_DEPS: ${{ inputs.macos_brew_deps }}
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+        run: |
+          read -r -a formulae <<< "$MACOS_BREW_DEPS"
+          for formula in "${formulae[@]}"; do
+            if [[ ! "$formula" =~ ^[a-zA-Z0-9@._+-]+$ ]]; then
+              echo "invalid Homebrew formula name" >&2
+              exit 1
+            fi
+          done
+          brew install "${formulae[@]}"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-apple-darwin,aarch64-apple-darwin
