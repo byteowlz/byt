@@ -4437,7 +4437,7 @@ fn handle_new(ctx: &RuntimeContext, cmd: NewCommand) -> Result<()> {
     }
 
     // Initialize trx if not already present, with a short issue-ID prefix
-    // derived from the repo name (e.g. "byteowlz-push" -> "bypush")
+    // derived from the repo name (e.g. "byteowlz-push" -> "bytwlz")
     if !project_dir.join(".trx").exists() {
         println!("Initializing trx...");
         let prefix = short_prefix(&cmd.name);
@@ -4954,6 +4954,7 @@ fn rename_template_dirs(project_dir: &Path, template: &str, project_name: &str) 
                     fs::rename(entry.path(), crates_dir.join(&new_name))?;
                 }
             }
+
         }
     }
 
@@ -7100,6 +7101,11 @@ mod tests {
         let _ = fs::remove_dir_all(&temp);
     }
 
+    // -------------------------------------------------------------------------
+    // Rename template dirs tests
+    // -------------------------------------------------------------------------
+
+    #[test]
     // -------------------------------------------------------------------------
     // NewCommand argument tests
     // -------------------------------------------------------------------------
