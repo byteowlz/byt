@@ -4392,6 +4392,14 @@ fn handle_new(ctx: &RuntimeContext, cmd: NewCommand) -> Result<()> {
         ));
     }
 
+    // --dry-run: describe the plan and stop before downloading or writing.
+    if ctx.common.dry_run {
+        for line in new_plan(&cmd, &project_dir, &ctx.config.templates.repo) {
+            println!("{line}");
+        }
+        return Ok(());
+    }
+
     // Branch based on whether we're using git clone or templates
     if let Some(ref git_source) = cmd.from_git {
         // Git-based scaffolding
@@ -4404,6 +4412,13 @@ fn handle_new(ctx: &RuntimeContext, cmd: NewCommand) -> Result<()> {
     // Apply variable replacements unless skipped
     if !cmd.no_replace {
         println!("Configuring project...");
+        // `{{project_name}}_core` is a Rust identifier (`use x_core::...`), so
+        // it takes the underscored name; a hyphenated name would not compile.
+        replace_in_files(
+            &project_dir,
+            "{{project_name}}_",
+            &format!("{}_", crate_ident(&cmd.name)),
+        )?;
         replace_in_files(&project_dir, "{{project_name}}", &cmd.name)?;
         replace_in_files(&project_dir, "your-binary-name", &cmd.name)?;
 
@@ -4425,6 +4440,10 @@ fn handle_new(ctx: &RuntimeContext, cmd: NewCommand) -> Result<()> {
             // Rename directories/files if needed (e.g., python_cli -> project_name)
             rename_template_dirs(&project_dir, &cmd.template, &cmd.name)?;
         }
+        // Path names are not touched by replace_in_files; rename any
+        // `{{project_name}}` file or directory, whatever the template.
+        rename_placeholder_paths(&project_dir, "{{project_name}}", &cmd.name)?;
+        format_rust_project(&project_dir);
     }
 
     // Initialize git (only if not already a git repo from clone)
@@ -4533,7 +4552,7 @@ fn short_prefix(name: &str) -> String {
 
 /// Scaffold a project from a git repository
 fn scaffold_from_git(
-    ctx: &RuntimeContext,
+    _ctx: &RuntimeContext,
     cmd: &NewCommand,
     project_dir: &Path,
     git_source: &str,
@@ -4617,11 +4636,6 @@ fn scaffold_from_git(
 
     // Clean up temp
     let _ = fs::remove_dir_all(&temp_dir);
-
-    // If --dry-run, just show what would happen
-    if ctx.common.dry_run {
-        println!("dry-run: would create project at {}", project_dir.display());
-    }
 
     Ok(())
 }
@@ -4911,6 +4925,101 @@ fn replace_in_files(dir: &Path, from: &str, to: &str) -> Result<()> {
     Ok(())
 }
 
+/// The Rust identifier form of a project name: `demo-app` -> `demo_app`.
+fn crate_ident(name: &str) -> String {
+    name.replace('-', "_")
+}
+
+/// What `byt new` would do, for `--dry-run`. Pure so it is testable.
+fn new_plan(cmd: &NewCommand, project_dir: &Path, templates_repo: &str) -> Vec<String> {
+    let mut plan = vec![format!(
+        "dry-run: would create {} at {}",
+        cmd.name,
+        project_dir.display()
+    )];
+    match &cmd.from_git {
+        Some(source) => {
+            let mut line = format!("  clone {}", normalize_git_url(source));
+            if let Some(git_ref) = &cmd.git_ref {
+                line.push_str(&format!(" (ref {git_ref})"));
+            }
+            if let Some(subdir) = &cmd.subdir {
+                line.push_str(&format!(" (subdir {subdir})"));
+            }
+            plan.push(line);
+        }
+        None => plan.push(format!(
+            "  copy template {} from {templates_repo}",
+            cmd.template
+        )),
+    }
+    if !cmd.no_replace {
+        plan.push(format!(
+            "  replace {{{{project_name}}}} with {} in file contents and paths",
+            cmd.name
+        ));
+        plan.push("  run cargo fmt --all if the project is a Rust workspace".to_string());
+    }
+    plan.push("  git init, trx init".to_string());
+    if cmd.github {
+        let visibility = if cmd.private { "private" } else { "public" };
+        plan.push(format!("  create {visibility} GitHub repository and push"));
+    }
+    plan.push("dry-run: nothing was written".to_string());
+    plan
+}
+
+/// Rename every file or directory under `dir` whose name contains
+/// `placeholder`. Children are renamed before their parents so paths stay
+/// valid while walking.
+fn rename_placeholder_paths(dir: &Path, placeholder: &str, value: &str) -> Result<()> {
+    let mut renames = Vec::new();
+    for entry in walkdir::WalkDir::new(dir).min_depth(1).contents_first(true) {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy();
+        if name.contains(placeholder) {
+            let target = entry
+                .path()
+                .with_file_name(name.replace(placeholder, value));
+            renames.push((entry.path().to_path_buf(), target));
+        }
+    }
+    for (from, to) in renames {
+        if to.exists() {
+            return Err(anyhow!(
+                "cannot rename {} to {}: target exists",
+                from.display(),
+                to.display()
+            ));
+        }
+        fs::rename(&from, &to)
+            .with_context(|| format!("renaming {} to {}", from.display(), to.display()))?;
+    }
+    Ok(())
+}
+
+/// Substituting the project name changes line widths, so a template that is
+/// rustfmt-clean with `{{project_name}}` is not clean afterwards. Format the
+/// generated workspace so `cargo fmt --check` passes out of the box. Best
+/// effort: a missing toolchain only warns.
+fn format_rust_project(project_dir: &Path) {
+    if !project_dir.join("Cargo.toml").exists() {
+        return;
+    }
+    match std::process::Command::new("cargo")
+        .args(["fmt", "--all"])
+        .current_dir(project_dir)
+        .output()
+    {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => eprintln!(
+            "Warning: cargo fmt failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Err(e) => eprintln!("Warning: could not run cargo fmt: {e}"),
+    }
+}
+
 /// Rename template-specific directories
 fn rename_template_dirs(project_dir: &Path, template: &str, project_name: &str) -> Result<()> {
     // Python: rename python_cli to project_name (with underscores)
@@ -4932,8 +5041,8 @@ fn rename_template_dirs(project_dir: &Path, template: &str, project_name: &str) 
         if crates_dir.exists() {
             // The template names crates `{{project_name}}-core` etc. and
             // references them as `{{project_name}}_core` in source; the earlier
-            // `{{project_name}}` content replacement already rewrote every
-            // dash/underscore reference in files. Here we only rename the
+            // content replacement already rewrote both forms (the underscore
+            // form with `crate_ident`). Here we only rename the
             // on-disk crate dirs (dir names aren't touched by replace_in_files).
             // Fall back to legacy `rust-*` dir names from older snapshots.
             // `byteowlz-tui-kit` is a real vendored crate and is left as-is.
@@ -4943,9 +5052,8 @@ fn rename_template_dirs(project_dir: &Path, template: &str, project_name: &str) 
                     continue;
                 }
                 let old_name = entry.file_name().to_string_lossy().to_string();
-                let new_name = if old_name.contains("{{project_name}}") {
-                    old_name.replace("{{project_name}}", project_name)
-                } else if old_name.starts_with("rust-") {
+                // `{{project_name}}` dirs are renamed by rename_placeholder_paths.
+                let new_name = if old_name.starts_with("rust-") {
                     old_name.replacen("rust-", &format!("{project_name}-"), 1)
                 } else {
                     continue;
@@ -4954,7 +5062,6 @@ fn rename_template_dirs(project_dir: &Path, template: &str, project_name: &str) 
                     fs::rename(entry.path(), crates_dir.join(&new_name))?;
                 }
             }
-
         }
     }
 
@@ -6786,6 +6893,106 @@ impl fmt::Display for AppPaths {
 
 #[cfg(test)]
 mod tests {
+    fn new_cmd(name: &str) -> NewCommand {
+        NewCommand {
+            name: name.to_string(),
+            template: "rust-gpui".to_string(),
+            github: false,
+            private: false,
+            description: None,
+            output: None,
+            from_git: None,
+            subdir: None,
+            git_ref: None,
+            no_replace: false,
+        }
+    }
+
+    #[test]
+    fn identifier_placeholders_take_the_underscored_name() {
+        let temp = std::env::temp_dir().join(format!("byt-ident-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp);
+        fs::create_dir_all(&temp).unwrap();
+        fs::write(
+            temp.join("theme.rs"),
+            "use {{project_name}}_design::x;\n// see {{project_name}}-design\n",
+        )
+        .unwrap();
+        replace_in_files(
+            &temp,
+            "{{project_name}}_",
+            &format!("{}_", crate_ident("demo-app")),
+        )
+        .unwrap();
+        replace_in_files(&temp, "{{project_name}}", "demo-app").unwrap();
+        assert_eq!(
+            fs::read_to_string(temp.join("theme.rs")).unwrap(),
+            "use demo_app_design::x;\n// see demo-app-design\n"
+        );
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
+    fn new_plan_describes_steps_without_side_effects() {
+        let mut cmd = new_cmd("invkr");
+        cmd.github = true;
+        cmd.private = true;
+        let plan = new_plan(&cmd, Path::new("/tmp/out/invkr"), "byteowlz/templates");
+        assert_eq!(plan[0], "dry-run: would create invkr at /tmp/out/invkr");
+        assert!(plan.contains(&"  copy template rust-gpui from byteowlz/templates".to_string()));
+        assert!(
+            plan.iter()
+                .any(|l| l.contains("replace {{project_name}} with invkr"))
+        );
+        assert!(plan.contains(&"  create private GitHub repository and push".to_string()));
+        assert_eq!(plan.last().unwrap(), "dry-run: nothing was written");
+
+        let mut git = new_cmd("x");
+        git.from_git = Some("user/repo".to_string());
+        git.no_replace = true;
+        let plan = new_plan(&git, Path::new("x"), "byteowlz/templates");
+        assert!(plan.contains(&"  clone https://github.com/user/repo".to_string()));
+        assert!(!plan.iter().any(|l| l.contains("replace")));
+    }
+
+    #[test]
+    fn rename_placeholder_paths_renames_nested_dirs_and_files() {
+        let temp = std::env::temp_dir().join(format!("byt-rename-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp);
+        let nested = temp.join("crates/{{project_name}}-design/schemes");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("x.json"), "{}").unwrap();
+        fs::create_dir_all(temp.join("crates/{{project_name}}/src")).unwrap();
+        fs::write(
+            temp.join("crates/{{project_name}}/src/{{project_name}}.rs"),
+            "",
+        )
+        .unwrap();
+        fs::write(temp.join("README.md"), "keep").unwrap();
+
+        rename_placeholder_paths(&temp, "{{project_name}}", "invkr").unwrap();
+
+        assert!(temp.join("crates/invkr-design/schemes/x.json").is_file());
+        assert!(temp.join("crates/invkr/src/invkr.rs").is_file());
+        assert!(temp.join("README.md").is_file());
+        let leftover = walkdir::WalkDir::new(&temp)
+            .into_iter()
+            .filter_map(Result::ok)
+            .any(|e| e.file_name().to_string_lossy().contains("{{project_name}}"));
+        assert!(!leftover);
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
+    fn rename_placeholder_paths_refuses_to_overwrite() {
+        let temp = std::env::temp_dir().join(format!("byt-rename-clash-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp);
+        fs::create_dir_all(temp.join("{{project_name}}")).unwrap();
+        fs::create_dir_all(temp.join("app")).unwrap();
+        assert!(rename_placeholder_paths(&temp, "{{project_name}}", "app").is_err());
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
     use super::*;
 
     // -------------------------------------------------------------------------
@@ -7109,7 +7316,6 @@ mod tests {
     // -------------------------------------------------------------------------
     // NewCommand argument tests
     // -------------------------------------------------------------------------
-
     #[test]
     fn test_short_prefix() {
         assert_eq!(short_prefix("byt"), "byt");
