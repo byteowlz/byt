@@ -38,10 +38,36 @@ byt release build --os linux   # Build configured linux targets
 byt release targets            # Print configured target triples
 byt release checksums          # Write dist/release/checksums.txt
 
+# Public mirrors (private working repo -> public snapshot)
+byt publish init         # Write publish.toml listing this repo's markdown
+byt publish check        # Show what an export would change; leak scan; writes nothing
+byt publish export       # Commit a snapshot into ~/byteowlz-public/<repo> (no push)
+byt publish export --push [--prune-branches]
+
 # Knowledge
 byt memory search "q"    # Search memories (via mmry)
 byt memory add "content" # Add memory
 ```
+
+## Public mirrors
+
+A working repository can stay private (e.g. on Forgejo) with its agent
+instructions, decision records and research, while its public GitHub repository
+receives snapshots. `byt publish export` takes committed content only and:
+
+- keeps markdown only when `publish.toml` lists it (`docs = [...]`); agent and
+  context files (`AGENTS.md`, `CLAUDE.md`, `CONTEXT.md`), `publish.toml` itself
+  and `.trx`/`.pi`/`.claude` are never exported;
+- refuses on home paths, tailnet addresses, private keys, the local user name,
+  `forbidden` terms and links in exported markdown to files that stay private;
+  exact harmless matches go in `allow`;
+- optionally runs `nym detect` too (`nym = true`, `nym_args`);
+- commits one snapshot into `~/byteowlz-public/<repo>` (cloned from
+  `public_remote` on first use, so history and tags continue) and pushes only
+  with `--push`;
+- publishes `main` only: it refuses a public checkout on another branch,
+  reports other public branches, and deletes them with `--push --prune-branches`.
+  Work branches live in the private repository.
 
 ## Release builder
 

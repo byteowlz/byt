@@ -1,6 +1,6 @@
 [package]
 name = "byt"
-version = "0.5.8"
+version = "0.6.0"
 edition = "2024"
 description = "Byteowlz meta-tool for cross-repo management, catalog generation, and governance"
 authors = ["Byteowlz"]
@@ -25,6 +25,7 @@ ignore = "0.4"
 # carries no runtime libssl dependency. See ADR-0021/0022.
 git2 = { version = "0.19", features = ["vendored-openssl"] }
 glob = "0.3"
+regex = "1"
 which = "8.0.0"
 hostname = "0.4.2"
 sha2 = "0.10"

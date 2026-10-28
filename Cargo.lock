@@ -135,7 +135,7 @@ checksum = "5d20789868f4b01b2f2caec9f5c4e0213b41e3e5702a50157d699ae31ced2fcb"
 
 [[package]]
 name = "byt"
-version = "0.5.8"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -148,6 +148,7 @@ dependencies = [
  "hostname",
  "ignore",
  "log",
+ "regex",
  "serde",
  "serde_json",
  "sha2",

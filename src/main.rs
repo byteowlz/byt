@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 const APP_NAME: &str = env!("CARGO_PKG_NAME");
 
+mod publish;
 mod release;
 
 fn main() {
@@ -50,6 +51,7 @@ fn try_main() -> Result<()> {
         Command::Hooks { command } => handle_hooks(&ctx, command),
         Command::Website { command } => handle_website(&ctx, command),
         Command::Release { command } => release::handle_release(&ctx, command),
+        Command::Publish { command } => publish::handle_publish(&ctx, command),
         Command::Completions { shell } => handle_completions(shell),
     }
 }
@@ -167,6 +169,11 @@ enum Command {
     Release {
         #[command(subcommand)]
         command: release::ReleaseCommand,
+    },
+    /// Export a private working repository into its public mirror
+    Publish {
+        #[command(subcommand)]
+        command: publish::PublishCommand,
     },
     /// Generate shell completions
     Completions {
