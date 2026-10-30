@@ -61,6 +61,10 @@ pub enum PublishCommand {
         /// With --push: delete every public branch other than main
         #[arg(long, requires = "push")]
         prune_branches: bool,
+        /// Tag the snapshot for a release. The private HEAD must carry the same
+        /// tag; without a value, the tag at the private HEAD is used.
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        tag: Option<String>,
     },
     /// Write a starter publish.toml listing this repository's markdown
     Init {
@@ -121,6 +125,8 @@ struct Report {
     extra_branches: Vec<String>,
     pruned_branches: Vec<String>,
     committed: Option<String>,
+    /// Release tag created on the snapshot.
+    tagged: Option<String>,
     pushed: bool,
 }
 
@@ -128,21 +134,19 @@ pub fn handle_publish(ctx: &RuntimeContext, command: PublishCommand) -> Result<(
     match command {
         PublishCommand::Init { repo } => init(&repo_root(repo)?),
         PublishCommand::Check { repo } => {
-            let report = run(&repo_root(repo)?, false, false, false)?;
+            let report = run(&repo_root(repo)?, false, false, false, None)?;
             finish(ctx, &report)
         }
         PublishCommand::Export {
             repo,
             push,
             prune_branches,
+            tag,
         } => {
             let apply = !ctx.common.dry_run;
-            let report = run(
-                &repo_root(repo)?,
-                apply,
-                push && apply,
-                prune_branches && apply,
-            )?;
+            let root = repo_root(repo)?;
+            let tag = tag.map(|t| release_tag(&root, &t)).transpose()?;
+            let report = run(&root, apply, push && apply, prune_branches && apply, tag)?;
             finish(ctx, &report)
         }
     }
@@ -271,7 +275,28 @@ fn remote_branches(public: &Path) -> Vec<String> {
         .collect()
 }
 
-fn run(root: &Path, apply: bool, push: bool, prune: bool) -> Result<Report> {
+/// The release tag to put on the snapshot: it must point at the private HEAD,
+/// so a public release always matches a tagged private commit.
+fn release_tag(root: &Path, requested: &str) -> Result<String> {
+    let at_head = git(root, &["tag", "--points-at", "HEAD"])?;
+    let tags: Vec<&str> = at_head.lines().filter(|t| !t.is_empty()).collect();
+    if requested.is_empty() {
+        match tags.as_slice() {
+            [one] => Ok((*one).to_owned()),
+            [] => bail!("--tag: the private HEAD has no tag; tag the release commit first"),
+            many => bail!(
+                "--tag: the private HEAD has several tags ({}); name one",
+                many.join(", ")
+            ),
+        }
+    } else if tags.contains(&requested) {
+        Ok(requested.to_owned())
+    } else {
+        bail!("--tag {requested}: that tag does not point at the private HEAD")
+    }
+}
+
+fn run(root: &Path, apply: bool, push: bool, prune: bool, tag: Option<String>) -> Result<Report> {
     let cfg = load_config(root)?;
     let public = public_dir(root, &cfg)?;
     let head = git(root, &["rev-parse", "--short", "HEAD"])?;
@@ -331,10 +356,18 @@ fn run(root: &Path, apply: bool, push: bool, prune: bool) -> Result<Report> {
             },
             pruned_branches: Vec::new(),
             committed: None,
+            tagged: None,
             pushed: false,
         };
         if apply && report.leaks.is_empty() {
+            if let Some(name) = &tag {
+                check_tag_free(&public, name, &report)?;
+            }
             report.committed = write_public(root, &cfg, &public, &stage, &kept, &head)?;
+            if let Some(name) = &tag {
+                tag_snapshot(&public, name, &head)?;
+                report.tagged = Some(name.clone());
+            }
             if push {
                 // Also pushes an earlier snapshot that was committed but not pushed.
                 let range = format!("origin/{PUBLIC_BRANCH}..{PUBLIC_BRANCH}");
@@ -342,6 +375,11 @@ fn run(root: &Path, apply: bool, push: bool, prune: bool) -> Result<Report> {
                     .unwrap_or_else(|_| "1".to_owned());
                 if ahead != "0" {
                     git(&public, &["push", "origin", PUBLIC_BRANCH])?;
+                    report.pushed = true;
+                }
+                // The tag goes after main, so the release builds a commit main already has.
+                if let Some(name) = &report.tagged {
+                    git(&public, &["push", "origin", &format!("refs/tags/{name}")])?;
                     report.pushed = true;
                 }
                 if prune {
@@ -663,6 +701,126 @@ fn nym_scan(stage: &Path, kept: &[String], cfg: &PublishConfig) -> Result<Vec<Le
     Ok(leaks)
 }
 
+/// Before anything is written: a tag that already exists publicly is only
+/// acceptable when this export changes nothing and the tag is on public HEAD.
+fn check_tag_free(public: &Path, name: &str, report: &Report) -> Result<()> {
+    if !public.join(".git").exists() {
+        return Ok(());
+    }
+    let local = git(
+        public,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/tags/{name}^{{commit}}"),
+        ],
+    )
+    .ok();
+    let remote = git(
+        public,
+        &[
+            "ls-remote",
+            "--tags",
+            "origin",
+            &format!("refs/tags/{name}*"),
+        ],
+    )
+    .unwrap_or_default();
+    let remote = remote
+        .lines()
+        .find(|l| l.ends_with("^{}"))
+        .or_else(|| remote.lines().next())
+        .and_then(|l| l.split_whitespace().next())
+        .map(str::to_owned);
+    let Some(existing) = local.or(remote) else {
+        return Ok(());
+    };
+    let unchanged =
+        report.added.is_empty() && report.removed.is_empty() && report.changed.is_empty();
+    let head = git(public, &["rev-parse", "HEAD"]).unwrap_or_default();
+    if unchanged && existing == head {
+        return Ok(());
+    }
+    bail!(
+        "tag {name} already exists on another public commit ({existing}); a release tag is never moved"
+    )
+}
+
+/// Tag the public HEAD; an existing tag is accepted only on the same commit.
+fn tag_snapshot(public: &Path, name: &str, head: &str) -> Result<()> {
+    let snapshot = git(public, &["rev-parse", "HEAD"])?;
+    let existing = git(
+        public,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/tags/{name}^{{commit}}"),
+        ],
+    )
+    .ok();
+    let remote = git(
+        public,
+        &[
+            "ls-remote",
+            "--tags",
+            "origin",
+            &format!("refs/tags/{name}^{{}}"),
+        ],
+    )
+    .unwrap_or_default();
+    let remote_commit = remote
+        .split_whitespace()
+        .next()
+        .map(str::to_owned)
+        .or_else(|| {
+            git(
+                public,
+                &[
+                    "ls-remote",
+                    "--tags",
+                    "origin",
+                    &format!("refs/tags/{name}"),
+                ],
+            )
+            .ok()
+            .and_then(|r| r.split_whitespace().next().map(str::to_owned))
+        });
+    for found in [existing, remote_commit].into_iter().flatten() {
+        if found != snapshot {
+            bail!(
+                "tag {name} already exists on another public commit ({found}); a release tag is never moved"
+            );
+        }
+    }
+    if git(
+        public,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/tags/{name}"),
+        ],
+    )
+    .is_err()
+    {
+        git(
+            public,
+            &[
+                "tag",
+                "-a",
+                name,
+                "-m",
+                &format!("Release {name}"),
+                "-m",
+                &format!("Exported from {head}."),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 fn hashes_of(dir: &Path, files: &[String]) -> Result<BTreeMap<String, String>> {
     let mut out = BTreeMap::new();
     for rel in files {
@@ -933,7 +1091,7 @@ mod tests {
         );
         private_repo(&root, &config);
 
-        let report = run(&root, true, false, false).unwrap();
+        let report = run(&root, true, false, false, None).unwrap();
         assert!(report.leaks.is_empty(), "{:?}", report.leaks);
         assert!(report.committed.is_some());
         let mut files = files_under(&public).unwrap();
@@ -950,7 +1108,7 @@ mod tests {
         assert!(report.excluded.contains(&"AGENTS.md".to_owned()));
 
         // A second export with no changes commits nothing.
-        let again = run(&root, true, false, false).unwrap();
+        let again = run(&root, true, false, false, None).unwrap();
         assert!(again.committed.is_none());
         fs::remove_dir_all(&base).unwrap();
     }
@@ -978,7 +1136,7 @@ mod tests {
         sh(&root, &["add", "-A"]);
         sh(&root, &["commit", "-q", "-m", "leak"]);
 
-        let report = run(&root, true, false, false).unwrap();
+        let report = run(&root, true, false, false, None).unwrap();
         let rules: BTreeSet<&str> = report.leaks.iter().map(|l| l.rule.as_str()).collect();
         assert!(
             rules.contains("home-path")
@@ -1012,7 +1170,7 @@ mod tests {
         sh(&root, &["add", "-A"]);
         sh(&root, &["commit", "-q", "-m", "mail"]);
 
-        let report = run(&root, false, false, false).unwrap();
+        let report = run(&root, false, false, false, None).unwrap();
         let hit = report
             .leaks
             .iter()
@@ -1040,7 +1198,7 @@ mod tests {
         sh(&root, &["add", "-A"]);
         sh(&root, &["commit", "-q", "-m", "links"]);
 
-        let report = run(&root, false, false, false).unwrap();
+        let report = run(&root, false, false, false, None).unwrap();
         let dangling: Vec<&str> = report
             .leaks
             .iter()
@@ -1087,7 +1245,7 @@ mod tests {
             remote.display()
         );
         private_repo(&root, &config);
-        let report = run(&root, true, true, true).unwrap();
+        let report = run(&root, true, true, true, None).unwrap();
         assert!(report.pushed, "{report:?}");
         assert_eq!(report.pruned_branches, ["stray"]);
         let heads = git(&base, &["ls-remote", "--heads", remote.to_str().unwrap()]).unwrap();
@@ -1103,8 +1261,74 @@ mod tests {
         sh(&public, &["checkout", "-q", "-b", "side"]);
         fs::write(root.join("src.rs"), "fn main() { let _ = 1; }").unwrap();
         sh(&root, &["commit", "-qam", "change"]);
-        let error = run(&root, true, false, false).unwrap_err().to_string();
+        let error = run(&root, true, false, false, None)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("publishes `main` only"), "{error}");
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn release_tag_lands_on_the_snapshot_and_is_never_moved() {
+        let base = tempdir().unwrap();
+        let root = base.join("work");
+        let remote = base.join("remote.git");
+        let public = base.join("public");
+        fs::create_dir_all(&root).unwrap();
+        sh(
+            &base,
+            &[
+                "init",
+                "-q",
+                "--bare",
+                "-b",
+                "main",
+                remote.to_str().unwrap(),
+            ],
+        );
+        let config = format!(
+            "public_dir = \"{}\"\npublic_remote = \"{}\"\ndocs = [\"README.md\", \"docs/usage.md\"]\n",
+            public.display(),
+            remote.display()
+        );
+        private_repo(&root, &config);
+        assert!(release_tag(&root, "").is_err(), "untagged HEAD is refused");
+        sh(&root, &["tag", "-a", "v1.0.0", "-m", "v1.0.0"]);
+        assert!(
+            release_tag(&root, "v9.9.9").is_err(),
+            "a tag not at HEAD is refused"
+        );
+        let tag = release_tag(&root, "").unwrap();
+
+        let report = run(&root, true, true, false, Some(tag)).unwrap();
+        assert_eq!(report.tagged.as_deref(), Some("v1.0.0"));
+        let main = git(
+            &base,
+            &["--git-dir", remote.to_str().unwrap(), "rev-parse", "main"],
+        )
+        .unwrap();
+        let tagged = git(
+            &base,
+            &[
+                "--git-dir",
+                remote.to_str().unwrap(),
+                "rev-parse",
+                "v1.0.0^{commit}",
+            ],
+        )
+        .unwrap();
+        assert_eq!(main, tagged, "the public tag sits on the pushed snapshot");
+
+        // Moving the private tag to a new commit must not move the public one.
+        fs::write(root.join("src.rs"), "fn main() { let _ = 2; }").unwrap();
+        sh(&root, &["commit", "-qam", "change"]);
+        sh(&root, &["tag", "-f", "-a", "v1.0.0", "-m", "v1.0.0"]);
+        let error = run(&root, true, true, false, Some("v1.0.0".into()))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("never moved"), "{error}");
+        let unpushed = git(&public, &["rev-list", "--count", "origin/main..main"]).unwrap();
+        assert_eq!(unpushed, "0", "nothing is written when the tag check fails");
         fs::remove_dir_all(&base).unwrap();
     }
 

@@ -43,6 +43,7 @@ byt publish init         # Write publish.toml listing this repo's markdown
 byt publish check        # Show what an export would change; leak scan; writes nothing
 byt publish export       # Commit a snapshot into ~/byteowlz-public/<repo> (no push)
 byt publish export --push [--prune-branches]
+byt publish export --tag v1.2.3 --push   # Release: snapshot + tag, starts the public release workflow
 
 # Knowledge
 byt memory search "q"    # Search memories (via mmry)
@@ -68,6 +69,10 @@ receives snapshots. `byt publish export` takes committed content only and:
 - publishes `main` only: it refuses a public checkout on another branch,
   reports other public branches, and deletes them with `--push --prune-branches`.
   Work branches live in the private repository.
+- releases: tag the release commit in the private repository, then
+  `byt publish export --tag <tag> --push`. The tag must point at the private
+  HEAD; it is created on the snapshot and pushed after `main`, which starts the
+  public release workflow. A public release tag is never moved.
 
 ## Release builder
 

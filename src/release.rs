@@ -550,13 +550,19 @@ fn system_lib_env(triple: &str, host_arch: &str, extra: &[String]) -> Vec<(Strin
             format!("CARGO_TARGET_{}_RUSTFLAGS", underscored.to_uppercase()),
             rustflags,
         ),
+        // `-isystem`, never `-I`: an `-I` directory is searched before zig's
+        // own sysroot, so glibc headers got mixed (zig's old stdio.h with
+        // Debian's newer sys/cdefs.h) and every bundled-C build failed with
+        // "expected function body after function declarator" (__COLD). zig's
+        // sysroot wins; the multiarch dir still satisfies the libc headers
+        // and the library includes this was added for.
         (
             format!("CFLAGS_{underscored}"),
-            format!("-I/usr/include/{multiarch}"),
+            format!("-isystem /usr/include -isystem /usr/include/{multiarch}"),
         ),
         (
             format!("CXXFLAGS_{underscored}"),
-            format!("-I/usr/include/{multiarch}"),
+            format!("-isystem /usr/include -isystem /usr/include/{multiarch}"),
         ),
     ];
     let target_arch = triple.split('-').next().unwrap_or_default();
@@ -1362,7 +1368,8 @@ mod tests {
 
     #[test]
     fn system_lib_env_adds_multiarch_link_path_for_linux_gnu() {
-        // native arch: link search path + multiarch include dir for C probes;
+        // native arch: link search path + multiarch include dir for C probes,
+        // searched after zig's sysroot (-isystem, not -I);
         // pkg-config needs no override (its default search path already
         // includes the host multiarch dirs); no extra flags by default
         assert_eq!(
@@ -1374,14 +1381,34 @@ mod tests {
                 ),
                 (
                     "CFLAGS_x86_64_unknown_linux_gnu".to_string(),
-                    "-I/usr/include/x86_64-linux-gnu".to_string()
+                    "-isystem /usr/include -isystem /usr/include/x86_64-linux-gnu".to_string()
                 ),
                 (
                     "CXXFLAGS_x86_64_unknown_linux_gnu".to_string(),
-                    "-I/usr/include/x86_64-linux-gnu".to_string()
+                    "-isystem /usr/include -isystem /usr/include/x86_64-linux-gnu".to_string()
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn c_flags_search_the_multiarch_dir_after_the_sysroot() {
+        // `-I` before zig's sysroot mixed two glibc versions and broke every
+        // bundled-C build; the multiarch dir must never be an `-I` again.
+        for triple in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+            for (key, value) in system_lib_env(triple, "x86_64", &[]) {
+                if !(key.starts_with("CFLAGS_") || key.starts_with("CXXFLAGS_")) {
+                    continue;
+                }
+                assert!(
+                    !value
+                        .split_whitespace()
+                        .any(|flag| flag == "-I" || flag.starts_with("-I/")),
+                    "{key} must not use -I: {value}"
+                );
+                assert!(value.contains("-isystem /usr/include"), "{key}: {value}");
+            }
+        }
     }
 
     #[test]
@@ -1396,11 +1423,11 @@ mod tests {
                 ),
                 (
                     "CFLAGS_aarch64_unknown_linux_gnu".to_string(),
-                    "-I/usr/include/aarch64-linux-gnu".to_string()
+                    "-isystem /usr/include -isystem /usr/include/aarch64-linux-gnu".to_string()
                 ),
                 (
                     "CXXFLAGS_aarch64_unknown_linux_gnu".to_string(),
-                    "-I/usr/include/aarch64-linux-gnu".to_string()
+                    "-isystem /usr/include -isystem /usr/include/aarch64-linux-gnu".to_string()
                 ),
                 ("PKG_CONFIG_ALLOW_CROSS".to_string(), "1".to_string()),
                 (
